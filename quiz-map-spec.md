@@ -209,6 +209,13 @@ LNG302 Natural Language Processing 期末プロジェクト / 谷ちなみ 28145
 4. 確定前に**選択された概念の一覧を表示**し、不要なものを外せるようにする
 5. 「この N 概念から M 問作る」と見せてから生成
 
+**実装（§11 で確認済み）**
+- 各点の `customdata` に識別子を入れ、
+  `st.plotly_chart(fig, on_select="rerun", selection_mode=("lasso","box"))` の戻り値
+  `event.selection.points[i]["customdata"]` から取り出す
+- **`customdata` は id だけにせず、種別も持たせる**（例 `[id, "node"]` / `[edge_id, "edge"]`）。
+  ノードと辺の中点は別トレースになるため、選択結果に両方が混ざる。種別が無いと区別できない
+
 ---
 
 ## 7. クイズ生成
@@ -263,6 +270,9 @@ LNG302 Natural Language Processing 期末プロジェクト / 谷ちなみ 28145
 4. **概念数の上限は危険** — 上限を設けると実在する回またぎのリンクが消える
 5. **分類ラベルの決め打ちは危険** — §4 の理由
 6. **全自動なので語彙が外れても止まらない** — `その他` 率で検知するしかない
+7. **pandas の循環インポート（§11 で遭遇）** — Plotly が `customdata` の検証時に pandas を
+   遅延読み込みし、Streamlit 側の読み込みとスレッド間で競合してエラーになる。
+   **スクリプト先頭で `import pandas` を先に済ませる**ことで解消する。本体でも同じ対策が要る
 
 ---
 
@@ -276,16 +286,23 @@ LNG302 Natural Language Processing 期末プロジェクト / 谷ちなみ 28145
 | PDFテキスト | pypdf または pdftotext |
 | PDF画像化 | pdftoppm |
 | マップ描画 | Plotly（投げ縄選択） |
+| 環境 | Python 3.12 / `project/.venv`。先頭で `import pandas`（§9の7） |
 | 保存 | JSONファイル |
 
 **※ Claude API には埋め込みのエンドポイントがない。** RAG を入れる場合は別途ローカルの埋め込みモデルが必要。
 
 ---
 
-## 11. 最初にやること
+## 11. 最初にやること — **完了（2026-10-19）**
 
-**Plotly の投げ縄で選んだ点が Streamlit 側に返ってくるか**を30分で確認する。
-ダミーの点を20個描いて、囲んだ点の id が Python 側で取れれば OK。ここで詰まると全体が止まる。
+Plotly の投げ縄で選んだ点が Streamlit 側に返ってくるかを確認した。**結果：取れる。**
+
+- `lasso_check.py`：ダミー20点の散布図。`customdata` に id を入れ、
+  `st.plotly_chart(fig, on_select="rerun", selection_mode=("lasso","box"))` の戻り値から取得
+- ヘッドレス Chromium で投げ縄ドラッグを再現し、囲んだ8点の id が取れることを確認
+- 遭遇した問題：pandas の循環インポート → §9 の7 に記録
+
+設計の前提は確認済み。次は §4〜5（語彙の導出と抽出）。
 
 ---
 
