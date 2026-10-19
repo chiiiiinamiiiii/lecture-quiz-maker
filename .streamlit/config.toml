@@ -1,0 +1,11 @@
+# ピンク系テーマ（UI 調整【5】）。点の 2 状態の色は app.py 側で、背景に対して明度・彩度とも差をつけて決める
+[theme]
+base = "light"
+primaryColor = "#D6336C"             # ボタン・スライダー・選択ハイライト
+backgroundColor = "#FFF5F8"          # 本体背景（淡いピンク）
+secondaryBackgroundColor = "#FCE4EC" # サイドバー・入力欄の背景
+textColor = "#3B1F2B"
+font = "sans serif"
+
+[server]
+runOnSave = true
