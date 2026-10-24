@@ -167,6 +167,7 @@ def gen_user(materials: str, n: int, counts: dict[str, int], n_short: int) -> st
 内訳: 関係を問う問題 {counts['relation']} 問 / 具体例を問う問題 {counts['example']} 問 / 定義を問う問題 {counts['definition']} 問
 形式: 4 択（type=mcq, choices は 4 つ, answer は正答の添字 0〜3, answer_text は正答の文字列）を基本とし、
       記述式（type=short, choices は空配列, answer は 0, answer_text は模範解答）を {n_short} 問まで混ぜてよい
+      answer は 0 始まりの添字（0〜3）。answer_text は choices[answer] と同じ文字列にする
 
 守ること:
 - 関係を問う問題は「関係ラベルごとの問い方」に沿って問う。問い方はそこに書かれたものだけを使う
@@ -192,6 +193,8 @@ def verify_user(questions: list[dict], materials: str) -> str:
 正答そのものが資料と食い違っていれば、問題文・選択肢・answer・explanation を資料に合わせて直してください。
 記述式の問題は distractor_reasons を空配列にして、そのまま返してください。
 問題の数・id・aspect・type は変えないでください。
+answer と distractor_reasons の choice は 0 始まりの添字（0〜3）です。choices の順番は変えないでください。
+answer_text は choices[answer] と同じ文字列にしてください。
 
 ## クイズ
 {json.dumps({"questions": questions}, ensure_ascii=False, indent=1)}
@@ -260,6 +263,48 @@ def resolve_concepts(q: dict, selected: list[dict]) -> tuple[list[str], list[str
     return [c["id"] for c in chosen], warnings
 
 
+# ------------------------------------------------------------------ 正答の添字（#31）
+
+def _answer_matches(q: dict) -> bool:
+    ch = q.get("choices", [])
+    a = q.get("answer", -1)
+    return 0 <= a < len(ch) and ch[a].strip() == q.get("answer_text", "").strip()
+
+
+def fix_answer_index(q: dict, before: dict | None) -> tuple[dict | None, list[str]]:
+    """自己確認の後の 4 択問題で、answer を answer_text の位置に合わせる。LLM は呼ばない。
+
+    自己確認で添字が 1 始まりに変わることがある（#31）。answer は採点に使うので、answer_text を正とする。
+    - answer_text が choices のどれかと一致すれば、answer をその位置にする
+    - どれとも一致しなければ、自己確認前の版（before）が一致していればそれに戻す。戻せなければ外す（None）
+    戻り値: (使う問題 または None, 警告)
+    """
+    if q.get("type") != "mcq":
+        return q, []
+    qid = q.get("id", "?")
+    warnings: list[str] = []
+    ch = [c.strip() for c in q.get("choices", [])]
+    text = q.get("answer_text", "").strip()
+    if text in ch:
+        at = ch.index(text)
+        if at != q.get("answer"):
+            warnings.append(f"{qid}: answer を answer_text に合わせて直した（{q.get('answer')} → {at}）")
+            q = {**q, "answer": at}
+    elif before is not None and before.get("type") == "mcq" and _answer_matches(before):
+        warnings.append(f"{qid}: 自己確認後の answer_text が選択肢に無いので、自己確認前の問題に戻した")
+        return before, warnings
+    else:
+        warnings.append(f"{qid}: answer_text が選択肢に無く、戻せる版も無いので、この問題を外した")
+        return None, warnings
+    for d in q.get("distractor_reasons", []):
+        c = d.get("choice")
+        if not isinstance(c, int) or not 0 <= c < len(ch):
+            warnings.append(f"{qid}: distractor_reasons の choice={c} が choices の範囲外")
+        elif c == q["answer"]:
+            warnings.append(f"{qid}: distractor_reasons の choice={c} が正答と同じ")
+    return q, warnings
+
+
 # ------------------------------------------------------------------ 検証
 
 def validate(questions: list[dict], confirmed_ids: list[str], pages: list[dict]) -> list[str]:
@@ -282,6 +327,8 @@ def validate(questions: list[dict], confirmed_ids: list[str], pages: list[dict])
                 warnings.append(f"{qid}: answer={q.get('answer')} が choices の範囲外")
             if len(set(ch)) != len(ch):
                 warnings.append(f"{qid}: 選択肢に重複がある")
+            if 0 <= q.get("answer", -1) < len(ch) and not _answer_matches(q):
+                warnings.append(f"{qid}: choices[answer] が answer_text と一致しない（出題しない）")
         if not q.get("sources"):
             warnings.append(f"{qid}: sources が空")
         for s in q.get("sources", []):
@@ -320,6 +367,16 @@ def generate_quiz(client, model: str, graph: dict, vocab: dict, pages: list[dict
     by_id = {q["id"]: q for q in verified}
     final = [by_id.get(q["id"], q) for q in questions]      # 返ってこなかった問題は生成時のまま
 
+    # 正答の添字を answer_text に合わせる（#31）。合わせられない問題は外す
+    answer_warnings: list[str] = []
+    fixed = []
+    for q, before in zip(final, questions):
+        q2, w = fix_answer_index(q, before)
+        answer_warnings += w
+        if q2 is not None:
+            fixed.append(q2)
+    final = fixed
+
     # concept_labels を概念 id にする。UI・採点・results.json は従来どおり concepts（id）を使う
     resolve_warnings: list[str] = []
     for q in final:
@@ -328,7 +385,9 @@ def generate_quiz(client, model: str, graph: dict, vocab: dict, pages: list[dict
     n_replaced = sum(1 for q in final for d in q.get("distractor_reasons", []) if d.get("replaced"))
 
     # (3) 自動検証
-    warnings = resolve_warnings + validate(final, confirmed_ids, pages)
+    warnings = answer_warnings + resolve_warnings + validate(final, confirmed_ids, pages)
+    # 補正の後でも正答の添字が answer_text と合わない 4 択は出さない（正しく答えても不正解になるため）
+    final = [q for q in final if q.get("type") != "mcq" or _answer_matches(q)]
     meta = {
         "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
         "model": model,
