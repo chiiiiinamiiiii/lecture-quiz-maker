@@ -165,8 +165,9 @@ class MapApp {
       `<span><i style="background:${rgba(COLORS.asked, 1)}"></i>${T.asked}</span>` +
       `<span><i class="ring"></i>${T.selected}</span>`;
     const hint = this.root.querySelector(".qm-hint");
-    hint.textContent = T.hint;
-    hint.title = T.hint;                // 幅が足りず省略されたときも、マウスを乗せれば全文が読める
+    const hintText = this.tool === "hand" ? T.hint_hand : T.hint_select;   // ツールごとに説明を替える（#67）
+    hint.textContent = hintText;
+    hint.title = hintText;              // 幅が足りず省略されたときも、マウスを乗せれば全文が読める
 
     const lec = this.root.querySelector(".qm-lectures");
     if (!lec.dataset.built || lec.dataset.course !== this.data.course_id || lec.dataset.lang !== T.lecture_fmt) {
