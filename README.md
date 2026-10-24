@@ -92,43 +92,49 @@ Only the map drawing and the selection are plain code.
 ## Evaluation
 
 <!-- EVAL:BEGIN（data/team/output-reviewer/summary-for-readme.md から差し込み） -->
-All numbers are counts with denominators. Model: `gemini-3.1-flash-lite`. "Before" = prompts at commit `fb02246` (vocab/graph generated 2026-10-19). The evaluation protocol is in `eval-protocol.md` (fixed random seed 20261024, so the samples are reproducible). "After" for vocabulary and extraction = the fixes for #8–#12 (regenerated 2026-10-24) plus the kind check of #49. The kind check was applied afterwards to the regenerated graph, so the numbers may change slightly when everything is regenerated with the final code. The After sample is a new random 30 from the regenerated graph. Each version was extracted only once; run-to-run variation was not measured.
+All numbers are counts with denominators. "Before" = prompts at commit `fb02246` (vocab/graph generated 2026-10-19, `gemini-3.1-flash-lite`). The evaluation protocol is in `eval-protocol.md` (fixed random seed 20261024, so the samples are reproducible). Vocabulary and extraction "after" = the final code, run three times on the Ethics course (§1). Question quality, grading and map value were measured on the Before graph with the fixed question and grading code, so those changes come from the question and grading fixes only.
 
 #### 1. Vocabulary quality (§12-1, §12-2)
 
-| | Ethics before (17 lectures, 185 pages) | NLP before (4 lectures, 136 pages, English slides) | Ethics after |
-|---|---|---|---|
-| Concept kinds | 6 | 5 | 5 |
-| Relation labels | 6 + Other | 7 + Other | 6 + Other |
-| Concepts / relations extracted | 74 / 104 | 13 / 26 | 129 / 79 |
-| Relations labelled "Other" | 32 / 104 (30.8%) | 3 / 26 (11.5%) | 49 / 79 (62%); 14 / 44 (32%) without book relations |
-| Concepts with kind "Other" | 28 / 74 (37.8%) | 5 / 13 (38.5%) | 0 / 129 |
-| Label with 0 relations | Proposes | Opposes | none |
-| Person concepts | 0 | – | 30 |
-| Relations whose end kinds break the vocabulary | – | – | 0 / 30 |
-| Relations usable for questions (not "Other") | 72 | – | 30 |
-| Concept–concept relations (no person, no book) | 104 | – | 25 |
+The final code (main at the end of the review) was run three times on all 17 Ethics lectures: twice with `gemini-3.1-flash-lite` and once with `gemini-3.8-flash`. Nothing else changed between the runs. Each run derives its own vocabulary, so the labels and kinds differ between runs.
 
-The derived vocabulary differs by field. Ethics got *proposes, opposes, means–end, grounds, transformation, inclusion*. NLP got *depends on, composed of, purpose, inclusion, conversion, metric, opposes*. Only *opposes* and *inclusion* appear in both.
+|  | Before (fb02246) | flash-lite run 1 | flash-lite run 2 | gemini-3.8-flash (stopped) |
+|---|---|---|---|---|
+| Concept kinds (excluding the dropped book kind) | 6 | 3 | 3 | 4 |
+| Relation labels (+ Other) | 6 | 6 | 6 | 8 |
+| Concepts / relations | 74 / 104 | 82 / 54 | 77 / 48 | 176 through lecture 13 (concepts only, before dropping books; no relations) |
+| Relations labelled "Other" | 32 / 104 (30.8%) | 20 / 54 (37.0%) | 15 / 48 (31.2%) | – |
+| Concepts with kind "Other" | 28 / 74 | 1 / 82 | 0 / 77 | – |
+| Person concepts | 0 | 23 | 24 | – |
+| Book concepts (dropped before relation extraction) | 0 | 0 (39 dropped) | 0 (21 dropped) | – |
+| Relations usable for questions (not "Other") | 72 | 34 | 33 | – |
+| Relations without a person | 104 | 18 | 8 | – |
+| Relations whose end kinds break the vocabulary | – | 0 / 34 | 0 / 33 | – |
+| Concepts with no relation | 3 / 74 | 24 / 82 | 19 / 77 | – |
+| Concepts of the Before graph that are missing | – | 34 / 74 | 37 / 74 | – |
 
-The same defect showed up in both courses: a relation label has no concept kind that can fill its subject or object slot. For example, there is no "person" kind for *proposes* and no "metric" kind for *metric*. As a result, Ethics has 0 person concepts, although Kant appears in 10 lectures.
+**Model choice.** The `gemini-3.8-flash` run stopped at lecture 13: the free tier allows 20 requests per day for this model, and one course needs about 35. Up to lecture 13 it had found 176 concepts; both flash-lite runs had about 112 at the same point (before dropping books). Its vocabulary had 5 kinds (4 without the book kind) and 8 labels plus Other, and it was the only run with both *subdivision* (part–whole) and *contrast* (opposition), and with a kind for schools of thought separate from persons. Per call it used about 16,000 tokens (thinking tokens about 1.8 times the output) against about 7,100 for flash-lite (no thinking). 14 successful calls took 3,000 seconds including waits for 429/503; flash-lite needs 230–290 seconds for all 35 calls. Coverage depends strongly on the model, but on the free tier only flash-lite can import a whole course in one day.
 
-After the fix, the vocabulary has a person kind (30 person concepts), and no concept falls into "Other". Each relation label now states which kinds may appear at each end, and relations that break this are relabelled "Other". Most of the "Other" relations are author → book. Without them, the "Other" rate (32%) is about the same as before.
+| | Ethics before | NLP before (4 lectures, English slides) |
+|---|---|---|
+| Relation labels | proposes, opposes, means–end, grounds, transformation, inclusion | depends on, composed of, purpose, inclusion, conversion, metric, opposes |
+| Relations labelled "Other" | 32 / 104 (30.8%) | 3 / 26 (11.5%) |
 
-Two problems remain. Books still become concepts (36 of 129). Concept–concept relations fell from 104 to 25, so relation questions have less material.
-
-With English slides (NLP lecture 1), the vocabulary, concepts and questions came out in English: 0 of 27 concepts and 0 of 5 questions contain Japanese. Only the fixed label "その他" (Other) stays in Japanese.
+The derived vocabulary differs by field; only *opposes* and *inclusion* appear in both. With the final code on English slides (NLP lecture 1), the vocabulary, concepts and questions came out in English (0 of 27 concepts and 0 of 5 questions contain Japanese).
 
 #### 2. Extraction accuracy (§12-6, 30 random relations)
 
-| | Before | After |
-|---|---|---|
-| Correct | 6 / 30 | 22 / 30 |
-| Ambiguous | 16 / 30 | 6 / 30 |
-| Wrong | 8 / 30 | 2 / 30 |
-| Correct / ambiguous / wrong, book relations excluded | 6 / 16 / 8 (no books) | 10 / 5 / 2 (17 relations) |
-| Concept pairs with conflicting labels | 10 pairs | 0 pairs |
-| Relations whose cited page contains both concept names | 67 / 104 | 52 / 79 (69 / 79 when person names are matched by surname) |
+Each sample is 30 relations drawn from that run's graph with seed 20261024. The 3.8-flash run has no relations.
+
+|  | Before (fb02246) | flash-lite run 1 | flash-lite run 2 | gemini-3.8-flash (stopped) |
+|---|---|---|---|---|
+| Correct | 6 / 30 | 17 / 30 | 25 / 30 | – |
+| Ambiguous | 16 / 30 | 9 / 30 | 3 / 30 | – |
+| Wrong | 8 / 30 | 4 / 30 | 2 / 30 | – |
+| Concept pairs with conflicting labels | 10 | 0 | 0 | – |
+| Relations whose cited page contains both concept names (person names matched by surname) | 67 / 104 | 39 / 54 | 39 / 48 | – |
+
+**Run-to-run variation.** The two flash-lite runs used the same code and the same model, yet they differ a lot: "Other" 20 / 54 vs 15 / 48, relations without a person 18 vs 8, and correct / ambiguous / wrong 17 / 9 / 4 vs 25 / 3 / 2. In run 2, 30 of the 33 usable relations are *proposes* (person → concept), so relation questions are mostly "who proposed X". Differences of this size between versions should not be read as the effect of a fix. Each run derives the vocabulary again, so the labels, the kinds, and the kinds allowed at each end of a label all change. When the allowed kinds come out narrow, relations that fit a label semantically are relabelled "Other" (issue #74); this is one main source of the variation in the "Other" rate.
 
 #### 3. Question quality (§12-3, 30 questions over 6 lecture ranges)
 
