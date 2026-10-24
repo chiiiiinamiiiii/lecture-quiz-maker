@@ -50,8 +50,11 @@ class FakeIndex:
         self.hits, self.queries = hits, []
 
     def search(self, client, query, k=5, exclude=frozenset()):
-        self.queries.append((query, set(exclude)))
-        return [h for h in self.hits.get(query, []) if (h["lecture"], h["page"]) not in exclude][:k]
+        raise AssertionError("complete_relations は search を 1 件ずつ呼ばず search_many を使う（#84）")
+
+    def search_many(self, client, queries, k=5, exclude=frozenset()):
+        self.queries.append((list(queries), k, set(exclude)))
+        return [[h for h in self.hits.get(q, []) if (h["lecture"], h["page"]) not in exclude][:k] for q in queries]
 
 
 class FakeWiki:
@@ -166,7 +169,7 @@ def test_isolated_concept_uses_index_and_external_needs_wiki_text(llm):
                     "evidence_url": "https://ja.wikipedia.org/wiki/丁説", "evidence_title": "丁説",
                     "added_by": "completion"}]
     c = g["stats"]["completion"]
-    assert c["searches"] >= 1 and ("丁説", {(1, 2)}) in index.queries
+    assert c["searches"] >= 1 and len(index.queries) == 1 and "丁説" in index.queries[0][0]
     assert c["isolated_after"] < c["isolated_before"]
 
 
@@ -226,3 +229,43 @@ def test_pair_records_for_evaluation(llm):
     assert bad["result"] == "rejected" and bad["reason"] == "evidence が本文に無い"
     assert bad["pages"] == [{"lecture": 2, "page": 1, "score": 0.9, "via": "search"}]
     assert bad["judgement"]["evidence"] == "無い文"
+
+
+def test_isolated_concepts_use_one_embedding_call(llm, monkeypatch):
+    """つながらない概念が N 個でも、索引の検索の埋め込みは 1 回（#84）。本物の SlideIndex で埋め込みだけ差し替える。"""
+    import numpy as np
+
+    from quizmap import rag
+
+    calls = []
+
+    def fake_embed(client, texts, task="RETRIEVAL_DOCUMENT"):
+        calls.append((list(texts), task))
+        return [[1.0, float(i % 3)] for i, _ in enumerate(texts)]
+
+    monkeypatch.setattr(rag, "embed", fake_embed)
+    pages = [{"lecture": 1, "page": n, "text": f"ページ{n}"} for n in range(1, 8)]
+    index = rag.SlideIndex(pages, np.array([[1.0, float(n % 3)] for n in range(7)], dtype=np.float32))
+    g0 = {"course": "テスト", "relations": [], "stats": {},
+          "concepts": [concept(f"c{n}", f"概念{n}", "人物", (1, n)) for n in range(1, 8)]}
+    g = extraction.complete_relations(None, "m", VOCAB, g0, pages, index=index, wiki=None, log=lambda s: None)
+    assert len(calls) == 1 and calls[0][1] == "RETRIEVAL_QUERY"
+    assert sorted(calls[0][0]) == [f"概念{n}" for n in range(1, 8)]
+    c = g["stats"]["completion"]
+    assert c["isolated_before"] == 7 and c["searches"] == 7
+    # 自分のページは候補のページにしない（exclude を概念ごとに渡せないので、取った後に除いている）
+    for rec in c["pairs"]:
+        for p in rec["pages"]:
+            assert p["via"] == "search"
+
+
+def test_own_pages_excluded_after_search_many(llm):
+    hits = [{"lecture": 1, "page": 2, "text": "", "score": 0.99}, {"lecture": 2, "page": 1, "text": "", "score": 0.5}]
+    index = FakeIndex({"丁説": hits})
+    g0 = graph()
+    g0["concepts"][2]["sources"].append({"lecture": 2, "page": 1})
+    g = extraction.complete_relations(None, "m", VOCAB, g0, PAGES, index=index, wiki=None, log=lambda s: None)
+    queries, k, exclude = index.queries[0]
+    assert exclude == set() and k == extraction.COMPLETION_SEARCH_K + 1
+    rec = {(r["a"], r["b"]): r for r in g["stats"]["completion"]["pairs"]}[("hei", "tei")]
+    assert rec["pages"] == [{"lecture": 2, "page": 1, "score": 0.5, "via": "search"}]
