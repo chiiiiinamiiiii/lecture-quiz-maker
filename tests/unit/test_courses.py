@@ -103,13 +103,27 @@ def test_save_upload_empty_name_falls_back(courses_dir):
     assert courses.save_upload(d, "", b"x").name == "upload.pdf"
 
 
-@pytest.mark.xfail(strict=True, reason="#4 ファイル名 '..' で uploads/.. を書こうとして IsADirectoryError")
-@pytest.mark.parametrize("filename", ["..", "a/.."])
+@pytest.mark.parametrize("filename", ["..", "a/..", ".", "...", " . ", "a\\..", "../.."])
 def test_save_upload_dotdot_name(courses_dir, filename):
     d = courses.create_course("c")
     p = courses.save_upload(d, filename, b"x")
     assert p.resolve().parent == (d / "uploads").resolve()
     assert p.is_file()
+    assert p.name == "upload.pdf"
+
+
+@pytest.mark.parametrize("filename, expected", [
+    ("../../evil.pdf", "evil.pdf"),
+    ("..\\..\\evil.pdf", "evil.pdf"),                       # Windows の区切り
+    ("C:\\Users\\me\\第3回.pdf", "第3回.pdf"),
+    (".hidden.pdf", "hidden.pdf"),                             # 隠しファイルにしない
+    ("..第2回.pdf", "第2回.pdf"),
+    ("a:b*c?.pdf", "a_b_c_.pdf"),
+    ("  第1回.pdf  ", "第1回.pdf"),
+    ("【配布用】第2回 倫理（前半）.pdf", "【配布用】第2回 倫理（前半）.pdf"),
+])
+def test_safe_upload_name(filename, expected):
+    assert courses.safe_upload_name(filename) == expected
 
 
 @pytest.mark.xfail(strict=True, reason="#5 記号だけ違う名前が同じ名前になり、前の PDF を上書きする")

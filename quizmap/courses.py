@@ -96,9 +96,18 @@ def rename_course(d: Path, name: str) -> None:
 _SAFE = re.compile(r"[^\w\-. ()（）【】『』「」]+")
 
 
+def safe_upload_name(filename: str) -> str:
+    """アップロードのファイル名を uploads/ の中で使える名前にする。
+
+    パスの部分は捨て、許可しない文字は _ にする。「.」「..」や先頭の「.」（隠しファイル）は使わない（#4）。
+    """
+    name = _SAFE.sub("_", filename.replace("\\", "/").split("/")[-1])
+    name = name.strip().lstrip(".").strip()
+    return name or "upload.pdf"
+
+
 def save_upload(d: Path, filename: str, data: bytes) -> Path:
-    name = _SAFE.sub("_", Path(filename).name) or "upload.pdf"
-    path = d / "uploads" / name
+    path = d / "uploads" / safe_upload_name(filename)
     path.write_bytes(data)
     return path
 
