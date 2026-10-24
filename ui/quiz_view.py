@@ -4,6 +4,7 @@ import json
 import streamlit as st
 
 from quizmap.common import DEFAULT_MODEL, make_client
+from quizmap.courses import open_rag
 from quizmap.grade import grade, save_results
 from quizmap.quiz import generate_quiz
 from ui.i18n import t
@@ -45,13 +46,25 @@ def _clear_answer_state() -> None:
         del st.session_state[k]
 
 
+def make_quiz(graph, vocab, ids, n) -> dict:
+    """出題する。RAG の索引と Wikipedia（QUIZMAP_RAG=off なら None）を渡し、正しさの確認まで行う（#78）。
+
+    確認で外された問題があると、頼んだ数より少なくなる。画面の問題数は meta の n_generated（実際の数）で出す。
+    """
+    index, wiki = open_rag(course_dir())
+    return generate_quiz(make_client(), DEFAULT_MODEL, graph, vocab, load_pages(), ids, n, index=index, wiki=wiki)
+
+
 def _generate(graph, vocab, ids, n) -> None:
     with st.spinner(t("generating")):
         try:
-            result = generate_quiz(make_client(), DEFAULT_MODEL, graph, vocab, load_pages(), ids, n)
+            result = make_quiz(graph, vocab, ids, n)
         except Exception as e:  # noqa: BLE001  画面に理由を出して止める
             st.error(t("gen_failed", e=e))
             return
+    if not result["questions"]:              # 確認ですべて外れた。0 問の解答欄は出さない
+        st.warning(t("no_valid_questions"))
+        return
     st.session_state["quiz"] = result
     _clear_answer_state()
     (course_dir() / "quiz_latest.json").write_text(
