@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest==9.1.1
+playwright==1.64.1
+plotly==7.1.0   # lasso_check.py（§11 の初期確認）だけが使う

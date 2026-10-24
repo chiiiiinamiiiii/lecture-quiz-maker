@@ -1,8 +1,12 @@
 # 役割ごとの作業環境を決める（source して使う）。作業ツリーのブランチ名 team/<役割> から役割を読む。
 MAIN="$(cd "$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")" && pwd)"
 BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
-ROLE="${QUIZMAP_ROLE:-${BRANCH#team/}}"
-[ "$ROLE" = "$BRANCH" ] && ROLE="main"
+# team/<役割> のほか、プルリクエストを分けた team/<役割>-<何か>（例: team/ui-improver-i18n）も同じ役割として扱う
+ROLE="main"
+for r in ui-reviewer ui-improver output-reviewer prompt-improver feature-dev; do
+  case "$BRANCH" in "team/$r"|"team/$r-"*) ROLE="$r" ;; esac
+done
+ROLE="${QUIZMAP_ROLE:-$ROLE}"
 case "$ROLE" in
   main)            PORT=8501 ;;
   ui-reviewer)     PORT=8611 ;;
