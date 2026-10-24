@@ -223,6 +223,34 @@ def find_narrow_person_targets(vocab: dict) -> list[str]:
     return warnings
 
 
+def widen_person_targets(vocab: dict) -> list[str]:
+    """人物を主語とするラベルの相手の種類を、コードの規則で広げる（#74）。vocab を書き換え、記録の文を返す。LLM は呼ばない。
+
+    プロンプトで指示しても、語彙の to_kinds が狭いままのことがあった（人物 → 概念 の関係が「その他」になる）。
+    規則: from_kinds に人物の種類（person が true）があるラベルで、to_kinds の「人物以外かつ cited_work 以外」の種類が
+    1 つ以下なら、「人物以外かつ cited_work 以外」の種類をすべて to_kinds に足す。
+    cited_work の種類は関係の抽出の前に落とすので足さない。人物の種類は、もともと to_kinds にあれば残す（足しも消しもしない）。
+    種類は名前ではなく旗で決めるので、分野に依らない。person の無い古い vocab.json では何もしない。
+    """
+    persons = {k["name"] for k in vocab["kinds"] if k.get("person") is True}
+    if not persons:
+        return []
+    content = [k["name"] for k in vocab["kinds"] if k.get("person") is not True and k.get("cited_work") is not True]
+    notes = []
+    for r in vocab["relations"]:
+        if r["label"] == OTHER_LABEL or not persons & set(r.get("from_kinds") or []):
+            continue
+        to_kinds = list(r.get("to_kinds") or [])
+        if len([k for k in to_kinds if k in content]) > 1:
+            continue
+        added = [k for k in content if k not in to_kinds]
+        if not added:
+            continue
+        r["to_kinds"] = to_kinds + added
+        notes.append(f"関係「{r['label']}」の to_kinds に {'・'.join(added)} を足した（人物を主語とするラベルの相手が狭かったため）")
+    return notes
+
+
 def derive_vocab(client, model: str, lectures, course_hint: str, log=print) -> dict:
     """語彙を導出して dict で返す（保存は呼び出し側）。「その他」は必ず 1 つ付ける。"""
     chosen = choose_lectures(lectures, MAX_CORPUS_CHARS)
@@ -255,8 +283,11 @@ def derive_vocab(client, model: str, lectures, course_hint: str, log=print) -> d
         gaps = find_kind_gaps(vocab)
         if gaps:
             log("警告: 作り直しても関係の端になる種類が足りない: " + " / ".join(gaps))
-    warnings = find_kind_warnings(vocab)
-    for w in warnings:
+    widened = widen_person_targets(vocab)
+    for w in widened:
+        log("語彙の後処理: " + w)
+    warnings = widened + find_kind_warnings(vocab)
+    for w in warnings[len(widened):]:
         log("警告: " + w)
 
     # 「その他」を常に 1 つ用意する（§3）。LLM が作っていたら除いて付け直す
@@ -277,6 +308,7 @@ def derive_vocab(client, model: str, lectures, course_hint: str, log=print) -> d
         "retried_for_kind_gaps": retried,
         "kind_gaps": gaps,
         "kind_warnings": warnings,
+        "widened_to_kinds": widened,
     }
     log(f"種類 {len(vocab['kinds'])} 個: " + " / ".join(k["name"] for k in vocab["kinds"]))
     log(f"関係 {len(vocab['relations'])} 個: " + " / ".join(r["label"] for r in vocab["relations"]))
