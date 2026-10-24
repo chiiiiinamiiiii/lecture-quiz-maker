@@ -7,6 +7,7 @@ LLM 呼び出しは quizmap.common.call_json（プロバイダ非依存）だけ
 from __future__ import annotations
 
 import datetime as dt
+import random
 import time
 from collections import Counter
 
@@ -90,19 +91,27 @@ VERIFY_SYSTEM = """あなたは作成済みのクイズを点検する専門家�
 
 # ------------------------------------------------------------------ 材料の組み立て
 
-def split_counts(n: int, has_relations: bool) -> dict[str, int]:
-    """目安の比率 関係4 / 具体例3 / 定義3 で n 問を配分する。関係が 1 本もなければ関係の枠を他に回す。"""
+def split_counts(n: int, has_relations: bool, rng: random.Random | None = None) -> dict[str, int]:
+    """目安の比率 関係4 / 具体例3 / 定義3 で n 問を配分する。関係が 1 本もなければ関係の枠を他に回す。
+
+    端数の大きい枠から 1 問ずつ足す。端数が同じ枠どうしの順は乱数で決める（#24）。
+    元の順のままだと、比率が同じ具体例と定義では同点の 1 問がいつも具体例に回る。
+    rng はテストで種を固定するために渡せる。渡さなければ新しく作る。
+    """
+    rng = rng or random.Random()
     ratio = dict(ASPECT_RATIO)
     if not has_relations:
         ratio["relation"] = 0
     total = sum(ratio.values())
-    counts = {k: int(n * v / total) for k, v in ratio.items()}
-    order = sorted(ratio, key=lambda k: -(n * ratio[k] / total - counts[k]))  # 端数の大きい順に 1 問ずつ足す
+    counts = {k: n * v // total for k, v in ratio.items()}
+    remainder = {k: n * v % total for k, v in ratio.items()}   # 整数で比べる（浮動小数の誤差で同点が崩れないように）
+    keys = [k for k in ratio if ratio[k] > 0]
+    rng.shuffle(keys)
+    order = sorted(keys, key=lambda k: -remainder[k])          # 安定ソートなので、同点の順は shuffle の順
     for k in order:
         if sum(counts.values()) >= n:
             break
-        if ratio[k] > 0:
-            counts[k] += 1
+        counts[k] += 1
     return counts
 
 
