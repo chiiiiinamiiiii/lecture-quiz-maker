@@ -23,6 +23,7 @@ import re
 import secrets
 import shutil
 import threading
+import time
 import traceback
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -206,6 +207,30 @@ _jobs: dict[str, Job] = {}
 _lock = threading.Lock()
 
 
+JOB_READ_RETRIES = 5
+JOB_READ_WAIT = 0.05      # 秒
+
+
+def _read_job_json(path: Path) -> dict | None:
+    """job.json を読む。壊れていれば短く待って読み直す（#54）。読めなければ None。
+
+    write_json は置き換えで書くので、ふつうは壊れたファイルは見えない。
+    以前の版が書いた途中のファイルや、別のプロセスが直接書いた場合に備える。
+    """
+    for attempt in range(JOB_READ_RETRIES):
+        try:
+            data = read_json(path)
+            if isinstance(data, dict):
+                return data
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            pass
+        except FileNotFoundError:
+            return None
+        if attempt < JOB_READ_RETRIES - 1:
+            time.sleep(JOB_READ_WAIT)
+    return None
+
+
 def current_job(d: Path) -> Job | None:
     """このコースの取り込み処理の状態。実行中のものが無ければ、前回の記録（job.json）を返す。"""
     job = _jobs.get(str(d))
@@ -213,7 +238,10 @@ def current_job(d: Path) -> Job | None:
         return job
     path = d / "job.json"
     if path.exists():
-        data = read_json(path)
+        data = _read_job_json(path)
+        if data is None:
+            return Job(course_dir=str(d), status="error",
+                       error="取り込みの記録（job.json）を読めなかった。もう一度実行してください。")
         if data.get("status") == "running":      # アプリが途中で止まった
             data["status"] = "error"
             data["error"] = "アプリが処理の途中で終了した。もう一度実行してください。"

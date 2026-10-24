@@ -277,3 +277,31 @@ def test_current_job_prefers_live_job_over_file(courses_dir):
     courses._jobs[str(d)] = live
     write_json(d / "job.json", {**json.loads(courses.dumps(courses.asdict(live))), "status": "done"})
     assert courses.current_job(d) is live
+
+
+def test_current_job_retries_broken_json_until_written(courses_dir, monkeypatch):
+    """読んだ瞬間に壊れていても、短く待って読み直す（#54）。"""
+    import threading
+    d = courses.create_course("c")
+    path = d / "job.json"
+    path.write_text("", encoding="utf-8")                 # 書きかけ（空）
+    done = courses.Job(course_dir=str(d), status="done")
+
+    def fix():
+        write_json(path, courses.asdict(done))
+    monkeypatch.setattr(courses, "JOB_READ_WAIT", 0.05)
+    t = threading.Timer(0.08, fix)
+    t.start()
+    got = courses.current_job(d)
+    t.join()
+    assert got.status == "done"
+
+
+def test_current_job_gives_error_when_json_stays_broken(courses_dir, monkeypatch):
+    monkeypatch.setattr(courses, "JOB_READ_WAIT", 0.001)
+    d = courses.create_course("c")
+    (d / "job.json").write_text('{"status": "runn', encoding="utf-8")
+    got = courses.current_job(d)
+    assert got.status == "error"
+    assert "job.json" in got.error
+    assert got.course_dir == str(d)

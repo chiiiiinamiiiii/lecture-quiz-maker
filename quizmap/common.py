@@ -16,6 +16,7 @@ import random
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unicodedata
@@ -196,9 +197,36 @@ def read_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _umask() -> int:
+    mask = os.umask(0)
+    os.umask(mask)
+    return mask
+
+
+_UMASK = _umask()
+
+
 def write_json(path: Path, data) -> None:
+    """JSON を書く。同じフォルダの一時ファイルに書いてから os.replace で置き換える（#54）。
+
+    読む側には、置き換える前の完全なファイルか、置き換えた後の完全なファイルのどちらかが見える。
+    書いている途中の空や半端なファイルは見えない。別のスレッドが同じファイルを同時に書いても、
+    一時ファイルはそれぞれ別の名前なので混ざらない（最後に置き換えたものが残る）。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    text = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(tmp, 0o666 & ~_UMASK)          # mkstemp は 0600 で作るので、普通のファイルと同じ権限に戻す
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------- llm helper
