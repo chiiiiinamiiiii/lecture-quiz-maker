@@ -157,9 +157,9 @@ def materials_text(concepts, selected, inner, neighbors, needed, page_text, styl
                          f" [第{r['source']['lecture']}回p.{r['source']['page']}]")
     else:
         parts.append("- （なし）")
-    parts.append("\n## 関係ラベルごとの問い方（この授業の語彙。関係を問う問題は必ずこれに沿う）")
+    parts.append("\n## 関係ラベルごとの出題の方針（出題者向け。この文を問題文に書き写さない）")
     for v in styles:
-        parts.append(f"- {v['label']}: 定義「{v['definition']}」／問い方「{v['question_style']}」／例: {v['example']}")
+        parts.append(f"- {v['label']}: 定義「{v['definition']}」／出題の方針「{v['question_style']}」／例: {v['example']}")
     parts.append("\n## 誤答に使ってよい隣接概念（地図上で隣り合う概念。紛らわしい誤答にする。concept_labels には書かない）")
     for cid, ns in neighbors.items():
         if ns:
@@ -179,8 +179,10 @@ def gen_user(materials: str, n: int, counts: dict[str, int], n_short: int) -> st
       answer は 0 始まりの添字（0〜3）。answer_text は choices[answer] と同じ文字列にする
 
 守ること:
-- 関係を問う問題は「関係ラベルごとの問い方」に沿って問う。問い方はそこに書かれたものだけを使う
-- 関係を問う問題では、材料の関係の from と to を入れ替えない。問い方の A・B がどちらに当たるかは、関係の行の括弧の説明で決める
+- 関係を問う問題は、そのラベルの出題の方針が示す内容を問う。ただし問題文は学習者に向けた疑問文で書き、方針の文（「〜を問う」）を書き写さない
+- 問題文に、正答に当たる関係ラベルの名前（「関係ラベルごとの出題の方針」にあるラベル名）を書かない
+- 1 つの問題で問うラベルは 1 つだけ
+- 関係を問う問題では、材料の関係の from と to を入れ替えない。出題の方針の A・B がどちらに当たるかは、関係の行の括弧の説明で決める
 - relation_used には、関係を問う問題で根拠にした関係の行の from・to・label を、概念の表記そのままで書く。関係を問う問題でなければ 3 つとも空文字列にする
 - 具体例を問う問題は、資料に出てくる具体例と概念の対応を問う
 - 定義を問う問題は、資料の記述に基づく定義を問う
@@ -206,6 +208,7 @@ def verify_user(questions: list[dict], materials: str) -> str:
 どの行にも当たらなければ、問題を資料の記述に合わせて直してください。relation_used はその行の from・to・label にしてください。
 記述式の問題は distractor_reasons を空配列にして、そのまま返してください。
 問題の数・id・aspect・type は変えないでください。
+問題文が「〜を問う。」で終わっている、または正答に当たる関係ラベルの名前を含んでいれば、問題文を学習者向けの疑問文に直してください。
 answer と distractor_reasons の choice は 0 始まりの添字（0〜3）です。choices の順番は変えないでください。
 answer_text は choices[answer] と同じ文字列にしてください。
 
@@ -337,6 +340,29 @@ def check_relation_direction(q: dict, inner: list[dict], concepts: dict[str, dic
     return [f"{qid}: relation_used が材料の関係のどれにも当たらない（{used.get('from')} —{used.get('label')}→ {used.get('to')}）"]
 
 
+# ------------------------------------------------------------------ 問題文（#33）
+
+_TRAILING = "。．.?？!！ 　"
+
+
+def check_prompt_style(q: dict, styles: list[dict]) -> list[str]:
+    """問題文が出題者向けの文（question_style）を書き写していないか。警告だけ出す。"""
+    qid = q.get("id", "?")
+    prompt = q.get("prompt", "")
+    warnings = []
+    if prompt.rstrip(_TRAILING).endswith("を問う"):
+        warnings.append(f"{qid}: 問題文が「を問う」で終わる（出題の方針を書き写している）")
+    body = _norm(prompt)
+    for v in styles:
+        style = _norm(v.get("question_style", "")).rstrip(_TRAILING)
+        if style and style in body:
+            warnings.append(f"{qid}: 問題文に「{v['label']}」の出題の方針がそのまま入っている")
+    used = (q.get("relation_used") or {}).get("label", "")
+    if q.get("aspect") == "relation" and used and _norm(used) in body:
+        warnings.append(f"{qid}: 問題文に正答のラベル名「{used}」が入っている")
+    return warnings
+
+
 # ------------------------------------------------------------------ 検証
 
 def validate(questions: list[dict], confirmed_ids: list[str], pages: list[dict]) -> list[str]:
@@ -418,7 +444,9 @@ def generate_quiz(client, model: str, graph: dict, vocab: dict, pages: list[dict
 
     # (3) 自動検証
     direction_warnings = [w for q in final for w in check_relation_direction(q, inner, concepts)]
-    warnings = answer_warnings + resolve_warnings + direction_warnings + validate(final, confirmed_ids, pages)
+    style_warnings = [w for q in final for w in check_prompt_style(q, styles)]
+    warnings = (answer_warnings + resolve_warnings + direction_warnings + style_warnings
+                + validate(final, confirmed_ids, pages))
     # 補正の後でも正答の添字が answer_text と合わない 4 択は出さない（正しく答えても不正解になるため）
     final = [q for q in final if q.get("type") != "mcq" or _answer_matches(q)]
     meta = {
