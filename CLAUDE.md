@@ -24,6 +24,7 @@
 | output-reviewer（出力評価） | 書かない。Issue と `data/team/output-reviewer/` の評価結果だけ | 指揮の許可を得て使う |
 | prompt-improver（プロンプト改善） | `quizmap/vocab.py`、`quizmap/extraction.py`、`quizmap/quiz.py`、`quizmap/grade.py` | 指揮の許可を得て使う |
 | feature-dev（機能開発） | `quizmap/courses.py`、`quizmap/common.py`、新しい機能のファイル | 指揮の許可を得て使う |
+| rag-engineer（RAG） | `quizmap/rag.py`（索引・埋め込み・Wikipedia）。設計は `docs/rag-design.md` | 指揮の許可を得て使う |
 
 上の表にないファイルを触る必要が出たら、自分で触らず指揮に相談する。
 
