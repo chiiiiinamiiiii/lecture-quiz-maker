@@ -37,6 +37,9 @@ CONCEPT_USER = """授業「{course}」の第{lecture}回の資料です（ペー
 {known_block}
 守ること:
 - 出てくる概念はすべて挙げる。1 度しか出てこない概念も挙げる。数の上限はない
+- 人名・書名だけでなく、その回で説明・定義されている用語、列挙されている項目（原則の一覧、類型の一覧など）、説明に使われている例・比喩もすべて挙げる
+- スライドに出典・参考文献・引用元として書かれているだけの書名・報告書名・論文名は、概念として挙げない。
+  その本の内容として説明されている概念や、著者の人物を挙げる。本そのものの内容が講義の話題として説明されている場合だけ、その本を挙げてよい
 - 一方で、資料に書かれていない概念を足さない
 - label は資料中の表記に合わせた短い日本語（人名は姓名、立場は正式名称）
 - id は label をローマ字にした snake_case の ASCII（例: kant, gimu_ron）。既出の概念は既出の id と label をそのまま使う
@@ -173,6 +176,8 @@ def extract_concepts(client, model: str, course: str, vocab: dict, lectures: lis
         f"- {k['name']}: {k['definition']}（例: {'、'.join(kind_examples(k))}）" for k in vocab["kinds"]
     )
     kind_names = {k["name"] for k in vocab["kinds"]}
+    # 固有名（人名・書名など）の種類。#51 より前の vocab.json には proper_noun が無いので空になり、警告は出ない
+    proper_kinds = {k["name"] for k in vocab["kinds"] if k.get("proper_noun") is True}
     concepts: dict[str, dict] = {}          # id -> concept
     by_label: dict[str, str] = {}           # label -> id
     unmatched_kind: list[dict] = []         # vocab のどの kind にも当てはまらなかった概念
@@ -222,6 +227,11 @@ def extract_concepts(client, model: str, course: str, vocab: dict, lectures: lis
             if lec.number not in entry["lectures"]:
                 entry["lectures"].append(lec.number)
         log(f"概念 第{lec.number}回: {len(data['concepts'])} 件（新規 {new}）→ 累計 {len(concepts)}")
+        if proper_kinds and data["concepts"]:
+            n_proper = sum(1 for c in data["concepts"] if c["kind"].strip() in proper_kinds)
+            if n_proper * 2 > len(data["concepts"]):
+                log(f"警告: 第{lec.number}回の概念 {len(data['concepts'])} 件のうち {n_proper} 件が固有名の種類"
+                    f"（{'・'.join(sorted(proper_kinds))}）。授業の中身の概念が取りこぼされていないか")
     return concepts, unmatched_kind
 
 
@@ -260,6 +270,19 @@ def check_end_kinds(f: str, t: str, label: str, concepts: dict[str, dict],
     if kt in fk and kf in tk:
         return t, f, label, "swapped"
     return f, t, OTHER_LABEL, "other"
+
+
+def remove_cited_works(concepts: dict[str, dict], vocab: dict) -> tuple[dict[str, dict], list[str]]:
+    """cited_work が true の種類（資料が出典・参考として挙げた文献・作品）の概念を落とす（#50）。
+
+    種類の名前ではなく vocab の旗で決めるので、分野に依らない。関係の抽出の前に落とすので、
+    その概念を端にする関係は作られない（関係ごと落ちる）。cited_work の無い古い vocab.json では何も落とさない。
+    戻り値: (残った概念, 落とした種類の名前)
+    """
+    cited = {k["name"] for k in vocab["kinds"] if k.get("cited_work") is True}
+    if not cited:
+        return concepts, []
+    return {cid: c for cid, c in concepts.items() if c["kind"] not in cited}, sorted(cited)
 
 
 def extract_relations(client, model: str, course: str, vocab: dict, lectures: list[Lecture],
@@ -425,6 +448,11 @@ def run_extraction(client, model: str, vocab: dict, lectures: list[Lecture], out
 
     step("concepts")
     concepts, unmatched_kind = extract_concepts(client, model, course, vocab, lectures, log=log)
+    n_before = len(concepts)
+    concepts, cited_kinds = remove_cited_works(concepts, vocab)
+    n_cited = n_before - len(concepts)
+    if cited_kinds:
+        log(f"出典・参考の文献・作品の種類（{'・'.join(cited_kinds)}）の概念 {n_cited} 件を落とした（関係の抽出の前）")
     step("relations")
     relations, dropped, adjusted = extract_relations(client, model, course, vocab, lectures, concepts, workers, log=log,
                                                      end_kind_mismatch=end_kind_mismatch)
@@ -449,6 +477,8 @@ def run_extraction(client, model: str, vocab: dict, lectures: list[Lecture], out
         "other_kind_count": n_other_kind,
         "other_kind_rate": round(other_kind_rate, 4),
         "unmatched_kind_count": len(unmatched_kind),
+        "removed_cited_work_concepts": n_cited,
+        "cited_work_kinds": cited_kinds,
         "unmatched_kind_examples": unmatched_kind[:20],
         "relations_by_label": dict(label_counts.most_common()),
         "concepts_by_kind": dict(kind_counts.most_common()),
