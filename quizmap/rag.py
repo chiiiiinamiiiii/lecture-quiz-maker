@@ -137,7 +137,26 @@ class SlideIndex:
         """
         if not self.pages or k <= 0 or not query.strip():
             return []
-        q = self._query_vector(client, query)
+        return self._rank(self._query_vector(client, query), k, exclude)
+
+    def search_many(self, client: LLMClient, queries: list[str], k: int = 5,
+                    exclude: set[tuple[int, int]] = frozenset()) -> list[list[dict]]:
+        """search を複数の問い合わせ文でまとめて行う。結果は queries と同じ順の search の結果のリスト。
+
+        まだ埋め込んでいない文だけを 1 回の batchEmbedContents（100 件ずつ）でまとめて埋め込み、
+        search と同じキャッシュに入れる。重複した文は 1 回だけ送る。
+        """
+        if not self.pages or k <= 0:
+            return [[] for _ in queries]
+        todo = list(dict.fromkeys(q for q in queries if q.strip() and q not in self._query_cache))
+        if todo:
+            for q, v in zip(todo, embed(client, todo, task="RETRIEVAL_QUERY")):
+                v = np.asarray(v, dtype=np.float32)
+                n = np.linalg.norm(v)
+                self._query_cache[q] = v / n if n else v
+        return [self._rank(self._query_cache[q], k, exclude) if q.strip() else [] for q in queries]
+
+    def _rank(self, q: np.ndarray, k: int, exclude: set[tuple[int, int]]) -> list[dict]:
         scores = self.vectors.astype(np.float32) @ q
         hits = []
         for i in np.argsort(-scores, kind="stable"):
