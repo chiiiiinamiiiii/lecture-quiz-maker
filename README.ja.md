@@ -38,6 +38,8 @@ http://localhost:8501 を開き、「＋ 新しいコース」で PDF をアッ�
 
 テスト（API を呼ばない）: `.venv/bin/pip install -r requirements-dev.txt && .venv/bin/playwright install chromium` の後、`.venv/bin/python -m pytest tests -q`
 
+API を実際に呼ぶ通しのテスト: `RUN_API_TESTS=1 .venv/bin/python -m pytest tests/e2e/test_full_flow_api.py -q`。ブラウザで PDF をアップロードし、RAG ありで取り込み、地図で講義回の範囲を選び、3 問を作って解答・採点し、解説・`results.json`・出題済みの色が出ることを確かめます。最終のコード（2026-10-24）で、120 秒・API 14 回で通りました。この回は記述問題が出なかったので記述の採点は通っていません。記述の採点は評価の節で別に測っています。
+
 ## LLM が判断している箇所
 
 | 工程 | LLM が決めること | LLM が要る理由 |
