@@ -16,6 +16,8 @@ TEXTS = {
     "not_ingested": {"ja": "（未取り込み）", "en": " (not imported)"},
     "page": {"ja": "画面", "en": "View"},
     "page_map": {"ja": "地図とクイズ", "en": "Map & quiz"},
+    "open_ingest": {"ja": "資料の取り込み", "en": "Import materials"},
+    "back_to_map": {"ja": "地図とクイズに戻る", "en": "Back to map & quiz"},
     "page_ingest": {"ja": "資料の取り込み", "en": "Import materials"},
     "rename_course": {"ja": "コース名", "en": "Course name"},
     "rename_help": {"ja": "ここで直した名前は、このコースのデータに保存されます", "en": "Saved to this course's data"},
