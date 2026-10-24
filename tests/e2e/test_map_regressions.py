@@ -84,7 +84,7 @@ def test_two_finger_zooms_and_space_pans(page):
     page.keyboard.up("Space")
     v2 = view(page)
     assert round(v2["tx"] - v["tx"]) == -180 and v2["scale"] == v["scale"]
-    assert app(page, "a.tool") == "lasso"
+    assert app(page, "a.tool") == "hand"                  # スペースでの移動はツールを変えない
 
 
 def test_space_after_lecture_button_does_not_toggle_it(page):
@@ -194,6 +194,7 @@ def _unselected_node(page) -> tuple[float, float, str]:
 def test_click_on_empty_space_keeps_selection(page):
     lecture_button(page, "3")
     lecture_button(page, "12", "Shift")
+    tool(page, "lasso")
     n = n_selected(page)
     assert n > 0 and app(page, "a.tool") == "lasso"
     x, y = _empty_spot(page)
@@ -234,3 +235,42 @@ def test_single_click_on_node_still_selects(page):
     page.mouse.click(x, y)
     page.wait_for_timeout(1500)
     assert n_selected(page) == 1
+
+
+# ------------------------------------------------------------------ #47: 最初のツールは手のひら
+
+def test_initial_tool_is_hand_and_drag_pans(page):
+    lecture_button(page, "3")
+    n = n_selected(page)
+    assert app(page, "a.tool") == "hand"
+    x, y = _empty_spot(page)
+    v0 = view(page)
+    page.mouse.move(x, y)
+    page.mouse.down()
+    page.mouse.move(x + 120, y + 40, steps=8)
+    page.mouse.up()
+    page.wait_for_timeout(1500)
+    v1 = view(page)
+    assert round(v1["tx"] - v0["tx"]) == 120 and round(v1["ty"] - v0["ty"]) == 40
+    assert n_selected(page) == n
+
+
+def test_hand_tool_click_on_node_selects(page):
+    """手のひらのままでも、点のクリックでの選択（置き換え・Shift 追加・⌘ 除外）は効く。"""
+    assert app(page, "a.tool") == "hand"
+    lecture_button(page, "3")
+    x, y, cid = _unselected_node(page)
+    n = n_selected(page)
+    page.keyboard.down("Shift")
+    page.mouse.click(x, y)
+    page.keyboard.up("Shift")
+    page.wait_for_timeout(1500)
+    assert n_selected(page) == n + 1
+    page.keyboard.down("Meta")
+    page.mouse.click(x, y)
+    page.keyboard.up("Meta")
+    page.wait_for_timeout(1500)
+    assert n_selected(page) == n
+    page.mouse.click(x, y)
+    page.wait_for_timeout(1500)
+    assert n_selected(page) == 1 and app(page, f"a.selected.has({json.dumps(cid)})")

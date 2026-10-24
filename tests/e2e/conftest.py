@@ -161,6 +161,9 @@ def canvas_center(pg: Page) -> tuple[float, float]:
 
 
 def lasso(pg: Page, cx: float, cy: float, r: float = 60, modifier: str | None = None) -> None:
+    """投げ縄ツールで (cx, cy) のまわりを円く囲む。最初のツールは手のひらなので、投げ縄に切り替えてから行う。"""
+    if app(pg, "a.tool") != "lasso":
+        tool(pg, "lasso")
     if modifier:
         pg.keyboard.down(modifier)
     pg.mouse.move(cx + r, cy)
