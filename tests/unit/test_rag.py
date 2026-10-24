@@ -296,3 +296,108 @@ def test_search_many_exclude_blank_and_empty_index(client, fake_embed_api):
     assert rag.SlideIndex.build(client, []).search_many(client, ["a", "b"]) == [[], []]
     assert index.search_many(client, []) == []
     assert len(fake_embed_api) == before
+
+
+# ---------------------------------------------------------------- 語の正規化と題名の確認 (#93)
+
+@pytest.mark.parametrize("raw,expected", [
+    ("功利主義（こうりしゅぎ）", "功利主義"),
+    ("理(ロゴス)を伴う活動", "理 を伴う活動"),
+    ("Kant (philosopher)", "Kant"),
+    ("  「定言命法」 ", "定言命法"),
+    ("『ニコマコス倫理学』", "ニコマコス倫理学"),
+    ("エートス（ἦθος（エトス））", "エートス"),            # 入れ子の括弧
+    ("dependency parsing (dependency)", "dependency parsing"),
+    ("・徳・", "徳"),
+    ("（こうりしゅぎ）", ""),
+    ("ＴＦ－ＩＤＦ", "TF-IDF"),                            # 全角英数は半角に
+    ("word  embedding", "word embedding"),
+])
+def test_normalize_term(raw, expected):
+    assert rag.normalize_term(raw) == expected
+
+
+@pytest.mark.parametrize("term,title,ok", [
+    ("功利主義", "功利主義", True),
+    ("カント", "イマヌエル・カント", True),                # 語が題名に含まれる
+    ("イマヌエル・カント", "カント", True),                # 題名が語に含まれる
+    ("Kant", "Immanuel Kant", True),                        # 大文字・小文字は区別しない
+    ("Kant (philosopher)", "Immanuel Kant", True),
+    ("word embedding", "Word embedding", True),
+    ("知的謙虚さ", "ある芸能事務所", False),
+    ("理を伴う活動", "あるアニメ作品", False),
+    ("", "倫理学", False),
+])
+def test_title_matches(term, title, ok):
+    assert rag.title_matches(term, title) is ok
+
+
+@pytest.fixture
+def wiki_titles(monkeypatch):
+    """検索の 1 件目の題名を語ごとに決められる MediaWiki API の偽物。calls に srsearch / titles を記録する。"""
+    state = {"titles": {}, "calls": []}
+
+    def get(url, params=None, headers=None, timeout=None):
+        if params.get("list") == "search":
+            term = params["srsearch"]
+            state["calls"].append(("search", term))
+            title = state["titles"].get(term, term)
+            return FakeResponse(200, {"query": {"search": [{"title": title}] if title else []}})
+        state["calls"].append(("extract", params["titles"]))
+        return FakeResponse(200, {"query": {"pages": [{
+            "title": params["titles"], "extract": "冒頭。", "fullurl": "https://ja.wikipedia.org/wiki/x"}]}})
+
+    monkeypatch.setattr(requests, "get", get)
+    return state
+
+
+def test_wiki_searches_normalized_term_and_caches_by_it(tmp_path, wiki_titles):
+    wiki = rag.Wiki(tmp_path, "ja")
+    r = wiki.lookup("功利主義（こうりしゅぎ）")
+    assert r["title"] == "功利主義"
+    assert wiki_titles["calls"] == [("search", "功利主義"), ("extract", "功利主義")]
+    assert wiki.lookup("「功利主義」") == r                  # 正規化すると同じ語なので問い合わせない
+    assert len(wiki_titles["calls"]) == 2
+    cache = json.loads((tmp_path / "wiki_cache.json").read_text(encoding="utf-8"))
+    assert list(cache["ja"]) == ["功利主義"]
+
+
+def test_wiki_unrelated_title_is_none_and_cached(tmp_path, wiki_titles):
+    wiki_titles["titles"]["知的謙虚さ"] = "ある芸能事務所"
+    wiki = rag.Wiki(tmp_path, "ja")
+    assert wiki.lookup("知的謙虚さ") is None
+    assert wiki_titles["calls"] == [("search", "知的謙虚さ")]  # 本文は取りに行かない
+    assert wiki.lookup("知的謙虚さ") is None
+    assert len(wiki_titles["calls"]) == 1                    # 「見つからない」として覚えている
+    cache = json.loads((tmp_path / "wiki_cache.json").read_text(encoding="utf-8"))
+    assert cache == {"ja": {"知的謙虚さ": None}}
+
+
+def test_wiki_title_containing_term_is_used(tmp_path, wiki_titles):
+    wiki_titles["titles"]["カント"] = "イマヌエル・カント"
+    r = rag.Wiki(tmp_path, "ja").lookup("カント")
+    assert r is not None and r["title"] == "イマヌエル・カント"
+
+
+def test_wiki_english_parenthesis_and_case(tmp_path, wiki_titles):
+    wiki_titles["titles"]["Kant"] = "Immanuel Kant"
+    r = rag.Wiki(tmp_path, "en").lookup("Kant (philosopher)")
+    assert r is not None and r["title"] == "Immanuel Kant"
+    assert wiki_titles["calls"][0] == ("search", "Kant")
+
+
+def test_wiki_only_parenthesis_is_not_searched(tmp_path, wiki_titles):
+    assert rag.Wiki(tmp_path, "ja").lookup("（こうりしゅぎ）") is None
+    assert wiki_titles["calls"] == []
+
+
+def test_wiki_old_cache_with_unrelated_title_is_ignored(tmp_path, wiki_titles):
+    """#93 より前のキャッシュに残った、題名の合わない記事は使わない。"""
+    (tmp_path / "wiki_cache.json").write_text(json.dumps({"ja": {
+        "知的謙虚さ": {"title": "ある芸能事務所", "url": "u", "extract": "e"},
+        "徳": {"title": "徳", "url": "u2", "extract": "e2"},
+    }}, ensure_ascii=False), encoding="utf-8")
+    wiki = rag.Wiki(tmp_path, "ja")
+    assert wiki.lookup("知的謙虚さ") is None
+    assert wiki.lookup("徳")["url"] == "u2"
+    assert wiki_titles["calls"] == []
