@@ -110,16 +110,18 @@ def browser():
 
 @pytest.fixture
 def page(browser, app_url) -> Page:
-    ctx = browser.new_context(viewport={"width": 1500, "height": 1000})
+    ctx = browser.new_context(viewport={"width": 1600, "height": 1000})
     pg = ctx.new_page()
+    pg.errors = []
+    pg.on("pageerror", lambda e: pg.errors.append(str(e)[:300]))
     pg.goto(app_url, wait_until="networkidle")
-    pg.wait_for_selector(".js-plotly-plot .scatterlayer .points path", state="attached", timeout=60000)
-    pg.wait_for_timeout(2500)
+    pg.wait_for_function("() => window.__qmMapApp && window.__qmMapApp.view", timeout=60000)
+    pg.wait_for_timeout(1500)
     yield pg
     ctx.close()
 
 
-# ------------------------------------------------------------------ 操作と観測の部品
+# ------------------------------------------------------------------ 操作と観測の部品（地図は ui/static/map.js）
 
 def exception_text(pg: Page) -> str | None:
     e = pg.locator("[data-testid='stException']")
@@ -130,68 +132,60 @@ def main_text(pg: Page) -> str:
     return pg.locator("[data-testid='stMain']").inner_text(timeout=10000)
 
 
-def panel_shown(pg: Page) -> bool:
-    return "不要なものはチェック" in main_text(pg)
+def app(pg: Page, expr: str):
+    """地図部品の状態を読む（a = MapApp）。"""
+    return pg.evaluate(f"() => {{ const a = window.__qmMapApp; return {expr}; }}")
 
 
-def xrange(pg: Page) -> list[float]:
-    return pg.evaluate("() => document.querySelector('.js-plotly-plot')._fullLayout.xaxis.range")
+def n_selected(pg: Page) -> int:
+    return app(pg, "a.selected.size")
 
 
-def dragmode(pg: Page) -> str:
-    return pg.evaluate("() => document.querySelector('.js-plotly-plot')._fullLayout.dragmode")
+def panel_count(pg: Page) -> int | None:
+    """右側パネルに並んだ選択の件数（チェックボックスの数）。"""
+    t = main_text(pg)
+    if "個（うち" not in t:
+        return None
+    return pg.locator("[data-testid='stCheckbox']").count()
 
 
-def selected_nodes(pg: Page) -> int:
-    return pg.evaluate("""() => { const gd=document.querySelector('.js-plotly-plot'); let n=0;
-      gd.data.forEach(t=>{ if(t.mode==='markers+text' && Array.isArray(t.selectedpoints)) n+=t.selectedpoints.length; });
-      return n; }""")
+def node_xy(pg: Page, rank: int) -> tuple[float, float, str]:
+    """重みの順位 rank の概念の、ページ上の座標と id。"""
+    return tuple(app(pg, f"""(() => {{ const n = a.ranked[{rank}]; const p = a.toScreen(a.pos.get(n.id));
+        const r = a.canvas.getBoundingClientRect(); return [p[0] + r.left, p[1] + r.top, n.id]; }})()"""))
 
 
-def plot_center(pg: Page) -> tuple[float, float]:
-    b = pg.locator(".js-plotly-plot .nsewdrag").first.bounding_box()
+def canvas_center(pg: Page) -> tuple[float, float]:
+    b = pg.locator("canvas").first.bounding_box()
     return b["x"] + b["width"] / 2, b["y"] + b["height"] / 2
 
 
-def pill(pg: Page, name: str) -> None:
-    pg.get_by_role("button", name=name, exact=True).click()
-    pg.wait_for_timeout(3500)
-
-
-def lasso_around_median(pg: Page, r: float = 80) -> None:
-    """表示中のノードの中央値のあたりを円く投げ縄で囲む。"""
-    pts = pg.locator(".js-plotly-plot .scatterlayer .trace .points path.point")
-    boxes = [pts.nth(i).bounding_box() for i in range(pts.count())]
-    boxes = [b for b in boxes if b and b["width"] > 6]
-    xs = sorted(b["x"] + b["width"] / 2 for b in boxes)
-    ys = sorted(b["y"] + b["height"] / 2 for b in boxes)
-    cx, cy = xs[len(xs) // 2], ys[len(ys) // 2]
+def lasso(pg: Page, cx: float, cy: float, r: float = 60, modifier: str | None = None) -> None:
+    if modifier:
+        pg.keyboard.down(modifier)
     pg.mouse.move(cx + r, cy)
     pg.mouse.down()
     for k in range(1, 41):
         a = 2 * math.pi * k / 40
         pg.mouse.move(cx + r * math.cos(a), cy + r * math.sin(a), steps=2)
     pg.mouse.up()
-    pg.wait_for_timeout(4000)
+    if modifier:
+        pg.keyboard.up(modifier)
+    pg.wait_for_timeout(2500)
 
 
-def hand_pan(pg: Page, dx: int = 150) -> float:
-    """スペース＋2本指（ホイール）で横に動かし、表示範囲の移動量を返す。"""
-    x, y = plot_center(pg)
-    pg.mouse.move(x, y)
-    r0 = xrange(pg)
-    pg.keyboard.down("Space")
-    pg.wait_for_timeout(250)
-    pg.mouse.wheel(dx, 0)
-    pg.wait_for_timeout(500)
-    r1 = xrange(pg)
-    pg.keyboard.up("Space")
-    pg.wait_for_timeout(400)
-    assert abs((r1[1] - r1[0]) - (r0[1] - r0[0])) < 1e-6, "手のひら操作で表示の幅（ズーム）が変わった"
-    return r1[0] - r0[0]
+def lecture_button(pg: Page, key: str, modifier: str | None = None) -> None:
+    if modifier:
+        pg.keyboard.down(modifier)
+    pg.locator(f".qm-lectures button[data-lec='{key}']").click()
+    if modifier:
+        pg.keyboard.up(modifier)
+    pg.wait_for_timeout(2500)
 
 
-def press_home(pg: Page) -> None:
-    frame = next(f for f in pg.frames if f != pg.main_frame and "表示を元に戻す" in f.content())
-    frame.get_by_text("表示を元に戻す").click()
-    pg.wait_for_timeout(800)
+def tool(pg: Page, name: str) -> None:
+    pg.locator(f".qm-toolbar button[data-tool='{name}']").click()
+
+
+def view(pg: Page) -> dict:
+    return app(pg, "({...a.view})")

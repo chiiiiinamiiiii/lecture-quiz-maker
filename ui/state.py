@@ -15,8 +15,9 @@ def _mtime(p: Path) -> float:
     return p.stat().st_mtime if p.exists() else 0.0
 
 
+# 注意: st.cache_data は「_」で始まる引数をキャッシュのキーから外す。更新時刻は必ず普通の名前で渡す（#14）
 @st.cache_data
-def _load_graph(cdir: str, _g: float, _r: float):
+def _load_graph(cdir: str, graph_mtime: float, results_mtime: float):
     d = Path(cdir)
     graph = json.loads((d / "graph.json").read_text(encoding="utf-8"))
     vocab = json.loads((d / "vocab.json").read_text(encoding="utf-8"))
@@ -33,7 +34,7 @@ def load_graph():
 
 
 @st.cache_data
-def _load_pages(cdir: str, _m: float):
+def _load_pages(cdir: str, pages_mtime: float):
     return json.loads((Path(cdir) / "pages.json").read_text(encoding="utf-8"))
 
 
@@ -47,14 +48,13 @@ def save_course_name(name: str) -> None:
     rename_course(course_dir(), name)
 
 
-SESSION_KEYS = ("confirmed_ids", "lasso", "quiz", "graded", "hints", "results_saved", "grade_calls")
+SESSION_KEYS = ("confirmed_ids", "selection", "quiz", "graded", "hints", "results_saved", "grade_calls")
 
 
 def clear_course_state() -> None:
     """コースを切り替えたときに、前のコースの選択・クイズ・解答の状態を捨てる。"""
     for k in SESSION_KEYS:
         st.session_state.pop(k, None)
-    st.session_state["lecture_pills"] = []
-    st.session_state["map_epoch"] = st.session_state.get("map_epoch", 0) + 1
+    st.session_state["sel_version"] = st.session_state.get("sel_version", 0) + 1
     for k in [k for k in st.session_state if k.startswith(("ans-", "chk-", "hint-"))]:
         del st.session_state[k]

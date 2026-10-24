@@ -1,0 +1,76 @@
+/* QUIZ MAP の地図部品。Obsidian のグラフ表示に寄せた暗い画面に、半透明のパネルを重ねる */
+.qm-root { width: 100%; height: 100%; }
+.qm-map {
+  position: relative; width: 100%; height: 100%; overflow: hidden; outline: none;
+  border-radius: 14px;
+  background:
+    radial-gradient(ellipse at 30% 20%, rgba(255, 122, 172, 0.06), transparent 55%),
+    radial-gradient(ellipse at 80% 90%, rgba(16, 170, 156, 0.05), transparent 50%),
+    #17161c;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif;
+  color: #e2e0ec; user-select: none; -webkit-user-select: none;
+}
+.qm-map canvas { position: absolute; inset: 0; display: block; touch-action: none; }
+.qm-map[data-cursor="cross"] canvas { cursor: crosshair; }
+.qm-map[data-cursor="grab"] canvas { cursor: grab; }
+.qm-map[data-cursor="grabbing"] canvas { cursor: grabbing; }
+.qm-map[data-cursor="cross"][data-hover="1"] canvas { cursor: pointer; }
+
+.qm-glass {
+  position: absolute; z-index: 2;
+  background: rgba(30, 29, 38, 0.62);
+  backdrop-filter: blur(14px) saturate(140%); -webkit-backdrop-filter: blur(14px) saturate(140%);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px; box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+}
+
+/* ツールバー（左上） */
+.qm-toolbar { top: 12px; left: 12px; display: flex; align-items: center; gap: 2px; padding: 4px; }
+.qm-toolbar button {
+  height: 30px; min-width: 30px; padding: 0 7px; border: 0; border-radius: 7px; background: transparent;
+  color: rgba(226, 224, 236, 0.72); font-size: 12px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center;
+  transition: background 0.12s, color 0.12s;
+}
+.qm-toolbar button:hover { background: rgba(255, 255, 255, 0.08); color: #fff; }
+.qm-toolbar button.on { background: rgba(255, 122, 172, 0.2); color: #ff9cc2; }
+.qm-toolbar svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.qm-sep { width: 1px; height: 18px; background: rgba(255, 255, 255, 0.1); margin: 0 4px; }
+.qm-seg { display: inline-flex; background: rgba(0, 0, 0, 0.18); border-radius: 8px; padding: 2px; }
+.qm-seg button { height: 26px; }
+.qm-density { display: inline-flex; align-items: center; gap: 6px; padding: 0 6px; font-size: 11px; color: rgba(226, 224, 236, 0.6); }
+.qm-density input { width: 84px; accent-color: #ff7aac; }
+.qm-density span { min-width: 38px; text-align: right; font-variant-numeric: tabular-nums; }
+
+/* 凡例（右上）・件数 */
+.qm-legend { bottom: 58px; right: 12px; display: flex; gap: 12px; padding: 7px 11px; font-size: 11px; color: rgba(226, 224, 236, 0.75); }
+.qm-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.qm-legend i { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+.qm-legend i.ring { background: transparent; border: 2px solid #ff7aac; width: 7px; height: 7px; box-shadow: 0 0 6px rgba(255, 122, 172, 0.7); }
+.qm-count { top: 12px; right: 12px; padding: 5px 11px; font-size: 12px; color: #ff9cc2; }
+
+/* 操作のヒント（左下） */
+.qm-hint { left: 12px; bottom: 58px; padding: 5px 10px; font-size: 11px; color: rgba(226, 224, 236, 0.5); background: rgba(30, 29, 38, 0.45); }
+
+/* 講義回ボタン（下端） */
+.qm-lectures {
+  left: 12px; right: 12px; bottom: 12px; display: flex; align-items: center; gap: 4px; padding: 5px 6px;
+  overflow-x: auto; scrollbar-width: none;
+}
+.qm-lectures::-webkit-scrollbar { display: none; }
+.qm-lec-title { font-size: 11px; color: rgba(226, 224, 236, 0.5); padding: 0 6px 0 4px; white-space: nowrap; }
+.qm-lectures button {
+  flex: 0 0 auto; height: 26px; padding: 0 9px; border-radius: 13px; border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.03); color: rgba(226, 224, 236, 0.75); font-size: 12px; cursor: pointer;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+}
+.qm-lectures button:hover { background: rgba(255, 255, 255, 0.09); color: #fff; }
+.qm-lectures button.on { background: rgba(255, 122, 172, 0.22); border-color: rgba(255, 122, 172, 0.55); color: #ffb3d1; }
+
+/* ツールチップ */
+.qm-tooltip { display: none; max-width: 300px; padding: 9px 11px; font-size: 12px; line-height: 1.5; pointer-events: none; z-index: 3; background: rgba(24, 23, 30, 0.9); }
+.qm-tooltip b { color: #fff; font-weight: 600; }
+.qm-tooltip div { color: rgba(226, 224, 236, 0.8); margin-top: 3px; }
+.qm-tooltip small { display: block; margin-top: 5px; color: rgba(226, 224, 236, 0.5); }
+.qm-tooltip .tag { margin-left: 6px; font-size: 10px; padding: 1px 6px; border-radius: 8px; background: rgba(16, 170, 156, 0.3); color: #7ff0e3; }
+.qm-tooltip .rel { color: #ff9cc2; margin: 0 4px; }
