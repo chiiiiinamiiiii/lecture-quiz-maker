@@ -66,6 +66,12 @@ Only the map drawing and the selection are plain code.
 
 **Hints do not reveal answers.** The first version showed the concept's definition as a hint, which *is* the answer to a definition question. The hint now reveals the source slide, which keeps the retrieval step with the learner.
 
+**The vocabulary also says which kinds may sit at each end of a relation.** “Proposes” runs from a person to an idea, for example. After extraction, code checks every relation against this and relabels the ones that do not fit as “Other”. In the evaluation this single check cut wrong relations from 9 to 2 out of 30.
+
+**Cited books are not concepts.** Slides list their sources, and the model kept turning those titles into concepts. Telling it not to did not work. Instead, the vocabulary marks which concept kind holds cited works (`cited_work`), and code removes those concepts before relations are extracted. The removed titles are logged.
+
+**Output follows the language of the material.** The app detects whether the slides are Japanese or English and asks the model to write the vocabulary, concepts, questions and explanations in that language. The interface language is a separate setting.
+
 **Display density is not extraction depth.** The map can show fewer dots, but it never deletes extracted data. How many concepts are extracted at all is decided at extraction time and depends on the model and the number of calls (see Known limitations).
 
 **Map component.** The first map used Plotly. Streamlit resets a Plotly chart's selection whenever the figure changes, so keeping a lasso selection, lecture-button selection and the current zoom alive required layers of browser-side workarounds that broke repeatedly. The map is now a small canvas component (Streamlit components v2) that keeps its view and selection in the browser and only reports the selection back to Python.
@@ -159,9 +165,10 @@ Selecting by lasso gives about 10 times more relations inside the range, and tho
 
 ## Known limitations
 
-- **Extraction coverage.** The ethics course yields 74 concepts. An earlier multi-pass prototype with a stronger model found 163. Later lectures tend to repeat concepts already listed instead of adding new ones. Coverage depends on the model and on how many passes are made; I plan to expose this as a setting rather than fix one value.
+- **Run-to-run variation.** Extraction runs once per import, and the derived vocabulary changes between runs (one ethics run had *opposes*, the next had *paraphrase* instead). The numbers in the evaluation are single runs; see the evaluation for the size of the variation.
+- **Few concept-to-concept relations.** With the cheapest model, most relations connect a person to an idea. Relations between ideas, which are the best material for relation questions, stay at about 20–30 for the ethics course. Prompting for them did not help (issue #51). A stronger model is compared in the evaluation.
+- **Removing cited books can remove ideas with the same name.** *Social Contract* or *Escape from Freedom* were extracted only as book titles and were removed with them (issue #69). The removed titles are logged so this can be checked.
 - **Repeated slides.** Later lectures sometimes repeat earlier slides, which inflates occurrence counts.
-- **Course name.** The derived vocabulary sometimes takes the course name from the folder name; the name can be edited in the app.
 
 ## Repository layout
 
