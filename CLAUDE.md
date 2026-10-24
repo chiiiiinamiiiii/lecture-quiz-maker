@@ -8,7 +8,7 @@
 | 場所 | 中身 |
 |---|---|
 | `app.py` | 入口。コースの切り替えと画面の切り替え |
-| `ui/` | 画面。`map_view.py`（地図・範囲選択）、`quiz_view.py`（出題・解答・採点）、`ingest_view.py`（取り込み）、`browser_js.py` と `static/parent_lib.js`（ブラウザ側の補助）、`theme.py`、`layout.py`、`state.py` |
+| `ui/` | 画面。`map_view.py`（左の地図と右のパネル）、`map_component.py` と `static/map.js`・`static/map.css`（地図の部品。Streamlit components v2 + canvas）、`quiz_view.py`（出題・解答・採点）、`ingest_view.py`（取り込み）、`i18n.py`（画面の文言 日本語/English）、`layout.py`（配置の計算）、`state.py` |
 | `quizmap/` | 中身。`common.py`（PDF・LLM 呼び出し）、`vocab.py`（§4 語彙）、`extraction.py`（§5 抽出）、`quiz.py`（§7 出題）、`grade.py`（§8 採点）、`courses.py`（コース管理と取り込みの裏処理） |
 | `tests/e2e/` | ブラウザで実際に操作する戻り確認。UI を変えたら必ず通す |
 | `data/` | Git 管理外。`data/courses/<id>/` がコースごとのデータ |
@@ -20,7 +20,7 @@
 | 役割 | 書いてよいファイル | API |
 |---|---|---|
 | ui-reviewer（UI 評価） | 書かない。Issue とスクリーンショットだけ | 使わない（取り込み済みのコースで触る） |
-| ui-improver（UI 改善） | `ui/`、`app.py`、`.streamlit/`、`tests/e2e/` | 使わない |
+| ui-improver（UI 改善） | `ui/`（`static/map.js`・`map.css` を含む）、`app.py`、`.streamlit/`、`tests/e2e/`（`test_full_flow_api.py` を除く） | 使わない |
 | output-reviewer（出力評価） | 書かない。Issue と `data/team/output-reviewer/` の評価結果だけ | 指揮の許可を得て使う |
 | prompt-improver（プロンプト改善） | `quizmap/vocab.py`、`quizmap/extraction.py`、`quizmap/quiz.py`、`quizmap/grade.py` | 指揮の許可を得て使う |
 | feature-dev（機能開発） | `quizmap/courses.py`、`quizmap/common.py`、新しい機能のファイル | 指揮の許可を得て使う |
@@ -58,7 +58,8 @@
 - **LLM の API を呼ぶ作業は、指揮の許可を得てから。** Gemini の無料枠はプロジェクト単位の制限で、同時に叩くと互いに 429 で止まる。
 - **方向を変える判断は利用者に聞く**（機能を削る、画面の構成を大きく変える、範囲を広げる）。指揮に上げる。
 - コミットメッセージ・Issue・プルリクエストは日本語。
-- ブラウザ側の処理を `components.html` の iframe の中に書かない。iframe は再実行で作り直され、その中で登録したイベント処理は呼ばれなくなる。処理の本体は `ui/static/parent_lib.js` に置く。
+- 地図は `ui/static/map.js`（Streamlit components v2）。キー付きで描くので、再実行しても要素は作り直されず、表示位置と選択はブラウザ側に残る。地図の状態は `window.__qmMapApp` から読める（テスト用）。
+- 画面の文言は直接書かず `ui/i18n.py` の `t("キー")` を使う（日本語と English）。
 
 ## よく使うコマンド
 
