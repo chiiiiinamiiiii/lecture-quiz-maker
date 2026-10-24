@@ -1,7 +1,11 @@
 """アプリの通しの動作確認（API を呼ぶ）: 新しいコース → 取り込み → 地図 → 講義回で選択 → クイズ → 採点 → 出題済み。
 
-RUN_API_TESTS=1 のときだけ動く（@pytest.mark.api）。1 回の実行で API を 5〜6 回呼ぶ:
-  取り込み 3 回（語彙・概念・関係）＋ 生成 2 回（作成・誤答の自己確認）＋ 採点 0〜1 回（記述問題があるときだけ）
+RUN_API_TESTS=1 のときだけ動く（@pytest.mark.api）。RAG あり（既定）の 1 回の実行で API を約 15 回呼ぶ:
+  取り込み 約 12 回（語彙・索引・概念・関係・関係の補完と索引の検索）
+  ＋ 生成 3 回（作成・誤答の自己確認・出題の検証）＋ 採点 0〜1 回（記述問題があるときだけ）
+
+出題の検証（verify_uniqueness）は、正答が資料から導けない問題や、別の選択肢も正解と言える問題を外す。
+そのため問題数は頼んだ 3 問より少ないことがある。少ないときは、外した数が検証の記録と合うことを確かめる。
 
 解答中は地図のツールチップに定義が出ないこと（#42）も確かめる。
 
@@ -203,7 +207,10 @@ def test_full_flow_from_upload_to_asked_on_map(fresh_page, fresh_data_dir):
     _wait_text(pg, "採点する", GENERATE_TIMEOUT, "クイズの生成")
     quiz = json.loads((d / "quiz_latest.json").read_text(encoding="utf-8"))
     questions = quiz["questions"]
-    assert len(questions) == 3, f"3 問のはずが {len(questions)} 問"
+    n_q = len(questions)
+    dropped = ((quiz["meta"].get("uniqueness") or {}).get("dropped") or 0)
+    assert 1 <= n_q <= 3, f"1〜3 問のはずが {n_q} 問"
+    assert n_q + dropped == 3, f"3 問頼んで {n_q} 問、検証で外したのは {dropped} 問（数が合わない）"
     for q in questions:
         assert set(q["concepts"]) <= selected, f"確定した範囲の外の概念が出題された: {q['concepts']}"
 
@@ -243,12 +250,12 @@ def test_full_flow_from_upload_to_asked_on_map(fresh_page, fresh_data_dir):
     main.get_by_role("button", name="採点する").click()
 
     # 結果と解説が出る
-    _wait_text(pg, " / 3 点", GENERATE_TIMEOUT, "採点")
+    _wait_text(pg, f" / {n_q} 点", GENERATE_TIMEOUT, "採点")
     text = main_text(pg)
-    assert text.count("解説:") >= 3, "各問の解説が出ていない"
+    assert text.count("解説:") >= n_q, "各問の解説が出ていない"
     assert "正答:" in text or "模範解答:" in text
     results = json.loads((d / "results.json").read_text(encoding="utf-8"))
-    assert len(results["attempts"]) == 3
+    assert len(results["attempts"]) == n_q
     asked = set(results["asked_concepts"])
     assert asked and asked <= selected
 
