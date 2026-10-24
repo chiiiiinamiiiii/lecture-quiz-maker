@@ -200,8 +200,11 @@ def gen_user(materials: str, n: int, counts: dict[str, int], n_short: int) -> st
 
 def verify_user(questions: list[dict], materials: str) -> str:
     import json
-    return f"""次のクイズの各 4 択問題について、各誤答（正答以外の選択肢）がなぜ誤りかを、資料の記述に基づいて 1 行で述べてください。
-資料に基づいて誤りだと述べられない誤答（実は正しい、資料から判断できない）は、別の誤答に差し替えて replaced を true にしてください。
+    return f"""次のクイズの各 4 択問題について、各誤答（正答以外の選択肢）がなぜ誤りかを、資料本文のすべてのページに照らして 1 行で述べてください。
+どこか 1 ページでも、その誤答が問題文の条件に当てはまる記述があれば、誤りとは言えないので差し替えてください。
+資料に基づいて誤りだと述べられない誤答（実は正しい、資料から判断できない）も、別の誤答に差し替えて replaced を true にしてください。
+差し替えるときは、choices のその位置の文字列を実際に別のものに書き換えてください。
+問題文が「資料における〇〇の定義」のように誰の説かを限っていないとき、別の人物の説と一致する誤答は差し替えるか、問題文に誰の説かを書き足してください。
 差し替えた場合も、その新しい誤答がなぜ誤りかを述べてください。
 正答そのものが資料と食い違っていれば、問題文・選択肢・answer・explanation を資料に合わせて直してください。
 関係を問う問題（aspect=relation）は、正答が材料の「出題範囲の概念どうしの関係」のどの行に当たるかを確かめ、向きが逆なら問題文か正答を直してください。
@@ -340,6 +343,23 @@ def check_relation_direction(q: dict, inner: list[dict], concepts: dict[str, dic
     return [f"{qid}: relation_used が材料の関係のどれにも当たらない（{used.get('from')} —{used.get('label')}→ {used.get('to')}）"]
 
 
+# ------------------------------------------------------------------ 誤答の差し替え（#34）
+
+def check_replaced(q: dict, before: dict | None) -> list[str]:
+    """replaced=true の誤答が、自己確認前と同じ文字列のままなら警告する（差し替えたと記録しただけ）。"""
+    if q.get("type") != "mcq" or before is None:
+        return []
+    qid = q.get("id", "?")
+    old, new = before.get("choices", []), q.get("choices", [])
+    warnings = []
+    for d in q.get("distractor_reasons", []):
+        c = d.get("choice")
+        if d.get("replaced") and isinstance(c, int) and 0 <= c < len(new) and c < len(old) \
+                and _norm(old[c]) == _norm(new[c]):
+            warnings.append(f"{qid}: 誤答 {c}「{new[c]}」は差し替えたと記録されたが、文字列が変わっていない")
+    return warnings
+
+
 # ------------------------------------------------------------------ 問題文（#33）
 
 _TRAILING = "。．.?？!！ 　"
@@ -431,6 +451,8 @@ def generate_quiz(client, model: str, graph: dict, vocab: dict, pages: list[dict
     for q, before in zip(final, questions):
         q2, w = fix_answer_index(q, before)
         answer_warnings += w
+        if q2 is not None and q2 is not before:
+            answer_warnings += check_replaced(q2, before)
         if q2 is not None:
             fixed.append(q2)
     final = fixed
