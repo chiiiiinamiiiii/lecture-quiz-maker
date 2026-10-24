@@ -10,6 +10,9 @@
         slides/          ページ画像 L{回}_p{ページ}.jpg
         results.json     §8 解答の記録
         job.json         直近の取り込み処理の状態（アプリを再起動しても結果が分かるように）
+        rag_index.json   RAG のスライド索引（quizmap.rag.SlideIndex。QUIZMAP_RAG=off なら作らない）
+        wiki_cache.json  Wikipedia の検索結果のキャッシュ（quizmap.rag.Wiki）
+        graph_before_completion.json  関係の補完の前の graph（補完の前後を比べるため。RAG ありのときだけ）
 
 取り込み処理は数分かかり、API 呼び出しも数十回あるので、別スレッドで走らせて進捗を Job に書く。
 画面はそれを定期的に読みに行くだけにする（Streamlit の再実行で処理が中断されないように）。
@@ -19,6 +22,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import re
 import secrets
 import shutil
@@ -153,14 +157,34 @@ def import_legacy(data_dir: Path) -> Path | None:
 
 # ------------------------------------------------------------------ 取り込み処理
 
-PHASES = [  # (名前, 表示, 進捗の幅)
+PHASES = [  # (名前, 表示, 進捗の幅)。index と completion は RAG（docs/rag-design.md）。off なら飛ばす
     ("read", "PDF の読み込み", 0.05),
-    ("vocab", "語彙の導出（§4）", 0.10),
-    ("concepts", "概念の抽出（§5）", 0.45),
-    ("relations", "関係の抽出（§5）", 0.30),
-    ("slides", "スライド画像の作成", 0.10),
+    ("vocab", "語彙の導出（§4）", 0.08),
+    ("index", "索引づくり", 0.07),
+    ("concepts", "概念の抽出（§5）", 0.35),
+    ("relations", "関係の抽出（§5）", 0.25),
+    ("completion", "関係の補完", 0.12),
+    ("slides", "スライド画像の作成", 0.08),
 ]
 PHASE_LABEL = {k: label for k, label, _ in PHASES}
+
+
+def _phase_span(phase: str) -> tuple[float, float]:
+    """その段階の (進捗の始まり, 幅)。"""
+    start = 0.0
+    for k, _, w in PHASES:
+        if k == phase:
+            return start, w
+        start += w
+    return start, 0.0
+
+
+SLIDE_DPI = 80
+
+
+def rag_enabled() -> bool:
+    """設定 QUIZMAP_RAG（既定 on）。off / 0 / false / no なら RAG を使わない（今までと同じ動き）。"""
+    return os.environ.get("QUIZMAP_RAG", "on").strip().lower() not in ("off", "0", "false", "no")
 
 
 @dataclass
@@ -182,12 +206,7 @@ class Job:
 
     def set_phase(self, phase: str) -> None:
         self.phase = phase
-        start = 0.0
-        for k, _, w in PHASES:
-            if k == phase:
-                break
-            start += w
-        self.progress = max(self.progress, start)
+        self.progress = max(self.progress, _phase_span(phase)[0])
         self.add(f"── {PHASE_LABEL.get(phase, phase)}")
 
     def add(self, msg: str) -> None:
@@ -196,10 +215,12 @@ class Job:
         n = max(1, self.n_lectures)
         if msg.startswith("概念 第"):
             self.done_concepts += 1
-            self.progress = 0.15 + 0.45 * min(1, self.done_concepts / n)
+            start, w = _phase_span("concepts")
+            self.progress = max(self.progress, start + w * min(1, self.done_concepts / n))
         elif msg.startswith("関係 第"):
             self.done_relations += 1
-            self.progress = 0.60 + 0.30 * min(1, self.done_relations / n)
+            start, w = _phase_span("relations")
+            self.progress = max(self.progress, start + w * min(1, self.done_relations / n))
         self.save()
 
 
@@ -267,7 +288,7 @@ def start_ingest(d: Path, rebuild_vocab: bool = False, model: str = DEFAULT_MODE
 
 
 def _run(job: Job, d: Path, rebuild_vocab: bool, model: str) -> None:
-    from quizmap.extraction import run_extraction
+    from quizmap import extraction
     from quizmap.vocab import derive_vocab
 
     try:
@@ -292,7 +313,11 @@ def _run(job: Job, d: Path, rebuild_vocab: bool, model: str) -> None:
             write_json(vocab_path, vocab)
         vocab["course"] = info["name"]       # 授業名は利用者が入れたものを使う（§16.3）
 
-        run_extraction(client, model, vocab, lectures, d, log=job.add, step=job.set_phase)
+        if rag_enabled():
+            _extract_with_rag(job, d, client, model, vocab, lectures)
+        else:
+            job.add("RAG は使わない（QUIZMAP_RAG=off）")
+            extraction.run_extraction(client, model, vocab, lectures, d, log=job.add, step=job.set_phase)
         rename_course(d, info["name"])
         job.progress = 1.0
         job.status = "done"
@@ -305,6 +330,68 @@ def _run(job: Job, d: Path, rebuild_vocab: bool, model: str) -> None:
     finally:
         job.finished_at = now()
         job.save()
+
+
+def _pages_of(lectures) -> list[dict]:
+    """pages.json と同じ形。"""
+    return [{"lecture": lec.number, "page": i, "text": page}
+            for lec in lectures for i, page in enumerate(lec.pages, start=1)]
+
+
+def _extract_with_rag(job: Job, d: Path, client, model: str, vocab: dict, lectures) -> None:
+    """索引づくり → 抽出 → 関係の補完 → スライド画像（docs/rag-design.md）。
+
+    索引づくりと関係の補完が失敗しても、取り込みは止めずに補完なしの地図を残す（記録には残す）。
+    """
+    from quizmap import extraction, rag
+    from quizmap.vocab import language_of
+
+    pages = _pages_of(lectures)
+    job.set_phase("index")
+    index = None
+    try:
+        index = rag.SlideIndex.build(client, pages)
+        index.save(d)
+        job.add(f"索引: {len(pages)} ページ")
+    except Exception as e:  # noqa: BLE001  補完なしで続ける
+        job.add(f"索引を作れなかった（関係の補完は飛ばす）: {type(e).__name__}: {e}")
+
+    graph = extraction.run_extraction(client, model, vocab, lectures, d, slides=False,
+                                      log=job.add, step=job.set_phase)
+    write_json(d / "graph_before_completion.json", graph)     # 補完の前後を比べるため（出力評価）
+
+    job.set_phase("completion")
+    if index is None:
+        job.add("索引が無いので関係の補完は飛ばした")
+    else:
+        try:
+            wiki = rag.Wiki(d, language_of(vocab, [p["text"] for p in pages]))
+            graph = extraction.complete_relations(client, model, vocab, graph, pages, index, wiki, log=job.add)
+            write_json(d / "graph.json", graph)
+        except Exception as e:  # noqa: BLE001  抽出だけの地図を残す
+            job.add(f"関係の補完に失敗した（抽出だけの地図を使う）: {type(e).__name__}: {e}")
+
+    job.set_phase("slides")
+    n_imgs = extraction.render_slides(lectures, d / "slides", SLIDE_DPI)
+    job.add(f"スライド画像 {n_imgs} 枚")
+
+
+def open_rag(d: Path):
+    """出題のときに使う (索引 or None, Wiki or None)。
+
+    索引が無い（RAG より前のコース、索引づくりに失敗した）なら索引は None。
+    QUIZMAP_RAG=off なら (None, None)。言語は vocab.json の meta.language（無ければ本文から決める）。
+    """
+    if not rag_enabled():
+        return None, None
+    from quizmap import rag
+    from quizmap.vocab import language_of
+
+    vocab = read_json(d / "vocab.json") if (d / "vocab.json").exists() else {}
+    texts = []
+    if not (vocab.get("meta") or {}).get("language") and (d / "pages.json").exists():
+        texts = [p["text"] for p in read_json(d / "pages.json")]
+    return rag.SlideIndex.load(d), rag.Wiki(d, language_of(vocab, texts))
 
 
 def assign_lecture_numbers(files: list[dict]) -> list[dict]:

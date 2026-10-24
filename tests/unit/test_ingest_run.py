@@ -43,6 +43,7 @@ def fakes(monkeypatch):
         write_json(out_dir / "graph.json", graph)
         return graph
 
+    monkeypatch.setenv("QUIZMAP_RAG", "off")      # RAG を入れたときは test_ingest_rag.py
     monkeypatch.setattr(courses, "load_lecture_files", load_lecture_files)
     monkeypatch.setattr(courses, "make_client", lambda: object())
     monkeypatch.setattr(vocab, "derive_vocab", derive_vocab)
