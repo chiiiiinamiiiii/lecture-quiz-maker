@@ -75,3 +75,38 @@ def test_selection_list_shows_two_rows(page):
         while (e && !/(auto|scroll)/.test(getComputedStyle(e).overflowY)) e = e.parentElement;
         return e && !e.classList.contains('st-key-qm-right') ? [e.scrollHeight - e.clientHeight] : []; }""")
     assert clipped and all(c <= 1 for c in clipped), clipped
+
+
+# ------------------------------------------------------------------ #75: 全体表示で端の点がツールバーや下の帯に隠れない
+
+def _fit_violations(page) -> list:
+    """全体表示の後、ツールバー（と列の見出し）の下端より上、または下の帯の上端より下にはみ出す点と名前。"""
+    return app(page, """(() => { const m = a.el.getBoundingClientRect();
+        const rel = (s) => { const r = a.root.querySelector(s).getBoundingClientRect(); return {t: r.top - m.top, b: r.bottom - m.top}; };
+        let top = rel('.qm-toolbar').b;
+        if (a.layout === 'timeline' && a.el.dataset.axis) {
+          const ax = JSON.parse(a.el.dataset.axis).labels; if (ax.length) top = Math.max(top, ...ax.map(l => l.y + l.h)); }
+        const bottom = Math.min(rel('.qm-hint').t, rel('.qm-legend').t, rel('.qm-lectures').t);
+        const bad = [];
+        for (const id of a.visibleIds()) { const n = a.byId.get(id); const [x, y] = a.toScreen(a.pos.get(id)); const r = a._radius(n);
+          if (y - r < top) bad.push([n.label, 'top', Math.round(y - r), Math.round(top)]);
+          if (y + r + 19 > bottom) bad.push([n.label, 'bottom', Math.round(y + r + 19), Math.round(bottom)]);
+          if (x < 0 || x > a.w) bad.push([n.label, 'x', Math.round(x)]); }
+        return bad; })()""")
+
+
+@pytest.mark.parametrize("layout", ["force", "timeline"])
+@pytest.mark.parametrize("size", SIZES, ids=lambda s: f"{s[0]}x{s[1]}")
+def test_fit_keeps_nodes_clear_of_bars(page, size, layout):
+    page.set_viewport_size({"width": size[0], "height": size[1]})
+    page.wait_for_timeout(1000)
+    if layout == "timeline":
+        page.locator(".qm-toolbar button[data-layout='timeline']").click()
+    page.locator(".qm-toolbar button[data-act='fit']").click()
+    page.wait_for_timeout(1200)                     # 全体表示のアニメーション（280ms）と描画を待つ
+    assert _fit_violations(page) == []
+
+
+def test_initial_view_keeps_nodes_clear_of_bars(page):
+    """開いた直後（全体表示のボタンを押す前）も同じ。"""
+    assert _fit_violations(page) == []
