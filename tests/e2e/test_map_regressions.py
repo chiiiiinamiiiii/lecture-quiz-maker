@@ -166,3 +166,71 @@ def test_ingest_page_opens(page):
     page.wait_for_timeout(2500)
     assert exception_text(page) is None
     assert "講義回の割り当て" in main_text(page)
+
+
+# ------------------------------------------------------------------ #41: クリック・ダブルクリックで選択が消えない
+
+def _empty_spot(page) -> tuple[float, float]:
+    """地図の上で、点にも辺にも当たらない所（ページ上の座標）。"""
+    xy = app(page, """(() => { const r = a.canvas.getBoundingClientRect();
+        for (let y = 60; y < a.h - 60; y += 17) for (let x = 60; x < a.w - 60; x += 17)
+          if (!a.hit(x, y)) return [x + r.left, y + r.top];
+        return null; })()""")
+    assert xy, "何もない所が見つからない"
+    return tuple(xy)
+
+
+def _unselected_node(page) -> tuple[float, float, str]:
+    """選択に入っておらず、その位置をクリックするとその点に当たる概念。"""
+    for rank in range(60):
+        x, y, cid = node_xy(page, rank)
+        hit = app(page, f"""(() => {{ const r = a.canvas.getBoundingClientRect();
+            return a.hit({x} - r.left, {y} - r.top); }})()""")
+        if hit and hit.get("type") == "node" and hit.get("id") == cid and not app(page, f"a.selected.has({json.dumps(cid)})"):
+            return x, y, cid
+    raise AssertionError("選択されていない点が見つからない")
+
+
+def test_click_on_empty_space_keeps_selection(page):
+    lecture_button(page, "3")
+    lecture_button(page, "12", "Shift")
+    n = n_selected(page)
+    assert n > 0 and app(page, "a.tool") == "lasso"
+    x, y = _empty_spot(page)
+    page.mouse.click(x, y)
+    page.wait_for_timeout(1500)
+    assert n_selected(page) == n
+    page.mouse.dblclick(*_empty_spot(page))
+    page.wait_for_timeout(1500)
+    assert n_selected(page) == n
+
+
+def test_double_click_on_node_only_zooms(page):
+    lecture_button(page, "3")
+    n = n_selected(page)
+    s0 = view(page)["scale"]
+    x, y, _ = _unselected_node(page)
+    page.mouse.dblclick(x, y)
+    page.wait_for_timeout(1500)
+    assert view(page)["scale"] > s0 * 1.5
+    assert n_selected(page) == n
+
+
+def test_single_click_on_node_still_selects(page):
+    """点の 1 回クリックは今どおり: 置き換え・Shift で追加・⌘ で除外。"""
+    lecture_button(page, "3")
+    x, y, cid = _unselected_node(page)
+    n = n_selected(page)
+    page.keyboard.down("Shift")
+    page.mouse.click(x, y)
+    page.keyboard.up("Shift")
+    page.wait_for_timeout(1500)
+    assert n_selected(page) == n + 1 and app(page, f"a.selected.has({json.dumps(cid)})")
+    page.keyboard.down("Meta")
+    page.mouse.click(x, y)
+    page.keyboard.up("Meta")
+    page.wait_for_timeout(1500)
+    assert n_selected(page) == n
+    page.mouse.click(x, y)
+    page.wait_for_timeout(1500)
+    assert n_selected(page) == 1

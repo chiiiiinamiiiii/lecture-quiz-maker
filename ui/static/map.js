@@ -8,9 +8,12 @@
 //   ドラッグ（手のひらツール）/ スペース＋ドラッグ / スペース＋2本指 … 移動
 //   2本指の上下 / ピンチ / ＋−ボタン … ズーム
 //   投げ縄・矩形 … 範囲選択。Shift で追加、⌘（または Option）で除外、修飾なしで置き換え
-//   点のクリック … その点を選択（同じ修飾キーの規則）
+//   点のクリック … その点を選択（同じ修飾キーの規則）。何もない所のクリックでは選択は変わらない
+//   ダブルクリック … 拡大だけ（選択は変えない）
 //   講義回ボタン … その回に出てくる概念を選択（同じ修飾キーの規則）
 //   H / L / M … 手のひら / 投げ縄 / 矩形、0 … 全体表示、Esc … 選択を解除
+
+const CLICK_DELAY = 250;   // 点のクリックを反映するまで待つ時間（ms）。この間のダブルクリックは拡大だけにする
 
 const ICONS = {
   hand: '<svg viewBox="0 0 24 24"><path d="M8 11V5.5a1.5 1.5 0 0 1 3 0V10m0-5.5V4a1.5 1.5 0 0 1 3 0v6m0-4.5a1.5 1.5 0 0 1 3 0V12m0-3.5a1.5 1.5 0 0 1 3 0V15a6 6 0 0 1-6 6h-1.5a6 6 0 0 1-4.9-2.6L4.3 14a1.5 1.5 0 0 1 2.4-1.8L8 14"/></svg>',
@@ -526,12 +529,24 @@ class MapApp {
       this.drag = null;
       this._cursor();
       if (!d.moved) {                                     // クリック
+        // 何もない所のクリックでは選択を変えない（全部外すのは Esc と × だけ。#41）。
+        // 点・辺のクリックは CLICK_DELAY 待ってから反映し、その間にダブルクリック（拡大）が来たら取り消す。
+        // 待っている間に次のクリックが来たら、ダブルクリックの 2 回目とみなして両方とも選択に使わない。
+        if (this._clickTimer) { clearTimeout(this._clickTimer); this._clickTimer = null; this.draw(); return; }
+        if (ev.detail >= 2) { this.draw(); return; }
         const h = this.hit(d.start[0], d.start[1]);
-        if (h && h.type === "node") this.applySelection([h.id], new Set(), this._mode(ev));
-        else if (h && h.type === "edge") {
-          const e = this.edges.find((x) => x.id === h.id);
-          this.applySelection([e.s, e.t], new Set([e.s, e.t]), this._mode(ev));
-        } else if (d.kind !== "pan" && this._mode(ev) === "replace") this.applySelection([], new Set(), "replace");
+        const mode = this._mode(ev);
+        if (h && (h.type === "node" || h.type === "edge")) {
+          this._clickTimer = setTimeout(() => {
+            this._clickTimer = null;
+            if (h.type === "node") this.applySelection([h.id], new Set(), mode);
+            else {
+              const e = this.edges.find((x) => x.id === h.id);
+              if (e) this.applySelection([e.s, e.t], new Set([e.s, e.t]), mode);
+            }
+            this.draw();
+          }, CLICK_DELAY);
+        }
         this.draw();
         return;
       }
@@ -542,7 +557,11 @@ class MapApp {
     c.addEventListener("pointerup", end);
     c.addEventListener("pointercancel", () => { this.drag = null; this._cursor(); this.draw(); });
     c.addEventListener("pointerleave", () => { if (!this.drag) { this.hover = null; this.tooltip.style.display = "none"; this.draw(); } });
-    c.addEventListener("dblclick", (ev) => { const p = this._pt(ev); this.zoomAt(p[0], p[1], 1.8); });
+    c.addEventListener("dblclick", (ev) => {
+      if (this._clickTimer) { clearTimeout(this._clickTimer); this._clickTimer = null; }   // ダブルクリックは拡大だけ
+      const p = this._pt(ev);
+      this.zoomAt(p[0], p[1], 1.8);
+    });
 
     // ホイール: ピンチ（ctrl 付き）と 2 本指の上下はズーム。スペースを押している間は移動
     this.el.addEventListener("wheel", (ev) => {
