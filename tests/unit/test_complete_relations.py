@@ -100,7 +100,7 @@ def test_slide_relation_is_added_with_origin_and_existing_get_slide(llm):
     g = extraction.complete_relations(None, "m", VOCAB, graph(), PAGES, index=None, wiki=None, log=lambda s: None)
     new = [r for r in g["relations"] if r["from"] == "kouno"]
     assert new == [{"from": "kouno", "to": "otsu", "label": "提唱", "source": {"lecture": 1, "page": 1},
-                    "origin": "slide", "evidence": "甲野は乙説を唱えた"}]
+                    "origin": "slide", "evidence": "甲野は乙説を唱えた", "added_by": "completion"}]
     assert all(r["origin"] == "slide" for r in g["relations"])
     c = g["stats"]["completion"]
     assert c["added_slide"] == 1 and c["added_external"] == 0 and c["api_calls"] == 1
@@ -163,7 +163,8 @@ def test_isolated_concept_uses_index_and_external_needs_wiki_text(llm):
     ext = [r for r in g["relations"] if r["origin"] == "external"]
     assert ext == [{"from": "hei", "to": "tei", "label": "提唱", "source": {"lecture": 2, "page": 1},
                     "origin": "external", "evidence": "丁説は丙が唱えた学説である",
-                    "evidence_url": "https://ja.wikipedia.org/wiki/丁説", "evidence_title": "丁説"}]
+                    "evidence_url": "https://ja.wikipedia.org/wiki/丁説", "evidence_title": "丁説",
+                    "added_by": "completion"}]
     c = g["stats"]["completion"]
     assert c["searches"] >= 1 and ("丁説", {(1, 2)}) in index.queries
     assert c["isolated_after"] < c["isolated_before"]
@@ -201,3 +202,27 @@ def test_input_graph_is_not_modified(llm):
     g0 = graph()
     extraction.complete_relations(None, "m", VOCAB, g0, PAGES, index=None, wiki=None, log=lambda s: None)
     assert "origin" not in g0["relations"][0] and g0["stats"] == {"concepts": 4, "relations": 1}
+
+
+def test_pair_records_for_evaluation(llm):
+    index = FakeIndex({"丁説": [{"lecture": 2, "page": 1, "text": "", "score": 0.9}]})
+    g0 = graph()
+    g0["concepts"][2]["sources"].append({"lecture": 2, "page": 1})
+    wiki = FakeWiki({"甲野": {"title": "甲野", "url": "U甲野", "extract": "甲野は哲学者。"}})
+
+    def answer(user):
+        return [J(pair_no(user, "kouno", "otsu"), "slide", "kouno", "otsu", "提唱", 1, 1, evidence="甲野は乙説を唱えた"),
+                J(pair_no(user, "hei", "kouno"), "none"),
+                J(pair_no(user, "hei", "tei"), "slide", "hei", "tei", "提唱", 2, 1, evidence="無い文")]
+    llm["answer"] = answer
+    g = extraction.complete_relations(None, "m", VOCAB, g0, PAGES, index=index, wiki=wiki, log=lambda s: None)
+    recs = {(r["a"], r["b"]): r for r in g["stats"]["completion"]["pairs"]}
+    added = recs[("kouno", "otsu")]
+    assert added["result"] == "added" and added["relation"]["added_by"] == "completion"
+    assert added["pages"] == [{"lecture": 1, "page": 1, "score": None, "via": "shared"}]
+    assert {"term": "甲野", "title": "甲野", "url": "U甲野"} in added["wiki"]
+    assert recs[("hei", "kouno")]["result"] == "none"
+    bad = recs[("hei", "tei")]
+    assert bad["result"] == "rejected" and bad["reason"] == "evidence が本文に無い"
+    assert bad["pages"] == [{"lecture": 2, "page": 1, "score": 0.9, "via": "search"}]
+    assert bad["judgement"]["evidence"] == "無い文"

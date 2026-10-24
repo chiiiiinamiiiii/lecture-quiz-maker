@@ -502,7 +502,8 @@ def completion_candidates(concepts: dict[str, dict], relations: list[dict], page
     2. どの関係にもつながらない概念は、索引で近いページを探し、そのページに出てくる概念と対にする
        （索引が無ければ 1 だけ）
     どの関係にもつながらない概念を含む対を先に、次に一緒に出るページの多い対を先にし、max_pairs 本で切る。
-    戻り値: (候補 [{"a", "b", "pages": [(lecture, page)], "isolated": bool}], 数の記録)
+    戻り値: (候補 [{"a", "b", "pages": [(lecture, page)], "page_info": [{"lecture", "page", "score", "via"}],
+              "isolated": bool}], 数の記録)。via は "shared"（両方が出るページ）か "search"（索引で見つけたページ）
     """
     related = {frozenset((r["from"], r["to"])) for r in relations}
     linked = {x for r in relations for x in (r["from"], r["to"])}
@@ -515,14 +516,16 @@ def completion_candidates(concepts: dict[str, dict], relations: list[dict], page
 
     pairs: dict[frozenset, dict] = {}
 
-    def add(a: str, b: str, page: tuple[int, int], shared: bool):
+    def add(a: str, b: str, page: tuple[int, int], shared: bool, score: float | None = None):
         key = frozenset((a, b))
         if a == b or key in related or page not in page_text:
             return
-        entry = pairs.setdefault(key, {"a": min(a, b), "b": max(a, b), "pages": [], "shared": 0,
+        entry = pairs.setdefault(key, {"a": min(a, b), "b": max(a, b), "pages": [], "page_info": [], "shared": 0,
                                        "isolated": a not in linked or b not in linked})
         if page not in entry["pages"]:
             entry["pages"].append(page)
+            entry["page_info"].append({"lecture": page[0], "page": page[1], "score": score,
+                                       "via": "shared" if shared else "search"})
             entry["shared"] += shared
 
     for page, ids in on_page.items():
@@ -539,12 +542,13 @@ def completion_candidates(concepts: dict[str, dict], relations: list[dict], page
             for h in hits:
                 page = (h["lecture"], h["page"])
                 for other in on_page.get(page, []):
-                    add(cid, other, page, shared=False)
+                    add(cid, other, page, shared=False, score=h.get("score"))
 
     ranked = sorted(pairs.values(), key=lambda p: (not p["isolated"], -p["shared"], p["a"], p["b"]))
     chosen = ranked[:max_pairs]
     for p in chosen:
         p["pages"] = p["pages"][:COMPLETION_PAGES_PER_PAIR]
+        p["page_info"] = p["page_info"][:COMPLETION_PAGES_PER_PAIR]
         p.pop("shared")
     return chosen, {"candidates": len(pairs), "judged": len(chosen), "isolated_before": len(isolated),
                     "searches": searches}
@@ -578,7 +582,12 @@ def complete_relations(client, model, vocab, graph, pages, index, wiki, log=prin
       "slide":    スライドの記述が根拠。source は根拠のページ、evidence はページ本文からの引用
       "external": スライドに明示が無く Wikipedia で確かめた。source は両端の概念が出てくるページ、
                   evidence は記事からの引用、evidence_url と evidence_title を付ける
-    既存の関係には origin: "slide" を付ける。照合は抽出と同じ規則（端の種類、evidence の本文照合）を通す。
+    既存の関係には origin: "slide" を付ける。足した関係には added_by: "completion" も付ける（抽出の関係と見分けるため）。
+    照合は抽出と同じ規則（端の種類、evidence の本文照合）を通す。
+    stats.completion.pairs に候補ごとの記録を残す（eval-protocol.md §7.5）:
+      {"a", "b", "pages": [{"lecture", "page", "score", "via"}], "wiki": [{"term", "title", "url"}],
+       "judgement": LLM の答え（origin・label・from・to・lecture・page・wiki・evidence）, "result": "added" / "rejected" / "none" / "no_answer",
+       "reason": 落とした理由, "relation": 足した関係}
     index（SlideIndex）と wiki（Wiki）は None でもよい。そのときは使える層だけで判定する。
     """
     concepts = {c["id"]: c for c in graph["concepts"]}
@@ -598,6 +607,13 @@ def complete_relations(client, model, vocab, graph, pages, index, wiki, log=prin
     record["wiki_found"] = sum(1 for a in articles.values() if a)
     record["wiki_lookups"] = len(articles)
 
+    pair_records = [
+        {"a": p["a"], "b": p["b"], "pages": p["page_info"],
+         "wiki": [{"term": concepts[cid]["label"], "title": (articles.get(cid) or {}).get("title", ""),
+                   "url": (articles.get(cid) or {}).get("url", "")} for cid in (p["a"], p["b"]) if cid in articles],
+         "judgement": None, "result": "no_answer", "reason": "", "relation": None}
+        for p in pairs
+    ]
     rel_text = "\n".join(
         f"- {r['label']}: {r['definition']}{_direction_text(r)}（例: {r['example']}）"
         for r in vocab["relations"] if r["label"] in labels
@@ -639,6 +655,11 @@ def complete_relations(client, model, vocab, graph, pages, index, wiki, log=prin
         n_before = len(added)
 
         done: set[int] = set()
+
+        def reject(reason: str):
+            dropped[reason] += 1
+            pair_records[n].update(result="rejected", reason=reason)
+
         for j in data["judgements"]:
             n = j["pair"] - 1
             if not start <= n < start + len(batch) or n in done:
@@ -646,19 +667,22 @@ def complete_relations(client, model, vocab, graph, pages, index, wiki, log=prin
                 continue
             done.add(n)
             p = pairs[n]
+            rec = pair_records[n]
+            rec["judgement"] = {k: j[k] for k in ("origin", "label", "from", "to", "lecture", "page", "wiki", "evidence")}
             if j["origin"] == "none":
                 dropped["関係なし"] += 1
+                rec["result"] = "none"
                 continue
             f, t, label = j["from"].strip(), j["to"].strip(), j["label"].strip()
             if {f, t} != {p["a"], p["b"]}:
-                dropped["対に無い id"] += 1           # 新しい概念・別の概念は使わせない
+                reject("対に無い id")
                 continue
             if label not in labels:
-                dropped["語彙にないラベル"] += 1        # 補完では「その他」を足さない
+                reject("語彙にないラベル")
                 continue
             f, t, label, fix = check_end_kinds(f, t, label, concepts, rel_by_label)
             if fix == "other":
-                dropped["端の種類が合わない"] += 1
+                reject("端の種類が合わない")
                 continue
             if fix == "swapped":
                 adjusted["向きを直した"] += 1
@@ -667,33 +691,35 @@ def complete_relations(client, model, vocab, graph, pages, index, wiki, log=prin
             if j["origin"] == "slide":
                 page = (j["lecture"], j["page"])
                 if page not in p["pages"]:
-                    dropped["対に付けていないページ"] += 1
+                    reject("対に付けていないページ")
                     continue
                 reason = check_evidence(j["evidence"], ends, page_text[page])
                 if reason:
-                    dropped[reason] += 1
+                    reject(reason)
                     continue
                 rel.update(source={"lecture": page[0], "page": page[1]}, origin="slide",
                            evidence=j["evidence"].strip())
             else:
                 if not 1 <= j["wiki"] <= len(wiki_ids):
-                    dropped["記事の番号が無い"] += 1
+                    reject("記事の番号が無い")
                     continue
                 cid = wiki_ids[j["wiki"] - 1]
                 if cid not in (f, t):
-                    dropped["対に付けていない記事"] += 1
+                    reject("対に付けていない記事")
                     continue
                 article = articles[cid]
                 reason = check_external_evidence(j["evidence"], ends, article)
                 if reason:
-                    dropped[reason] += 1
+                    reject(reason)
                     continue
                 shared = sorted(_pages_of(concepts[f]) & _pages_of(concepts[t]))
                 lec, pg = (shared or p["pages"])[0]
                 rel.update(source={"lecture": lec, "page": pg}, origin="external",
                            evidence=j["evidence"].strip(), evidence_url=article.get("url", ""),
                            evidence_title=article.get("title", ""))
+            rel["added_by"] = "completion"
             added.append(rel)
+            rec.update(result="added", relation=rel)
         missing = len(batch) - len(done)
         if missing:
             dropped["答えの無い対"] += missing
@@ -709,6 +735,7 @@ def complete_relations(client, model, vocab, graph, pages, index, wiki, log=prin
         api_calls=api_calls,
         dropped=dict(dropped),
         adjusted=dict(adjusted),
+        pairs=pair_records,
     )
     stats = dict(graph.get("stats", {}))
     stats.update(
