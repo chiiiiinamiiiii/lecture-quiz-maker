@@ -107,9 +107,26 @@ def safe_upload_name(filename: str) -> str:
 
 
 def save_upload(d: Path, filename: str, data: bytes) -> Path:
-    path = d / "uploads" / safe_upload_name(filename)
-    path.write_bytes(data)
-    return path
+    """uploads/ に保存して、保存先を返す。
+
+    同じ名前のファイルが既にあれば、中身が同じならそれを使い（書かない）、違えば
+    「名前 (2).pdf」のように連番を付けて保存する。既存のファイルは上書きしない（#5）。
+    連番は「_2」ではなく「 (2)」にする。「_2」だとファイル名から第2回と読まれてしまう。
+    """
+    name = safe_upload_name(filename)
+    stem, suffix = Path(name).stem, Path(name).suffix
+    uploads = d / "uploads"
+    uploads.mkdir(parents=True, exist_ok=True)
+    for i in range(1, 1000):
+        path = uploads / (name if i == 1 else f"{stem} ({i}){suffix}")
+        try:
+            with path.open("xb") as f:          # 無ければ作る。あれば FileExistsError（上書きしない）
+                f.write(data)
+            return path
+        except FileExistsError:
+            if path.is_file() and path.read_bytes() == data:
+                return path
+    raise RuntimeError(f"同じ名前のファイルが多すぎる: {name}")
 
 
 def import_legacy(data_dir: Path) -> Path | None:
