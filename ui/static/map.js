@@ -13,7 +13,10 @@
 //   講義回ボタン … その回に出てくる概念を選択（同じ修飾キーの規則）
 //   H / L / M … 手のひら（最初のツール）/ 投げ縄 / 矩形、0 … 全体表示、Esc … 選択を解除
 
-const CLICK_DELAY = 250;   // 点のクリックを反映するまで待つ時間（ms）。この間のダブルクリックは拡大だけにする
+const CLICK_DELAY = 250;
+const FIT_NODE_R = 10;     // 全体表示の余白に足す点の半径の目安（px）
+const FIT_LABEL_H = 18;    // 点の下に描く名前 1 行の高さ（px）
+const AXIS_ROW = 25;       // 「講義回」の配置の列の見出しの行の高さ（札 17px＋間 8px）   // 点のクリックを反映するまで待つ時間（ms）。この間のダブルクリックは拡大だけにする
 
 const ICONS = {
   hand: '<svg viewBox="0 0 24 24"><path d="M8 11V5.5a1.5 1.5 0 0 1 3 0V10m0-5.5V4a1.5 1.5 0 0 1 3 0v6m0-4.5a1.5 1.5 0 0 1 3 0V12m0-3.5a1.5 1.5 0 0 1 3 0V15a6 6 0 0 1-6 6h-1.5a6 6 0 0 1-4.9-2.6L4.3 14a1.5 1.5 0 0 1 2.4-1.8L8 14"/></svg>',
@@ -228,11 +231,28 @@ class MapApp {
     if (!pts.length) return;
     const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
     const [x0, x1, y0, y1] = [Math.min(...xs), Math.max(...xs), Math.min(...ys), Math.max(...ys)];
-    const pad = 70, bottom = 70, top = 70;
+    const pad = 70;
+    const { top, bottom } = this._fitMargins();
     const scale = Math.min((this.w - pad * 2) / Math.max(x1 - x0, 1e-6), (this.h - top - bottom) / Math.max(y1 - y0, 1e-6));
     const target = { scale, tx: pad + (this.w - pad * 2 - (x1 - x0) * scale) / 2 - x0 * scale,
                      ty: top + (this.h - top - bottom - (y1 - y0) * scale) / 2 - y0 * scale };
     this._setView(target, animate);
+  }
+
+  // 全体表示の上下の余白（#75）。上に重ねたツールバーと、下に重ねた帯（説明・凡例・講義回ボタン）を
+  // 毎回測り、その外に点と名前が収まるようにする。ツールバーは窓の幅で 1〜3 段になる
+  _fitMargins() {
+    this._fitToolbar();
+    const m = this.el.getBoundingClientRect();
+    const tb = this.root.querySelector(".qm-toolbar").getBoundingClientRect();
+    const bandTop = Math.min(...[".qm-hint", ".qm-legend", ".qm-lectures"]
+      .map((s) => this.root.querySelector(s).getBoundingClientRect().top));
+    let top = tb.bottom - m.top + 16 + FIT_NODE_R;
+    if (this.layout === "timeline") top += AXIS_ROW;                       // 列の見出しの行
+    let bottom = m.bottom - bandTop + FIT_NODE_R + FIT_LABEL_H + 8;        // 点の下に描く名前 1 行分
+    const room = this.h - top - bottom;
+    if (room < 80) { const k = (this.h - 80) / (top + bottom); top *= k; bottom *= k; }   // とても低い窓では余白を縮める
+    return { top, bottom };
   }
 
   zoomAt(sx, sy, factor) {
