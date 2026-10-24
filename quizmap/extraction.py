@@ -19,7 +19,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from quizmap.common import OTHER_LABEL, Lecture, call_json, lecture_as_prompt_text, write_json
+from quizmap.common import OTHER_LABEL, Lecture, call_json, lecture_as_prompt_text, normalize_text, write_json
 
 # ------------------------------------------------------------------ 概念抽出
 
@@ -87,6 +87,8 @@ RELATION_USER = """授業「{course}」の第{lecture}回の資料です（ペ�
 - from と to は上の id から選ぶ。同じ id を両端にしない
 - label はラベルの定義に従って選ぶ。無理に当てはめず、合わなければ「{other}」にする
 - page はその関係が書かれているこの回のページ番号
+- evidence には、その関係が書かれている箇所を page のページ本文からそのまま 40 字以内で抜き出す。抜き出せない関係は出さない
+- 同じページに二つの概念が出てくるだけでは関係にしない。二つの概念を結びつける記述があるときだけ挙げる
 - 1 度しか書かれていない関係も挙げる。数の上限はない
 
 === 資料 ===
@@ -105,8 +107,9 @@ RELATION_SCHEMA = {
                     "to": {"type": "string"},
                     "label": {"type": "string"},
                     "page": {"type": "integer"},
+                    "evidence": {"type": "string"},
                 },
-                "required": ["from", "to", "label", "page"],
+                "required": ["from", "to", "label", "page", "evidence"],
                 "additionalProperties": False,
             },
         }
@@ -179,6 +182,41 @@ def extract_concepts(client, model: str, course: str, vocab: dict, lectures: lis
     return concepts, unmatched_kind
 
 
+_SPACE_RE = re.compile(r"\s+")
+
+
+def _squash(text: str) -> str:
+    """出典の照合用。ページ本文と同じ正規化をかけ、空白をすべて除く。"""
+    return _SPACE_RE.sub("", normalize_text(text))
+
+
+def _label_head(label: str) -> str:
+    """概念名の照合用。括弧より前（例: 「理（ロゴス）を伴う活動」→「理」）。"""
+    return _squash(label).split("(")[0]
+
+
+def check_evidence(evidence: str, end_labels: list[str], page_text: str) -> str | None:
+    """関係が出典ページに根拠を持つか（Issue #11）。落とす理由、または None を返す。"""
+    page = _squash(page_text)
+    evidence = _squash(evidence)
+    if not evidence or evidence not in page:
+        return "evidence が本文に無い"
+    heads = [_label_head(l) for l in end_labels]
+    if not any(h and h in page for h in heads):
+        return "両端の概念名が本文に無い"
+    return None
+
+
+def evidence_rank(evidence: str, end_labels: list[str], page_text: str) -> tuple[int, int]:
+    """同じ対で同点のときに使う、根拠の確かさ（Issue #11・#12）。大きいほど確か。
+
+    (evidence に出てくる端の概念名の数, ページ本文に出てくる端の概念名の数)。どちらも 0〜2。
+    """
+    page, evidence = _squash(page_text), _squash(evidence)
+    heads = [h for h in (_label_head(l) for l in end_labels) if h]
+    return sum(h in evidence for h in heads), sum(h in page for h in heads)
+
+
 def extract_relations(client, model: str, course: str, vocab: dict, lectures: list[Lecture],
                       concepts: dict[str, dict], workers: int, log=print) -> tuple[list[dict], dict]:
     """概念 id を固定して、回ごとに関係を出させる（回は独立なので並列）。"""
@@ -198,11 +236,10 @@ def extract_relations(client, model: str, course: str, vocab: dict, lectures: li
             ),
         )
 
-    relations: list[dict] = []
-    seen: set[tuple] = set()
+    candidates: list[dict] = []
     dropped = collections.Counter()
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        for lec, data in ex.map(one, lectures):
+        for lec, data in ex.map(one, lectures):        # ex.map は回の順を保つ
             kept = 0
             for r in data["relations"]:
                 f, t, label = r["from"].strip(), r["to"].strip(), r["label"].strip()
@@ -215,17 +252,80 @@ def extract_relations(client, model: str, course: str, vocab: dict, lectures: li
                 if label not in labels:
                     dropped["vocab にないラベル→その他"] += 1
                     label = OTHER_LABEL
-                key = (f, t, label)
-                if key in seen:
-                    dropped["重複"] += 1
+                if not 1 <= r["page"] <= lec.page_count:
+                    dropped["ページ番号が範囲外"] += 1
                     continue
-                seen.add(key)
-                page = r["page"] if 1 <= r["page"] <= lec.page_count else 1
-                relations.append({"from": f, "to": t, "label": label,
-                                  "source": {"lecture": lec.number, "page": page}})
+                page = r["page"]
+                ends = [concepts[f]["label"], concepts[t]["label"]]
+                reason = check_evidence(r.get("evidence", ""), ends, lec.pages[page - 1])
+                if reason:
+                    dropped[reason] += 1
+                    continue
+                # evidence は検証と同点の判定に使うだけで保存しない（講義資料の本文を graph.json に増やさない）
+                candidates.append({"from": f, "to": t, "label": label,
+                                   "source": {"lecture": lec.number, "page": page},
+                                   "_rank": evidence_rank(r.get("evidence", ""), ends, lec.pages[page - 1])})
                 kept += 1
-            log(f"関係 第{lec.number}回: {len(data['relations'])} 件 → 採用 {kept}")
+            log(f"関係 第{lec.number}回: {len(data['relations'])} 件 → 候補 {kept}")
+    relations, merged = resolve_pair_conflicts(candidates)
+    dropped.update(merged)
+    log("同じ概念対の整理: " + (", ".join(f"{k} {v}" for k, v in merged.items()) or "なし")
+        + f" → 関係 {len(relations)}")
     return relations, dict(dropped)
+
+
+def resolve_pair_conflicts(candidates: list[dict]) -> tuple[list[dict], collections.Counter]:
+    """1 つの概念対（向きを問わない）に、1 つのラベルと 1 つの向きだけを残す（Issue #12）。
+
+    回ごとに独立に抽出するため、同じ対に別のラベルや逆向きの関係が付くことがある。
+    LLM は呼ばず、資料中で何度その関係が書かれたか（支持数）で決める。
+    1. ラベルが 2 つ以上あれば、支持数（両向きの合計）の多いラベルを残す。
+       「その他」も同じように比べる。語彙に合うラベルが無いときは「その他」が正しいことがあるため
+    2. そのラベルが両向きにあれば、支持数の多い向きを残す
+       （対立のように向きの無いラベルでも、両向きは同じ関係の重複なので 1 本にしてよい）
+    支持数が同点なら、根拠の確かさ（候補の "_rank"。evidence_rank の値）の大きいものを残す。
+    それも同点なら先に出たもの（若い回）を残す。残した関係の source は、その (from, to, label) が最初に出た箇所。
+    candidates は出現順に並んでいること。完全に同じ (from, to, label) も支持数として数える。
+    "_rank" は判定に使うだけで、戻り値には残さない。
+    """
+    dropped = collections.Counter()
+    first: dict[tuple, dict] = {}                     # (from, to, label) -> 最初に出た関係
+    support = collections.Counter()                   # (from, to, label) -> 出た回数
+    order: dict[tuple, int] = {}                      # (from, to, label) -> 最初に出た位置
+    rank: dict[tuple, tuple] = {}                     # (from, to, label) -> 根拠の確かさの最大
+    for i, r in enumerate(candidates):
+        key = (r["from"], r["to"], r["label"])
+        support[key] += 1
+        rank[key] = max(rank.get(key, ()), tuple(r.get("_rank", ())))
+        if key not in first:
+            first[key], order[key] = r, i
+        else:
+            dropped["重複"] += 1
+
+    by_pair: dict[frozenset, list[tuple]] = collections.defaultdict(list)
+    for key in first:
+        by_pair[frozenset(key[:2])].append(key)
+
+    kept: list[tuple] = []
+    for keys in by_pair.values():
+        if len(keys) > 1:
+            label_support = collections.Counter()
+            label_order: dict[str, int] = {}
+            label_rank: dict[str, tuple] = {}
+            for k in keys:
+                label_support[k[2]] += support[k]
+                label_order[k[2]] = min(label_order.get(k[2], order[k]), order[k])
+                label_rank[k[2]] = max(label_rank.get(k[2], ()), rank[k])
+            # 支持数の多い順 → 根拠の確かな順 → 先に出た順。rank は大きいほうを先にするので符号を反転して比べる
+            best_label = min(label_support, key=lambda l: (-label_support[l], [-x for x in label_rank[l]], label_order[l]))
+            best = min((k for k in keys if k[2] == best_label),
+                       key=lambda k: (-support[k], [-x for x in rank[k]], order[k]))
+            dropped["同じ対の食い違い"] += len(keys) - 1
+            keys = [best]
+        kept.append(keys[0])
+
+    kept.sort(key=order.__getitem__)
+    return [{k2: v for k2, v in first[k].items() if k2 != "_rank"} for k in kept], dropped
 
 
 # ------------------------------------------------------------------ 画像
