@@ -496,10 +496,10 @@ def _pages_of(c: dict) -> set[tuple[int, int]]:
 def completion_candidates(concepts: dict[str, dict], relations: list[dict], page_text: dict[tuple[int, int], str],
                           index, client, max_pairs: int = COMPLETION_MAX_PAIRS,
                           search_k: int = COMPLETION_SEARCH_K) -> tuple[list[dict], dict]:
-    """関係を補う候補の対を選ぶ。LLM は呼ばない（索引の検索は埋め込みを 1 回ずつ呼ぶ）。
+    """関係を補う候補の対を選ぶ。LLM は呼ばない（索引の検索は埋め込みを 1 回呼ぶ）。
 
     1. 同じページに一緒に出てくるのに関係の無い対
-    2. どの関係にもつながらない概念は、索引で近いページを探し、そのページに出てくる概念と対にする
+    2. どの関係にもつながらない概念は、索引で近いページを探し（search_many で全部を 1 回の埋め込みにまとめる）、そのページに出てくる概念と対にする
        （索引が無ければ 1 だけ）
     どの関係にもつながらない概念を含む対を先に、次に一緒に出るページの多い対を先にし、max_pairs 本で切る。
     戻り値: (候補 [{"a", "b", "pages": [(lecture, page)], "page_info": [{"lecture", "page", "score", "via"}],
@@ -534,11 +534,15 @@ def completion_candidates(concepts: dict[str, dict], relations: list[dict], page
                 add(a, b, page, shared=True)
 
     searches = 0
-    if index is not None:
-        for cid in isolated:
-            c = concepts[cid]
-            hits = index.search(client, c["label"], k=search_k, exclude=_pages_of(c))
-            searches += 1
+    if index is not None and isolated:
+        # 全部の概念名を search_many の 1 回の埋め込みでまとめて引く（#84）。exclude は全問い合わせで共通なので、
+        # 概念ごとの「自分のページ」は渡さず、その分だけ多めに取ってからここで除く
+        own = {cid: _pages_of(concepts[cid]) for cid in isolated}
+        k = search_k + max(len(v) for v in own.values())
+        results = index.search_many(client, [concepts[cid]["label"] for cid in isolated], k=k)
+        searches = len(isolated)
+        for cid, found in zip(isolated, results):
+            hits = [h for h in found if (h["lecture"], h["page"]) not in own[cid]][:search_k]
             for h in hits:
                 page = (h["lecture"], h["page"])
                 for other in on_page.get(page, []):
