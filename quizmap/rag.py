@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 import sys
+import unicodedata
 import threading
 from pathlib import Path
 from urllib.parse import quote
@@ -171,9 +173,41 @@ class SlideIndex:
 
 # ---------------------------------------------------------------- wikipedia
 
+_PAREN_RE = re.compile(r"\([^()]*\)")                  # NFKC の後なので全角の括弧も半角になっている
+_EDGE_RE = re.compile(r"^[\W_]+|[\W_]+$")              # 前後の記号・空白（漢字・かな・英数字は \w）
+_SPACE_RE = re.compile(r"\s+")
+_KEY_DROP_RE = re.compile(r"[\W_]+")                    # 題名との比べ方: 空白・中黒・記号は無視する
+
+
+def normalize_term(term: str) -> str:
+    """Wikipedia で引く語にする（#93）。
+
+    NFKC にそろえ、括弧の中（読み・原語・曖昧さ回避。「功利主義（こうりしゅぎ）」「Kant (philosopher)」）を外し、
+    前後の記号と空白を削り、中の空白を 1 つにする。
+    """
+    t = unicodedata.normalize("NFKC", term or "")
+    prev = None
+    while prev != t:                                     # 入れ子の括弧も外す
+        prev, t = t, _PAREN_RE.sub(" ", t)
+    t = _EDGE_RE.sub("", t)
+    return _SPACE_RE.sub(" ", t).strip()
+
+
+def _match_key(text: str) -> str:
+    return _KEY_DROP_RE.sub("", normalize_term(text)).casefold()
+
+
+def title_matches(term: str, title: str) -> bool:
+    """記事の題名が引いた語と合うか。正規化して、どちらかがもう一方に含まれれば合う（#93）。"""
+    a, b = _match_key(term), _match_key(title)
+    return bool(a and b) and (a in b or b in a)
+
+
 class Wiki:
     """Wikipedia の記事の冒頭を引く。lang は "ja" / "en"。結果（見つからなかったことも）をキャッシュする。
 
+    引く前に語を正規化し（normalize_term）、キャッシュのキーも正規化後の語にする。
+    検索の 1 件目の題名が語と合わない（title_matches でない）ときは、関係の無い記事なので None にする（#93）。
     通信に失敗したときは None を返し、キャッシュしない（次に呼んだときにもう一度試す）。
     """
 
@@ -190,13 +224,15 @@ class Wiki:
                 print(f"[warn] {self.path} を読めなかった: {e}", file=sys.stderr)
 
     def lookup(self, term: str) -> dict | None:
-        """{"title", "url", "extract"}。見つからなければ None。"""
-        term = term.strip()
+        """{"title", "url", "extract"}。見つからない・題名が語と合わなければ None。"""
+        term = normalize_term(term)
         if not term:
             return None
         with self._lock:
             if term in self._cache:
-                return self._cache[term]
+                hit = self._cache[term]
+                # #93 より前のキャッシュには、題名の合わない記事が残っていることがある
+                return hit if hit is None or title_matches(term, hit.get("title", "")) else None
         try:
             result = self._fetch(term)
         except Exception as e:  # noqa: BLE001  通信の失敗で取り込みや出題を止めない
@@ -221,6 +257,8 @@ class Wiki:
         if not found:
             return None
         title = found[0]["title"]
+        if not title_matches(term, title):
+            return None                                  # 関係の無い記事。「見つからない」として残す
         pages = self._get({"action": "query", "prop": "extracts|info", "exintro": 1, "explaintext": 1,
                            "inprop": "url", "redirects": 1, "titles": title}).get("query", {}).get("pages") or []
         page = next((p for p in pages if not p.get("missing")), None)
