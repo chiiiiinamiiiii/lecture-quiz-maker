@@ -355,18 +355,14 @@ class MapApp {
     const ctx = this.ctx, vis = this.visibleIds();
     ctx.clearRect(0, 0, this.w, this.h);
 
-    // 時系列: 講義回の列の目盛り
+    // 時系列: 講義回の列の補助線（見出しは点の上に重ねて最後に描く: _drawAxisLabels）
     if (this.layout === "timeline") {
-      ctx.font = "11px -apple-system, 'Hiragino Sans', sans-serif";
-      ctx.textAlign = "center";
+      ctx.strokeStyle = "rgba(255,255,255,0.075)";
       for (const n of this.data.lectures) {
         const p = this.data.positions.timeline_axis[String(n)];
-        if (!p) continue;
+        if (p === undefined) continue;
         const [x] = this.toScreen([p, 0]);
-        ctx.strokeStyle = "rgba(255,255,255,0.045)";
         ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, this.h); ctx.stroke();
-        ctx.fillStyle = "rgba(226,224,236,0.45)";
-        ctx.fillText(this.T.lecture_fmt.replace("{n}", n), x, this.h - 54);
       }
     }
 
@@ -455,6 +451,51 @@ class MapApp {
         ctx.restore();
       }
     }
+    this._drawAxisLabels(focus ? this.byId.get(hov) : null);
+  }
+
+  // 「講義回」の配置の列の見出し（#44）。縦位置はツールバーのすぐ下に固定し、横位置は列に合わせて動かす。
+  // 隣の見出しと重なるときは、重ならなくなるまで間引く（2 つに 1 つ、3 つに 1 つ…）。
+  // 描いた見出しの位置は data-axis に出す（テスト用）。
+  _drawAxisLabels(hoverNode) {
+    if (this.layout !== "timeline") { delete this.el.dataset.axis; return; }
+    const ctx = this.ctx;
+    const tb = this.root.querySelector(".qm-toolbar");
+    const y = tb.offsetTop + tb.offsetHeight + 8;
+    ctx.save();
+    ctx.font = "600 11px -apple-system, 'Hiragino Sans', sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "top";
+    const items = [];
+    for (const n of this.data.lectures) {
+      const p = this.data.positions.timeline_axis[String(n)];
+      if (p === undefined) continue;
+      const text = this.T.lecture_short.replace("{n}", n);
+      items.push({ n, text, x: this.toScreen([p, 0])[0], w: ctx.measureText(text).width + 10 });
+    }
+    items.sort((a, b) => a.x - b.x);
+    let step = 1;
+    const fits = (k) => items.every((it, i) => i < k || items[i].x - items[i - k].x >= (items[i].w + items[i - k].w) / 2 + 4);
+    while (step < items.length && !fits(step)) step += 1;
+    // 明るくする列: 点に乗っていればその点の講義回、そうでなければマウスの下（いちばん近い列。列の間隔の半分以内）
+    const hot = new Set(hoverNode ? hoverNode.lectures.map(String) : []);
+    if (!hoverNode && this.mouseX != null && items.length) {
+      const gap = items.length > 1 ? (items[items.length - 1].x - items[0].x) / (items.length - 1) : Infinity;
+      const near = items.reduce((b, it) => (Math.abs(it.x - this.mouseX) < Math.abs(b.x - this.mouseX) ? it : b));
+      if (Math.abs(near.x - this.mouseX) <= gap / 2) hot.add(String(near.n));
+    }
+    const drawn = [];
+    items.forEach((it, i) => {
+      if (i % step !== 0) return;               // 間引いた見出しは、明るくする列でも描かない（重なるため）
+      if (it.x + it.w / 2 < 0 || it.x - it.w / 2 > this.w) return;
+      const on = hot.has(String(it.n));
+      ctx.fillStyle = on ? rgba(COLORS.accent, 0.28) : "rgba(23,22,28,0.72)";
+      ctx.beginPath(); ctx.roundRect(it.x - it.w / 2, y - 2, it.w, 17, 8); ctx.fill();
+      ctx.fillStyle = on ? "#fff" : "rgba(226,224,236,0.7)";
+      ctx.fillText(it.text, it.x, y + 1);
+      drawn.push({ n: it.n, x: Math.round(it.x), y: Math.round(y - 2), w: Math.round(it.w), h: 17 });
+    });
+    ctx.restore();
+    this.el.dataset.axis = JSON.stringify({ step, labels: drawn });
   }
 
   _rectPoly(d) { const [x0, y0] = d.start, [x1, y1] = d.cur; return [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]; }
@@ -534,8 +575,9 @@ class MapApp {
         const h = this.hit(p[0], p[1]);
         const changed = JSON.stringify(h) !== JSON.stringify(this.hover);
         this.hover = h;
+        this.mouseX = p[0];
         this._showTooltip(p[0], p[1]);
-        if (changed) this.draw();
+        if (changed || this.layout === "timeline") this.draw();   // 時系列ではマウスの下の列の見出しを明るくする
         this.el.dataset.hover = h ? "1" : "";
         return;
       }
@@ -584,7 +626,7 @@ class MapApp {
     };
     c.addEventListener("pointerup", end);
     c.addEventListener("pointercancel", () => { this.drag = null; this._cursor(); this.draw(); });
-    c.addEventListener("pointerleave", () => { if (!this.drag) { this.hover = null; this.tooltip.style.display = "none"; this.draw(); } });
+    c.addEventListener("pointerleave", () => { this.mouseX = null; if (!this.drag) { this.hover = null; this.tooltip.style.display = "none"; this.draw(); } });
     c.addEventListener("dblclick", (ev) => {
       if (this._clickTimer) { clearTimeout(this._clickTimer); this._clickTimer = null; }   // ダブルクリックは拡大だけ
       const p = this._pt(ev);
