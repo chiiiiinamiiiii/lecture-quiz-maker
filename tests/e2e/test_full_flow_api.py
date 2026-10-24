@@ -3,6 +3,8 @@
 RUN_API_TESTS=1 のときだけ動く（@pytest.mark.api）。1 回の実行で API を 5〜6 回呼ぶ:
   取り込み 3 回（語彙・概念・関係）＋ 生成 2 回（作成・誤答の自己確認）＋ 採点 0〜1 回（記述問題があるときだけ）
 
+解答中は地図のツールチップに定義が出ないこと（#42）も確かめる。
+
 このテストは取り込み済みのコースを使わない。空のデータ置き場（一時フォルダ）で別にアプリを起動し、
 資料の PDF を 1 つアップロードするところから始める。conftest の app_url / page（取り込み済みのコースをコピーする）は使わない。
 
@@ -113,6 +115,16 @@ def _course_dir(data_dir: Path) -> Path:
     return dirs[0]
 
 
+def hover_tooltip(pg: Page, cid: str) -> dict:
+    """概念 cid の点にマウスを乗せ、ツールチップの表示と文字を返す。"""
+    x, y = app(pg, f"""(() => {{ const p = a.toScreen(a.pos.get({json.dumps(cid)}));
+        const r = a.canvas.getBoundingClientRect(); return [p[0] + r.left, p[1] + r.top]; }})()""")
+    pg.mouse.move(x - 40, y - 40)
+    pg.mouse.move(x, y, steps=5)
+    pg.wait_for_timeout(500)
+    return app(pg, "({shown: a.tooltip.style.display, text: a.tooltip.innerText, hover: a.hover})")
+
+
 def create_course_until_ingest(pg: Page, data_dir: Path, pdf: Path) -> Path:
     """新しいコースを作り、講義回の割り当てを確かめ、「取り込みを始める」が押せる所まで進む。API は呼ばない。"""
     main = pg.locator("[data-testid='stMain']")
@@ -195,6 +207,16 @@ def test_full_flow_from_upload_to_asked_on_map(fresh_page, fresh_data_dir):
     for q in questions:
         assert set(q["concepts"]) <= selected, f"確定した範囲の外の概念が出題された: {q['concepts']}"
 
+    # 解答中は地図のツールチップに定義を出さない（#42）。定義はブラウザにも送らない
+    probe = max((c for c in graph["concepts"] if c["id"] in selected), key=lambda c: len(c["definition"]))
+    pg.wait_for_function("() => window.__qmMapApp && window.__qmMapApp.data.hide_definitions === true", timeout=15000)
+    assert app(pg, "a.nodes.every(n => !n.definition)"), "解答中なのに定義がブラウザに送られている"
+    tip = hover_tooltip(pg, probe["id"])
+    assert tip["shown"] == "block" and tip["hover"] and tip["hover"]["type"] == "node", tip
+    probe = next(c for c in graph["concepts"] if c["id"] == tip["hover"]["id"])   # 点が重なっていたら、実際に乗った概念で確かめる
+    assert "解答中は定義を隠しています" in tip["text"], tip["text"]
+    assert probe["definition"][:15] not in tip["text"], "解答中のツールチップに定義が出ている"
+
     # 4 択は 1 つ目の選択肢を選び、記述は何か書く → 採点
     # 問題は上から順に並ぶ。4 択は k 番目の radiogroup、記述は k 番目の文字入力欄（枠の要素には testid が無いので、種類ごとの順番で探す）
     groups = main.get_by_role("radiogroup")
@@ -236,5 +258,10 @@ def test_full_flow_from_upload_to_asked_on_map(fresh_page, fresh_data_dir):
         arg=sorted(asked), timeout=30000)
     on_map = set(app(pg, "a.nodes.filter(n => n.asked).map(n => n.id)"))
     assert on_map == asked, f"地図の出題済み {sorted(on_map)} と results.json {sorted(asked)} が違う"
+    # 採点した後は、ツールチップに定義が戻る
+    pg.wait_for_function("() => window.__qmMapApp && window.__qmMapApp.data.hide_definitions === false", timeout=15000)
+    tip = hover_tooltip(pg, probe["id"])
+    assert tip["hover"] == {"type": "node", "id": probe["id"]}, tip
+    assert probe["definition"][:15] in tip["text"], f"採点後のツールチップに定義が戻らない: {tip['text']}"
     _no_exception(pg, "採点後")
     assert not pg.errors, f"ブラウザでエラー: {pg.errors}"
