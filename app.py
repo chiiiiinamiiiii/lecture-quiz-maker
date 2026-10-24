@@ -7,6 +7,7 @@
 """
 import pandas  # noqa: F401  plotly などの遅延 import が Streamlit のスレッドと競合して落ちるのを防ぐ（§9 の 8）
 
+import zlib
 from pathlib import Path
 
 import streamlit as st
@@ -38,15 +39,24 @@ def _import_legacy_once() -> bool:
 
 
 def _select_course(cid: str) -> None:
-    clear_course_state()
+    """選んでいるコースを cid にする。前と違うときだけ、前のコースの選択・クイズの状態を捨てる。
+
+    選んでいるコースはウィジェットの状態ではなく session_state["course_id"] で持つ（#52, #16）。
+    コース欄は表示名（言語・「未取り込み」・コース名）が変わるたびに作り直すため、その値には頼らない。
+    """
+    if st.session_state.get("course_id") != cid:
+        clear_course_state()
+    st.session_state["course_id"] = cid
     if cid == NEW:
         st.session_state.pop("course_dir", None)
     else:
         st.session_state["course_dir"] = str(COURSES_DIR / cid)
 
 
-def _on_course_change() -> None:
-    _select_course(st.session_state["course_select"])
+def _on_course_change(widget_key: str) -> None:
+    cid = st.session_state.get(widget_key)
+    if cid is not None and cid != st.session_state.get("course_id"):
+        _select_course(cid)
 
 
 @st.fragment(run_every="2s")
@@ -69,34 +79,35 @@ def main() -> None:
     _import_legacy_once()
     st.markdown(PAGE_CSS, unsafe_allow_html=True)
 
-    # 新しく作ったコースへの切り替えは、選択欄を作る前に行う（作った後に値を変えるとエラーになる: #13）
+    # 新しく作ったコースへの切り替えは、選択欄を作る前に行う（#13）
     pending = st.session_state.pop("pending_course", None)
     if pending:
-        st.session_state["course_select"] = pending
         _select_course(pending)
 
     courses = list_courses()
     by_id = {c["id"]: c for c in courses}
-    if "course_select" not in st.session_state or (st.session_state["course_select"] not in by_id
-                                                    and st.session_state["course_select"] != NEW):
+    cur = st.session_state.get("course_id")
+    if cur is None or (cur not in by_id and cur != NEW):
         ready = [c for c in courses if c["ready"]]
-        first = (ready or courses or [{"id": NEW}])[0]["id"]
-        st.session_state["course_select"] = first
-        _select_course(first)
+        _select_course((ready or courses or [{"id": NEW}])[0]["id"])
+    sel = st.session_state["course_id"]
+
+    options = [c["id"] for c in courses] + [NEW]
+    labels = {cid: t("new_course") if cid == NEW
+              else by_id[cid]["name"] + ("" if by_id[cid]["ready"] else t("not_ingested")) for cid in options}
+    # 表示名が変わったら別のウィジェットとして作り直す（閉じた欄の文字を今の表示名にする。#16）
+    widget_key = f"course_select-{zlib.crc32(chr(31).join(labels[c] for c in options).encode()):08x}"
 
     with st.sidebar:
         st.markdown(f"### {t('app_title')}")
         st.segmented_control(t("language"), options=list(LANGS), format_func=LANGS.get, key="lang",
                              default="ja", label_visibility="collapsed")
         st.selectbox(
-            t("course"), options=[c["id"] for c in courses] + [NEW], key="course_select",
-            format_func=lambda cid: t("new_course") if cid == NEW
-            else by_id[cid]["name"] + ("" if by_id[cid]["ready"] else t("not_ingested")),
-            on_change=_on_course_change,
+            t("course"), options=options, index=options.index(sel), key=widget_key,
+            format_func=labels.get, on_change=_on_course_change, args=(widget_key,),
         )
         _job_indicator()
 
-    sel = st.session_state["course_select"]
     if sel == NEW or sel not in by_id:
         render_new_course()
         return

@@ -36,6 +36,7 @@ TEXTS = {
     "unasked": {"ja": "未出題", "en": "Not asked"},
     "asked": {"ja": "出題済み", "en": "Asked"},
     "selected": {"ja": "選択中", "en": "Selected"},
+    "rel_other": {"ja": "その他", "en": "Other"},
     "hint": {"ja": "2本指でズーム ・ スペース＋ドラッグで移動 ・ Shift 追加 ・ ⌘ 除外",
              "en": "Two fingers to zoom · Space + drag to pan · Shift add · ⌘ subtract"},
     "by_lecture": {"ja": "講義回で選ぶ", "en": "By lecture"},
