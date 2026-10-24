@@ -1,7 +1,7 @@
 /* QUIZ MAP の地図部品。Obsidian のグラフ表示に寄せた暗い画面に、半透明のパネルを重ねる */
 .qm-root { width: 100%; height: 100%; }
 .qm-map {
-  position: relative; width: 100%; height: 100%; overflow: hidden; outline: none;
+  position: relative; width: 100%; height: 100%; overflow: hidden; outline: none; box-sizing: border-box;
   border-radius: 14px;
   background:
     radial-gradient(ellipse at 30% 20%, rgba(255, 122, 172, 0.06), transparent 55%),
@@ -26,8 +26,9 @@
 }
 
 /* ツールバー（左上） */
-.qm-toolbar { top: 12px; left: 12px; display: flex; align-items: center; gap: 2px; padding: 4px; }
+.qm-toolbar { top: 12px; left: 12px; display: flex; flex-wrap: nowrap; align-items: center; gap: 2px; padding: 4px; white-space: nowrap; }
 .qm-toolbar button {
+  white-space: nowrap; flex: 0 0 auto;
   height: 30px; min-width: 30px; padding: 0 7px; border: 0; border-radius: 7px; background: transparent;
   color: rgba(226, 224, 236, 0.72); font-size: 12px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center;
   transition: background 0.12s, color 0.12s;
@@ -42,15 +43,23 @@
 .qm-density input { width: 84px; accent-color: #ff7aac; }
 .qm-density span { min-width: 38px; text-align: right; font-variant-numeric: tabular-nums; }
 
-/* 凡例（右上）・件数 */
-.qm-legend { bottom: 58px; right: 12px; display: flex; gap: 12px; padding: 7px 11px; font-size: 11px; color: rgba(226, 224, 236, 0.75); }
+/* 狭いとき（map.js の _fitToolbar が qm-narrow を付ける）: ツールの段と表示の段の 2 段にする */
+.qm-break { display: none; }
+.qm-narrow .qm-toolbar { flex-wrap: wrap; row-gap: 4px; max-width: calc(100% - 24px); box-sizing: border-box; }
+.qm-narrow .qm-break { display: block; flex-basis: 100%; height: 0; }
+.qm-narrow .qm-sep-break { display: none; }
+
+/* 選択数（ツールバーの中、× の左） */
+.qm-count { padding: 0 8px; font-size: 12px; color: #ff9cc2; font-variant-numeric: tabular-nums; }
+
+/* 地図下の帯: 左に操作の説明、右に凡例。幅が足りなければ説明の方を省略し、凡例は必ず全部見せる */
+.qm-band { position: absolute; z-index: 2; left: 12px; right: 12px; bottom: 58px; display: flex; align-items: flex-end; justify-content: space-between; gap: 8px; pointer-events: none; }
+.qm-band > .qm-glass { position: static; pointer-events: auto; }
+.qm-legend { flex: 0 0 auto; display: flex; gap: 12px; padding: 7px 11px; font-size: 11px; color: rgba(226, 224, 236, 0.75); white-space: nowrap; }
 .qm-legend span { display: inline-flex; align-items: center; gap: 6px; }
 .qm-legend i { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
 .qm-legend i.ring { background: transparent; border: 2px solid #ff7aac; width: 7px; height: 7px; box-shadow: 0 0 6px rgba(255, 122, 172, 0.7); }
-.qm-count { top: 12px; right: 12px; padding: 5px 11px; font-size: 12px; color: #ff9cc2; }
-
-/* 操作のヒント（左下） */
-.qm-hint { left: 12px; bottom: 58px; padding: 5px 10px; font-size: 11px; color: rgba(226, 224, 236, 0.5); background: rgba(30, 29, 38, 0.45); }
+.qm-hint { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 5px 10px; font-size: 11px; color: rgba(226, 224, 236, 0.5); background: rgba(30, 29, 38, 0.45); }
 
 /* 講義回ボタン（下端） */
 .qm-lectures {
@@ -58,6 +67,10 @@
   overflow-x: auto; scrollbar-width: none;
 }
 .qm-lectures::-webkit-scrollbar { display: none; }
+/* 続きがある側の端をぼかす（map.js の _lecEdges が data 属性を付ける） */
+.qm-lectures[data-more-right="1"] { -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 36px), transparent); mask-image: linear-gradient(to right, #000 calc(100% - 36px), transparent); }
+.qm-lectures[data-more-left="1"] { -webkit-mask-image: linear-gradient(to left, #000 calc(100% - 36px), transparent); mask-image: linear-gradient(to left, #000 calc(100% - 36px), transparent); }
+.qm-lectures[data-more-left="1"][data-more-right="1"] { -webkit-mask-image: linear-gradient(to right, transparent, #000 36px, #000 calc(100% - 36px), transparent); mask-image: linear-gradient(to right, transparent, #000 36px, #000 calc(100% - 36px), transparent); }
 .qm-lec-title { font-size: 11px; color: rgba(226, 224, 236, 0.5); padding: 0 6px 0 4px; white-space: nowrap; }
 .qm-lectures button {
   flex: 0 0 auto; height: 26px; padding: 0 9px; border-radius: 13px; border: 1px solid rgba(255, 255, 255, 0.1);

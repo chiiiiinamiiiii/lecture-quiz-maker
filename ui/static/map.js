@@ -56,18 +56,20 @@ class MapApp {
           <button data-tool="hand"></button><button data-tool="lasso"></button><button data-tool="rect"></button>
           <span class="qm-sep"></span>
           <button data-act="zoomin"></button><button data-act="zoomout"></button><button data-act="fit"></button>
-          <span class="qm-sep"></span>
+          <span class="qm-sep qm-sep-break"></span><span class="qm-break"></span>
           <div class="qm-seg"><button data-layout="force"></button><button data-layout="timeline"></button></div>
           <span class="qm-sep"></span>
           <label class="qm-density"><span></span><input type="range" min="1" step="1"></label>
           <span class="qm-sep"></span>
+          <span class="qm-count"></span>
           <button data-act="clear" class="qm-clear"></button>
         </div>
-        <div class="qm-legend qm-glass"></div>
-        <div class="qm-hint qm-glass"></div>
+        <div class="qm-band">
+          <div class="qm-hint qm-glass"></div>
+          <div class="qm-legend qm-glass"></div>
+        </div>
         <div class="qm-lectures qm-glass"></div>
         <div class="qm-tooltip qm-glass"></div>
-        <div class="qm-count qm-glass"></div>
       </div>`;
     this.el = root.querySelector(".qm-map");
     this.canvas = root.querySelector("canvas");
@@ -162,7 +164,10 @@ class MapApp {
       `<span><i style="background:${rgba(COLORS.unasked, 1)}"></i>${T.unasked}</span>` +
       `<span><i style="background:${rgba(COLORS.asked, 1)}"></i>${T.asked}</span>` +
       `<span><i class="ring"></i>${T.selected}</span>`;
-    this.root.querySelector(".qm-hint").textContent = T.hint;
+    const hint = this.root.querySelector(".qm-hint");
+    const hintText = this.tool === "hand" ? T.hint_hand : T.hint_select;   // ツールごとに説明を替える（#67）
+    hint.textContent = hintText;
+    hint.title = hintText;              // 幅が足りず省略されたときも、マウスを乗せれば全文が読める
 
     const lec = this.root.querySelector(".qm-lectures");
     if (!lec.dataset.built || lec.dataset.course !== this.data.course_id || lec.dataset.lang !== T.lecture_fmt) {
@@ -174,9 +179,27 @@ class MapApp {
       lec.dataset.lang = T.lecture_fmt;
     }
     lec.querySelectorAll("button").forEach((b) => b.classList.toggle("on", this.activeLectures.has(b.dataset.lec)));
+    this._lecEdges();
     const c = this.root.querySelector(".qm-count");
     c.textContent = this.selected.size ? T.count_fmt.replace("{n}", this.selected.size) : "";
     c.style.display = this.selected.size ? "" : "none";
+    this._fitToolbar();
+  }
+
+  // ツールバーが 1 段で地図の幅に収まらなければ 2 段にする（#43）。選択数の文字で幅が変わるので描くたびに見る
+  _fitToolbar() {
+    if (!this.w) return;
+    const tb = this.root.querySelector(".qm-toolbar");
+    this.el.classList.remove("qm-narrow");
+    this.el.classList.toggle("qm-narrow", tb.scrollWidth > this.w - 24);
+  }
+
+  // 講義回ボタンの列: 左右に続きがあるかを data 属性で示す（CSS が端をぼかす。#43）
+  _lecEdges() {
+    const lec = this.root.querySelector(".qm-lectures");
+    const max = lec.scrollWidth - lec.clientWidth;
+    lec.dataset.moreLeft = lec.scrollLeft > 1 ? "1" : "";
+    lec.dataset.moreRight = lec.scrollLeft < max - 1 ? "1" : "";
   }
 
   // ---------------------------------------------------------------- 座標
@@ -190,6 +213,8 @@ class MapApp {
     this.canvas.style.width = r.width + "px";
     this.canvas.style.height = r.height + "px";
     this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    this._fitToolbar();
+    this._lecEdges();
     this.draw();
   }
 
@@ -331,18 +356,14 @@ class MapApp {
     const ctx = this.ctx, vis = this.visibleIds();
     ctx.clearRect(0, 0, this.w, this.h);
 
-    // 時系列: 講義回の列の目盛り
+    // 時系列: 講義回の列の補助線（見出しは点の上に重ねて最後に描く: _drawAxisLabels）
     if (this.layout === "timeline") {
-      ctx.font = "11px -apple-system, 'Hiragino Sans', sans-serif";
-      ctx.textAlign = "center";
+      ctx.strokeStyle = "rgba(255,255,255,0.075)";
       for (const n of this.data.lectures) {
         const p = this.data.positions.timeline_axis[String(n)];
-        if (!p) continue;
+        if (p === undefined) continue;
         const [x] = this.toScreen([p, 0]);
-        ctx.strokeStyle = "rgba(255,255,255,0.045)";
         ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, this.h); ctx.stroke();
-        ctx.fillStyle = "rgba(226,224,236,0.45)";
-        ctx.fillText(this.T.lecture_fmt.replace("{n}", n), x, this.h - 54);
       }
     }
 
@@ -431,6 +452,51 @@ class MapApp {
         ctx.restore();
       }
     }
+    this._drawAxisLabels(focus ? this.byId.get(hov) : null);
+  }
+
+  // 「講義回」の配置の列の見出し（#44）。縦位置はツールバーのすぐ下に固定し、横位置は列に合わせて動かす。
+  // 隣の見出しと重なるときは、重ならなくなるまで間引く（2 つに 1 つ、3 つに 1 つ…）。
+  // 描いた見出しの位置は data-axis に出す（テスト用）。
+  _drawAxisLabels(hoverNode) {
+    if (this.layout !== "timeline") { delete this.el.dataset.axis; return; }
+    const ctx = this.ctx;
+    const tb = this.root.querySelector(".qm-toolbar");
+    const y = tb.offsetTop + tb.offsetHeight + 8;
+    ctx.save();
+    ctx.font = "600 11px -apple-system, 'Hiragino Sans', sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "top";
+    const items = [];
+    for (const n of this.data.lectures) {
+      const p = this.data.positions.timeline_axis[String(n)];
+      if (p === undefined) continue;
+      const text = this.T.lecture_short.replace("{n}", n);
+      items.push({ n, text, x: this.toScreen([p, 0])[0], w: ctx.measureText(text).width + 10 });
+    }
+    items.sort((a, b) => a.x - b.x);
+    let step = 1;
+    const fits = (k) => items.every((it, i) => i < k || items[i].x - items[i - k].x >= (items[i].w + items[i - k].w) / 2 + 4);
+    while (step < items.length && !fits(step)) step += 1;
+    // 明るくする列: 点に乗っていればその点の講義回、そうでなければマウスの下（いちばん近い列。列の間隔の半分以内）
+    const hot = new Set(hoverNode ? hoverNode.lectures.map(String) : []);
+    if (!hoverNode && this.mouseX != null && items.length) {
+      const gap = items.length > 1 ? (items[items.length - 1].x - items[0].x) / (items.length - 1) : Infinity;
+      const near = items.reduce((b, it) => (Math.abs(it.x - this.mouseX) < Math.abs(b.x - this.mouseX) ? it : b));
+      if (Math.abs(near.x - this.mouseX) <= gap / 2) hot.add(String(near.n));
+    }
+    const drawn = [];
+    items.forEach((it, i) => {
+      if (i % step !== 0) return;               // 間引いた見出しは、明るくする列でも描かない（重なるため）
+      if (it.x + it.w / 2 < 0 || it.x - it.w / 2 > this.w) return;
+      const on = hot.has(String(it.n));
+      ctx.fillStyle = on ? rgba(COLORS.accent, 0.28) : "rgba(23,22,28,0.72)";
+      ctx.beginPath(); ctx.roundRect(it.x - it.w / 2, y - 2, it.w, 17, 8); ctx.fill();
+      ctx.fillStyle = on ? "#fff" : "rgba(226,224,236,0.7)";
+      ctx.fillText(it.text, it.x, y + 1);
+      drawn.push({ n: it.n, x: Math.round(it.x), y: Math.round(y - 2), w: Math.round(it.w), h: 17 });
+    });
+    ctx.restore();
+    this.el.dataset.axis = JSON.stringify({ step, labels: drawn });
   }
 
   _rectPoly(d) { const [x0, y0] = d.start, [x1, y1] = d.cur; return [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]; }
@@ -510,8 +576,9 @@ class MapApp {
         const h = this.hit(p[0], p[1]);
         const changed = JSON.stringify(h) !== JSON.stringify(this.hover);
         this.hover = h;
+        this.mouseX = p[0];
         this._showTooltip(p[0], p[1]);
-        if (changed) this.draw();
+        if (changed || this.layout === "timeline") this.draw();   // 時系列ではマウスの下の列の見出しを明るくする
         this.el.dataset.hover = h ? "1" : "";
         return;
       }
@@ -560,7 +627,7 @@ class MapApp {
     };
     c.addEventListener("pointerup", end);
     c.addEventListener("pointercancel", () => { this.drag = null; this._cursor(); this.draw(); });
-    c.addEventListener("pointerleave", () => { if (!this.drag) { this.hover = null; this.tooltip.style.display = "none"; this.draw(); } });
+    c.addEventListener("pointerleave", () => { this.mouseX = null; if (!this.drag) { this.hover = null; this.tooltip.style.display = "none"; this.draw(); } });
     c.addEventListener("dblclick", (ev) => {
       if (this._clickTimer) { clearTimeout(this._clickTimer); this._clickTimer = null; }   // ダブルクリックは拡大だけ
       const p = this._pt(ev);
@@ -568,8 +635,15 @@ class MapApp {
     });
 
     // ホイール: ピンチ（ctrl 付き）と 2 本指の上下はズーム。スペースを押している間は移動
+    const lecRow = this.root.querySelector(".qm-lectures");
+    lecRow.addEventListener("scroll", () => this._lecEdges());
     this.el.addEventListener("wheel", (ev) => {
       ev.preventDefault();
+      // 講義回ボタンの列の上では、地図をズームせずに列を横に送る（#43）
+      if (ev.target.closest && ev.target.closest(".qm-lectures")) {
+        lecRow.scrollLeft += Math.abs(ev.deltaX) > Math.abs(ev.deltaY) ? ev.deltaX : ev.deltaY;
+        return;
+      }
       const p = this._pt(ev);
       if (this.space && !ev.ctrlKey) {
         this.view = { ...this.view, tx: this.view.tx - ev.deltaX, ty: this.view.ty - ev.deltaY };

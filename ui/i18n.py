@@ -36,11 +36,15 @@ TEXTS = {
     "unasked": {"ja": "未出題", "en": "Not asked"},
     "asked": {"ja": "出題済み", "en": "Asked"},
     "selected": {"ja": "選択中", "en": "Selected"},
-    "hint": {"ja": "ドラッグで移動 ・ 2本指でズーム ・ L 投げ縄 / M 矩形で範囲を選ぶ ・ Shift 追加 ・ ⌘ 除外 ・ Esc で選択を解除",
-             "en": "Drag to pan · Two fingers to zoom · L lasso / M marquee to select · Shift add · ⌘ subtract · Esc to clear"},
+    # 地図下の説明。選んでいるツールで替える（#67）
+    "hint_hand": {"ja": "ドラッグで移動 ・ クリックで選択（Shift 追加・⌘ 除外） ・ 2本指でズーム ・ L 投げ縄 / M 矩形で囲んで選ぶ ・ Esc で選択を解除",
+                  "en": "Drag to pan · Click to select (Shift add · ⌘ subtract) · Two fingers to zoom · L lasso / M marquee to select an area · Esc to clear"},
+    "hint_select": {"ja": "ドラッグで囲んで選択 ・ Shift 追加 ・ ⌘ 除外 ・ スペース＋ドラッグで移動 ・ 2本指でズーム ・ H 手のひら ・ Esc で選択を解除",
+                    "en": "Drag to select an area · Shift add · ⌘ subtract · Space + drag to pan · Two fingers to zoom · H hand · Esc to clear"},
     "by_lecture": {"ja": "講義回で選ぶ", "en": "By lecture"},
     "all": {"ja": "全部", "en": "All"},
     "lecture_fmt": {"ja": "第{n}回", "en": "L{n}"},
+    "lecture_short": {"ja": "{n}", "en": "L{n}"},   # 「講義回」の配置の列の見出し（短い形。#44）
     "count_fmt": {"ja": "{n} 個を選択中", "en": "{n} selected"},
     "def_hidden": {"ja": "解答中は定義を隠しています", "en": "Definitions are hidden while you answer"},
 
@@ -141,6 +145,6 @@ def t(key: str, **kw) -> str:
 def map_texts() -> dict:
     """地図部品（JavaScript）に渡す文言。"""
     keys = ["tool_hand", "tool_lasso", "tool_rect", "zoom_in", "zoom_out", "fit", "clear", "layout_force",
-            "layout_timeline", "density", "unasked", "asked", "selected", "hint", "by_lecture", "all",
-            "lecture_fmt", "count_fmt", "def_hidden"]
+            "layout_timeline", "density", "unasked", "asked", "selected", "hint_hand", "hint_select", "by_lecture", "all",
+            "lecture_fmt", "lecture_short", "count_fmt", "def_hidden"]
     return {k: TEXTS[k].get(lang()) or TEXTS[k]["ja"] for k in keys}

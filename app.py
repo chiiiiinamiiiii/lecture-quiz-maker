@@ -27,6 +27,13 @@ PAGE_CSS = """
 .block-container { padding: 1.4rem 1.6rem 1rem 1.6rem; max-width: 100%; }
 header[data-testid="stHeader"] { background: transparent; }
 div[data-testid="stVerticalBlockBorderWrapper"] { border-color: rgba(255,255,255,0.07); }
+/* 地図の画面（ui/map_view.py）: 左の地図（qm-left）と右の欄（qm-right）の高さを窓の高さに合わせる（#43）。
+   上の余白（約 38px）と下の余白（約 16px）を引き、420〜900px に収める。外側の枠が flex で高さを固定するので、そこも上書きする */
+[data-testid="stLayoutWrapper"]:has(> .st-key-qm-left), [data-testid="stLayoutWrapper"]:has(> .st-key-qm-right),
+.st-key-qm-left, .st-key-qm-right {
+  height: clamp(420px, calc(100vh - 56px), 900px) !important; flex: 0 0 auto !important;
+}
+.st-key-qm-left { overflow: hidden !important; }
 </style>
 """
 
