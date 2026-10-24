@@ -38,7 +38,7 @@ def rel_label(label: str) -> str:
 
 
 def concept_map(graph, asked: set[str], selected: list[str], sel_version: int, course_id: str,
-                height: int = 760, hide_definitions: bool = False) -> dict | None:
+                height: int | str = 760, hide_definitions: bool = False) -> dict | None:
     """地図を描き、ブラウザ側の選択 {"ids", "via_edge", "version", "n"} を返す（まだ無ければ None）。
 
     hide_definitions: 解答中は True。定義をブラウザに送らず、説明にも出さない（#42。定義問題の答えになる）。

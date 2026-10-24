@@ -56,18 +56,20 @@ class MapApp {
           <button data-tool="hand"></button><button data-tool="lasso"></button><button data-tool="rect"></button>
           <span class="qm-sep"></span>
           <button data-act="zoomin"></button><button data-act="zoomout"></button><button data-act="fit"></button>
-          <span class="qm-sep"></span>
+          <span class="qm-sep qm-sep-break"></span><span class="qm-break"></span>
           <div class="qm-seg"><button data-layout="force"></button><button data-layout="timeline"></button></div>
           <span class="qm-sep"></span>
           <label class="qm-density"><span></span><input type="range" min="1" step="1"></label>
           <span class="qm-sep"></span>
+          <span class="qm-count"></span>
           <button data-act="clear" class="qm-clear"></button>
         </div>
-        <div class="qm-legend qm-glass"></div>
-        <div class="qm-hint qm-glass"></div>
+        <div class="qm-band">
+          <div class="qm-hint qm-glass"></div>
+          <div class="qm-legend qm-glass"></div>
+        </div>
         <div class="qm-lectures qm-glass"></div>
         <div class="qm-tooltip qm-glass"></div>
-        <div class="qm-count qm-glass"></div>
       </div>`;
     this.el = root.querySelector(".qm-map");
     this.canvas = root.querySelector("canvas");
@@ -162,7 +164,9 @@ class MapApp {
       `<span><i style="background:${rgba(COLORS.unasked, 1)}"></i>${T.unasked}</span>` +
       `<span><i style="background:${rgba(COLORS.asked, 1)}"></i>${T.asked}</span>` +
       `<span><i class="ring"></i>${T.selected}</span>`;
-    this.root.querySelector(".qm-hint").textContent = T.hint;
+    const hint = this.root.querySelector(".qm-hint");
+    hint.textContent = T.hint;
+    hint.title = T.hint;                // 幅が足りず省略されたときも、マウスを乗せれば全文が読める
 
     const lec = this.root.querySelector(".qm-lectures");
     if (!lec.dataset.built || lec.dataset.course !== this.data.course_id || lec.dataset.lang !== T.lecture_fmt) {
@@ -174,9 +178,27 @@ class MapApp {
       lec.dataset.lang = T.lecture_fmt;
     }
     lec.querySelectorAll("button").forEach((b) => b.classList.toggle("on", this.activeLectures.has(b.dataset.lec)));
+    this._lecEdges();
     const c = this.root.querySelector(".qm-count");
     c.textContent = this.selected.size ? T.count_fmt.replace("{n}", this.selected.size) : "";
     c.style.display = this.selected.size ? "" : "none";
+    this._fitToolbar();
+  }
+
+  // ツールバーが 1 段で地図の幅に収まらなければ 2 段にする（#43）。選択数の文字で幅が変わるので描くたびに見る
+  _fitToolbar() {
+    if (!this.w) return;
+    const tb = this.root.querySelector(".qm-toolbar");
+    this.el.classList.remove("qm-narrow");
+    this.el.classList.toggle("qm-narrow", tb.scrollWidth > this.w - 24);
+  }
+
+  // 講義回ボタンの列: 左右に続きがあるかを data 属性で示す（CSS が端をぼかす。#43）
+  _lecEdges() {
+    const lec = this.root.querySelector(".qm-lectures");
+    const max = lec.scrollWidth - lec.clientWidth;
+    lec.dataset.moreLeft = lec.scrollLeft > 1 ? "1" : "";
+    lec.dataset.moreRight = lec.scrollLeft < max - 1 ? "1" : "";
   }
 
   // ---------------------------------------------------------------- 座標
@@ -190,6 +212,8 @@ class MapApp {
     this.canvas.style.width = r.width + "px";
     this.canvas.style.height = r.height + "px";
     this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    this._fitToolbar();
+    this._lecEdges();
     this.draw();
   }
 
@@ -568,8 +592,15 @@ class MapApp {
     });
 
     // ホイール: ピンチ（ctrl 付き）と 2 本指の上下はズーム。スペースを押している間は移動
+    const lecRow = this.root.querySelector(".qm-lectures");
+    lecRow.addEventListener("scroll", () => this._lecEdges());
     this.el.addEventListener("wheel", (ev) => {
       ev.preventDefault();
+      // 講義回ボタンの列の上では、地図をズームせずに列を横に送る（#43）
+      if (ev.target.closest && ev.target.closest(".qm-lectures")) {
+        lecRow.scrollLeft += Math.abs(ev.deltaX) > Math.abs(ev.deltaY) ? ev.deltaX : ev.deltaY;
+        return;
+      }
       const p = this._pt(ev);
       if (this.space && !ev.ctrlKey) {
         this.view = { ...this.view, tx: this.view.tx - ev.deltaX, ty: this.view.ty - ev.deltaY };

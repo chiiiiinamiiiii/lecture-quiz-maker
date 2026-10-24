@@ -7,7 +7,8 @@ from ui.map_component import concept_map
 from ui.quiz_view import quiz_section
 from ui.state import course_dir, load_graph
 
-MAP_HEIGHT = 780
+MAP_HEIGHT = 780   # CSS が効かないときの高さ。実際の高さは app.py の PAGE_CSS で窓の高さから決める（#43）
+
 
 
 def _current_selection() -> tuple[list[str], set[str]]:
@@ -28,9 +29,9 @@ def render_map_page() -> None:
     version = st.session_state["sel_version"]
 
     left, right = st.columns([1.75, 1], gap="medium")
-    with left:
+    with left, st.container(key="qm-left", height=MAP_HEIGHT, border=False):
         ids, _ = _current_selection()
-        sel = concept_map(graph, asked, ids, version, course_dir().name, height=MAP_HEIGHT,
+        sel = concept_map(graph, asked, ids, version, course_dir().name, height="stretch",
                           hide_definitions=answering_quiz(st.session_state))
         # ブラウザ側の選択を受け取る。古い版（コース切替・解除の前）の送信は捨てる
         # 右側はこの後に描くので、ここで受け取れば同じ実行の中で一覧に反映される
@@ -38,7 +39,7 @@ def render_map_page() -> None:
             st.session_state["selection"] = sel
 
     with right:
-        panel = st.container(height=MAP_HEIGHT, border=False)
+        panel = st.container(key="qm-right", height=MAP_HEIGHT, border=False)
         with panel:
             _selection_panel(graph, concepts, weights, asked)
             if "confirmed_ids" in st.session_state:
@@ -55,7 +56,7 @@ def _selection_panel(graph, concepts, weights, asked) -> None:
     ordered = sorted(ids, key=lambda i: (i in via, -weights[i]))
     st.caption(t("sel_caption", n=len(ordered), m=sum(1 for i in ordered if i in via)))
     with st.form("confirm", border=False):
-        box = st.container(height=min(260, 34 * len(ordered) + 10), border=True)
+        box = st.container(height=min(260, 40 * len(ordered) + 16), border=True)
         checked = {}
         with box:
             for cid in ordered:
