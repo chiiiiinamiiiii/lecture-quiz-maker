@@ -37,7 +37,6 @@ def test_create_course_makes_folder_and_course_json(courses_dir):
     assert courses.list_courses()[0]["ready"] is False
 
 
-@pytest.mark.xfail(strict=True, reason="#3 同じ秒に作ると同じフォルダになり、前のコースを上書きする")
 def test_create_course_twice_in_same_second_keeps_both(courses_dir, frozen_clock):
     a = courses.create_course("A")
     write_json(a / "course.json", {**read_json(a / "course.json"),
@@ -46,6 +45,32 @@ def test_create_course_twice_in_same_second_keeps_both(courses_dir, frozen_clock
     assert a != b
     assert read_json(a / "course.json")["name"] == "A"
     assert len(read_json(a / "course.json")["files"]) == 1
+    assert read_json(b / "course.json")["name"] == "B"
+    assert {c["name"] for c in courses.list_courses()} == {"A", "B"}
+
+
+def test_create_course_does_not_reuse_existing_folder(courses_dir, frozen_clock):
+    """中身の無いフォルダが同じ id で残っていても、それを使わず別の id にする（#3）。"""
+    stale = courses_dir / "c20261024-120000-000000"
+    (stale / "uploads").mkdir(parents=True)
+    (stale / "uploads" / "残り.pdf").write_bytes(b"old")
+    d = courses.create_course("新しい")
+    assert d != stale
+    assert d.name.startswith("c20261024-120000-000000-")
+    assert list((d / "uploads").iterdir()) == []
+    assert not (stale / "course.json").exists()
+
+
+def test_create_course_many_in_same_instant_are_distinct(courses_dir, frozen_clock):
+    dirs = [courses.create_course(f"C{i}") for i in range(20)]
+    assert len(set(dirs)) == 20
+    assert sorted(c["name"] for c in courses.list_courses()) == sorted(f"C{i}" for i in range(20))
+
+
+def test_create_course_id_format(courses_dir):
+    import re
+    d = courses.create_course("c")
+    assert re.fullmatch(r"c\d{8}-\d{6}-\d{6}", d.name)
 
 
 # ------------------------------------------------------------------ save_upload

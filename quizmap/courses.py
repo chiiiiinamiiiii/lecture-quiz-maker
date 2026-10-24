@@ -20,6 +20,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import re
+import secrets
 import shutil
 import threading
 import traceback
@@ -52,9 +53,24 @@ def list_courses() -> list[dict]:
 
 
 def create_course(name: str) -> Path:
-    cid = dt.datetime.now().strftime("c%Y%m%d-%H%M%S")
-    d = COURSES_DIR / cid
-    (d / "uploads").mkdir(parents=True, exist_ok=True)
+    """新しいコースのフォルダを作る。id は c年月日-時分秒-マイクロ秒。
+
+    同じ id のフォルダが既にあれば作り直さず、末尾に短い乱数を足した別の id にする（#3）。
+    フォルダの作成は exist_ok=False なので、同時に呼ばれても同じフォルダを 2 人が使うことはない。
+    """
+    COURSES_DIR.mkdir(parents=True, exist_ok=True)
+    base = dt.datetime.now().strftime("c%Y%m%d-%H%M%S-%f")
+    cid = base
+    for _ in range(100):
+        d = COURSES_DIR / cid
+        try:
+            d.mkdir()
+            break
+        except FileExistsError:
+            cid = f"{base}-{secrets.token_hex(2)}"
+    else:
+        raise RuntimeError(f"コースのフォルダを作れなかった: {COURSES_DIR / base}")
+    (d / "uploads").mkdir()
     write_json(d / "course.json", {"name": name, "created_at": now(), "files": []})
     return d
 
