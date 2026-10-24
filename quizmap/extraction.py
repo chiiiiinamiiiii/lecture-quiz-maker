@@ -268,9 +268,9 @@ def resolve_pair_conflicts(candidates: list[dict]) -> tuple[list[dict], collecti
 
     回ごとに独立に抽出するため、同じ対に別のラベルや逆向きの関係が付くことがある。
     LLM は呼ばず、資料中で何度その関係が書かれたか（支持数）で決める。
-    1. 同じ対に「その他」以外のラベルがあれば、「その他」を落とす
-    2. ラベルが 2 つ以上残れば、支持数（両向きの合計）の多いラベルを残す
-    3. そのラベルが両向きにあれば、支持数の多い向きを残す
+    1. ラベルが 2 つ以上あれば、支持数（両向きの合計）の多いラベルを残す。
+       「その他」も同じように比べる。語彙に合うラベルが無いときは「その他」が正しいことがあるため
+    2. そのラベルが両向きにあれば、支持数の多い向きを残す
        （対立のように向きの無いラベルでも、両向きは同じ関係の重複なので 1 本にしてよい）
     同点は先に出たもの（若い回）を残す。残した関係の source は、その (from, to, label) が最初に出た箇所。
     candidates は出現順に並んでいること。完全に同じ (from, to, label) も支持数として数える。
@@ -293,11 +293,6 @@ def resolve_pair_conflicts(candidates: list[dict]) -> tuple[list[dict], collecti
 
     kept: list[tuple] = []
     for keys in by_pair.values():
-        if len(keys) > 1:
-            named = [k for k in keys if k[2] != OTHER_LABEL]
-            if named and len(named) < len(keys):
-                dropped["同じ対の「その他」"] += len(keys) - len(named)
-                keys = named
         if len(keys) > 1:
             label_support = collections.Counter()
             label_order: dict[str, int] = {}
