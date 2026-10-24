@@ -71,6 +71,7 @@
 .qm-tooltip { display: none; max-width: 300px; padding: 9px 11px; font-size: 12px; line-height: 1.5; pointer-events: none; z-index: 3; background: rgba(24, 23, 30, 0.9); }
 .qm-tooltip b { color: #fff; font-weight: 600; }
 .qm-tooltip div { color: rgba(226, 224, 236, 0.8); margin-top: 3px; }
+.qm-tooltip .hidden-def { font-size: 11px; font-style: italic; color: rgba(226, 224, 236, 0.5); }
 .qm-tooltip small { display: block; margin-top: 5px; color: rgba(226, 224, 236, 0.5); }
 .qm-tooltip .tag { margin-left: 6px; font-size: 10px; padding: 1px 6px; border-radius: 8px; background: rgba(16, 170, 156, 0.3); color: #7ff0e3; }
 .qm-tooltip .rel { color: #ff9cc2; margin: 0 4px; }

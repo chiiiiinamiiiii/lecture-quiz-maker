@@ -32,6 +32,8 @@ const COLORS = {
   edge: [170, 170, 196],
   text: [226, 224, 236],
 };
+// LLM が資料から作った文字列（概念名・定義・関係の名前）を HTML に差し込む前に無害化する（#42）
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
 const rgba = (c, a) => `rgba(${c[0]},${c[1]},${c[2]},${a})`;
 
 function pointInPolygon(x, y, poly) {
@@ -441,11 +443,13 @@ class MapApp {
     if (this.hover.type === "node") {
       const n = this.byId.get(this.hover.id);
       const lec = n.lectures.map((x) => T.lecture_fmt.replace("{n}", x)).join("・");
-      html = `<b>${n.label}</b>${n.asked ? `<span class="tag">${T.asked}</span>` : ""}<div>${n.definition}</div><small>${lec}</small>`;
+      // 解答中は定義を出さない（定義問題の答えになる: #42）
+      const def = this.data.hide_definitions ? `<div class="hidden-def">${esc(T.def_hidden)}</div>` : `<div>${esc(n.definition)}</div>`;
+      html = `<b>${esc(n.label)}</b>${n.asked ? `<span class="tag">${esc(T.asked)}</span>` : ""}${def}<small>${esc(lec)}</small>`;
     } else {
       const e = this.edges.find((x) => x.id === this.hover.id);
-      html = `<b>${this.byId.get(e.s).label}</b> <span class="rel">${e.label}</span> <b>${this.byId.get(e.t).label}</b>` +
-        `<small>${T.lecture_fmt.replace("{n}", e.lecture)} p.${e.page}</small>`;
+      html = `<b>${esc(this.byId.get(e.s).label)}</b> <span class="rel">${esc(e.label)}</span> <b>${esc(this.byId.get(e.t).label)}</b>` +
+        `<small>${esc(T.lecture_fmt.replace("{n}", e.lecture))} p.${esc(e.page)}</small>`;
     }
     this.tooltip.innerHTML = html;
     this.tooltip.style.display = "block";

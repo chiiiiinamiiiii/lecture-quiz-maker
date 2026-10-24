@@ -42,6 +42,7 @@ TEXTS = {
     "all": {"ja": "全部", "en": "All"},
     "lecture_fmt": {"ja": "第{n}回", "en": "L{n}"},
     "count_fmt": {"ja": "{n} 個を選択中", "en": "{n} selected"},
+    "def_hidden": {"ja": "解答中は定義を隠しています", "en": "Definitions are hidden while you answer"},
 
     "rel_other": {"ja": "その他", "en": "Other"},   # 関係ラベル「その他」の表示
 
@@ -141,5 +142,5 @@ def map_texts() -> dict:
     """地図部品（JavaScript）に渡す文言。"""
     keys = ["tool_hand", "tool_lasso", "tool_rect", "zoom_in", "zoom_out", "fit", "clear", "layout_force",
             "layout_timeline", "density", "unasked", "asked", "selected", "hint", "by_lecture", "all",
-            "lecture_fmt", "count_fmt"]
+            "lecture_fmt", "count_fmt", "def_hidden"]
     return {k: TEXTS[k].get(lang()) or TEXTS[k]["ja"] for k in keys}

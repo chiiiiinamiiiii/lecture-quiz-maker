@@ -15,6 +15,11 @@ def _current_selection() -> tuple[list[str], set[str]]:
     return list(sel.get("ids", [])), set(sel.get("via_edge", []))
 
 
+def answering_quiz(state) -> bool:
+    """クイズが出ていて、まだ採点していない間（解答中）か。この間は地図に定義を出さない（#42）。"""
+    return bool(state.get("quiz")) and "graded" not in state
+
+
 def render_map_page() -> None:
     graph, vocab, asked = load_graph()
     concepts = {c["id"]: c for c in graph["concepts"]}
@@ -25,7 +30,8 @@ def render_map_page() -> None:
     left, right = st.columns([1.75, 1], gap="medium")
     with left:
         ids, _ = _current_selection()
-        sel = concept_map(graph, asked, ids, version, course_dir().name, height=MAP_HEIGHT)
+        sel = concept_map(graph, asked, ids, version, course_dir().name, height=MAP_HEIGHT,
+                          hide_definitions=answering_quiz(st.session_state))
         # ブラウザ側の選択を受け取る。古い版（コース切替・解除の前）の送信は捨てる
         # 右側はこの後に描くので、ここで受け取れば同じ実行の中で一覧に反映される
         if sel is not None and sel.get("version") == version:
