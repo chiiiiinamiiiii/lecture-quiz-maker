@@ -14,21 +14,26 @@ from ui.state import clear_course_state
 SECONDS_PER_LECTURE = 15     # 目安。概念と関係で 2 回呼び、呼び出しの間に待機が入る
 
 
-def _add_files(d: Path, uploaded) -> int:
-    """アップロードされた PDF を保存し、ファイル名から講義回を推測して一覧に足す。"""
+def _add_files(d: Path, uploaded) -> tuple[int, int]:
+    """アップロードされた PDF を保存し、一覧に足す。(新しく足した数, 既に一覧にあった数) を返す。
+
+    新しい名前はファイル名から講義回を推測する。既に一覧にある名前（save_upload が同じ中身と
+    判断して同じ名前を返したもの）は、利用者が決めた講義回と「使う」をそのまま残す（#6）。
+    """
     info = course_info(d)
     known = {f["name"]: f for f in info["files"]}
-    added = 0
+    added = kept = 0
     for up in uploaded:
         path = save_upload(d, up.name, up.getvalue())
+        if path.name in known:
+            kept += 1
+            continue
         n = lecture_number_of(path)
-        entry = {"name": path.name, "lecture": n, "use": n is not None}
-        if path.name not in known:
-            added += 1
-        known[path.name] = entry
+        known[path.name] = {"name": path.name, "lecture": n, "use": n is not None}
+        added += 1
     info["files"] = sorted(known.values(), key=lambda f: (f["lecture"] is None, f["lecture"] or 0, f["name"]))
     save_course_info(d, info)
-    return added
+    return added, kept
 
 
 def render_new_course() -> None:
@@ -43,7 +48,7 @@ def render_new_course() -> None:
         _add_files(d, files)
         clear_course_state()
         st.session_state["course_dir"] = str(d)
-        st.session_state["course_select"] = d.name
+        st.session_state["pending_course"] = d.name
         st.rerun()
 
 
@@ -61,10 +66,18 @@ def render_ingest_page(d: Path) -> None:
     more = st.file_uploader("資料を追加する（PDF、複数可）", type=["pdf"], accept_multiple_files=True,
                             key=f"more-{d.name}-{st.session_state.get('upload_epoch', 0)}")
     if more and st.button("追加する"):
-        n = _add_files(d, more)
+        added, kept = _add_files(d, more)
         st.session_state["upload_epoch"] = st.session_state.get("upload_epoch", 0) + 1
-        st.toast(f"{n} 件を追加しました")
+        msg = []
+        if added:
+            msg.append(f"{added} 件を追加しました")
+        if kept:
+            msg.append(f"{kept} 件は一覧にある同じファイルのため、講義回と「使う」はそのまま残しました")
+        st.session_state["ingest_notice"] = "。".join(msg)   # rerun の直前の toast は消えることがあるので次の回で出す
         st.rerun()
+    notice = st.session_state.pop("ingest_notice", None)
+    if notice:
+        st.toast(notice)
 
     files = course_info(d)["files"]
     if not files:
