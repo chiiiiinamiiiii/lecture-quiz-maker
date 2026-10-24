@@ -38,11 +38,14 @@ def rel_label(label: str) -> str:
 
 
 def concept_map(graph, asked: set[str], selected: list[str], sel_version: int, course_id: str,
-                height: int = 760) -> dict | None:
-    """地図を描き、ブラウザ側の選択 {"ids", "via_edge", "version", "n"} を返す（まだ無ければ None）。"""
+                height: int = 760, hide_definitions: bool = False) -> dict | None:
+    """地図を描き、ブラウザ側の選択 {"ids", "via_edge", "version", "n"} を返す（まだ無ければ None）。
+
+    hide_definitions: 解答中は True。定義をブラウザに送らず、説明にも出さない（#42。定義問題の答えになる）。
+    """
     weights = compute_weights(graph)
     nodes = [{
-        "id": c["id"], "label": c["label"], "definition": c["definition"],
+        "id": c["id"], "label": c["label"], "definition": "" if hide_definitions else c["definition"],
         "lectures": sorted(c["lectures"]), "asked": c["id"] in asked, "weight": round(weights[c["id"]], 4),
     } for c in graph["concepts"]]
     edges = [{
@@ -59,6 +62,7 @@ def concept_map(graph, asked: set[str], selected: list[str], sel_version: int, c
         "sel_version": sel_version,
         "layout": "force",
         "texts": map_texts(),
+        "hide_definitions": hide_definitions,
     }
     result = _component(key=f"map-{course_id}", data=data, default={"selection": None},
                         on_selection_change=lambda: None, height=height)
