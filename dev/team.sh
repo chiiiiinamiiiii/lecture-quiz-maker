@@ -32,6 +32,10 @@ setup() {
 start() {
   local r="$1"; shift || true
   cd "$TEAM_DIR/$r"
+  # 指揮のセッションから Terminal を起動すると、その環境変数（セッション ID・メッセージ用の接続情報など）が
+  # 引き継がれ、各役割が「指揮の子セッション」扱いになる。独立したセッションにするため消してから起動する
+  local v
+  for v in $(env | cut -d= -f1 | grep -E '^(CLAUDE|CLAUDECODE|MCP_CONNECTION)'); do unset "$v"; done
   local args=(--agent "$r" --name "$r" --permission-mode auto)
   [ "$r" = "ui-reviewer" ] && args+=(--chrome)
   exec claude "${args[@]}" "$@"
