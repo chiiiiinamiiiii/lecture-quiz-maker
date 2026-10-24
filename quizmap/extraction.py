@@ -198,11 +198,10 @@ def extract_relations(client, model: str, course: str, vocab: dict, lectures: li
             ),
         )
 
-    relations: list[dict] = []
-    seen: set[tuple] = set()
+    candidates: list[dict] = []
     dropped = collections.Counter()
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        for lec, data in ex.map(one, lectures):
+        for lec, data in ex.map(one, lectures):        # ex.map は回の順を保つ
             kept = 0
             for r in data["relations"]:
                 f, t, label = r["from"].strip(), r["to"].strip(), r["label"].strip()
@@ -215,17 +214,67 @@ def extract_relations(client, model: str, course: str, vocab: dict, lectures: li
                 if label not in labels:
                     dropped["vocab にないラベル→その他"] += 1
                     label = OTHER_LABEL
-                key = (f, t, label)
-                if key in seen:
-                    dropped["重複"] += 1
-                    continue
-                seen.add(key)
                 page = r["page"] if 1 <= r["page"] <= lec.page_count else 1
-                relations.append({"from": f, "to": t, "label": label,
-                                  "source": {"lecture": lec.number, "page": page}})
+                candidates.append({"from": f, "to": t, "label": label,
+                                   "source": {"lecture": lec.number, "page": page}})
                 kept += 1
-            log(f"関係 第{lec.number}回: {len(data['relations'])} 件 → 採用 {kept}")
+            log(f"関係 第{lec.number}回: {len(data['relations'])} 件 → 候補 {kept}")
+    relations, merged = resolve_pair_conflicts(candidates)
+    dropped.update(merged)
+    log("同じ概念対の整理: " + (", ".join(f"{k} {v}" for k, v in merged.items()) or "なし")
+        + f" → 関係 {len(relations)}")
     return relations, dict(dropped)
+
+
+def resolve_pair_conflicts(candidates: list[dict]) -> tuple[list[dict], collections.Counter]:
+    """1 つの概念対（向きを問わない）に、1 つのラベルと 1 つの向きだけを残す（Issue #12）。
+
+    回ごとに独立に抽出するため、同じ対に別のラベルや逆向きの関係が付くことがある。
+    LLM は呼ばず、資料中で何度その関係が書かれたか（支持数）で決める。
+    1. 同じ対に「その他」以外のラベルがあれば、「その他」を落とす
+    2. ラベルが 2 つ以上残れば、支持数（両向きの合計）の多いラベルを残す
+    3. そのラベルが両向きにあれば、支持数の多い向きを残す
+       （対立のように向きの無いラベルでも、両向きは同じ関係の重複なので 1 本にしてよい）
+    同点は先に出たもの（若い回）を残す。残した関係の source は、その (from, to, label) が最初に出た箇所。
+    candidates は出現順に並んでいること。完全に同じ (from, to, label) も支持数として数える。
+    """
+    dropped = collections.Counter()
+    first: dict[tuple, dict] = {}                     # (from, to, label) -> 最初に出た関係
+    support = collections.Counter()                   # (from, to, label) -> 出た回数
+    order: dict[tuple, int] = {}                      # (from, to, label) -> 最初に出た位置
+    for i, r in enumerate(candidates):
+        key = (r["from"], r["to"], r["label"])
+        support[key] += 1
+        if key not in first:
+            first[key], order[key] = r, i
+        else:
+            dropped["重複"] += 1
+
+    by_pair: dict[frozenset, list[tuple]] = collections.defaultdict(list)
+    for key in first:
+        by_pair[frozenset(key[:2])].append(key)
+
+    kept: list[tuple] = []
+    for keys in by_pair.values():
+        if len(keys) > 1:
+            named = [k for k in keys if k[2] != OTHER_LABEL]
+            if named and len(named) < len(keys):
+                dropped["同じ対の「その他」"] += len(keys) - len(named)
+                keys = named
+        if len(keys) > 1:
+            label_support = collections.Counter()
+            label_order: dict[str, int] = {}
+            for k in keys:
+                label_support[k[2]] += support[k]
+                label_order[k[2]] = min(label_order.get(k[2], order[k]), order[k])
+            best_label = min(label_support, key=lambda l: (-label_support[l], label_order[l]))
+            best = min((k for k in keys if k[2] == best_label), key=lambda k: (-support[k], order[k]))
+            dropped["同じ対の食い違い"] += len(keys) - 1
+            keys = [best]
+        kept.append(keys[0])
+
+    kept.sort(key=order.__getitem__)
+    return [dict(first[k]) for k in kept], dropped
 
 
 # ------------------------------------------------------------------ 画像
