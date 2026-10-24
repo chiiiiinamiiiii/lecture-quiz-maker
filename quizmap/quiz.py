@@ -75,8 +75,9 @@ VERIFY_SCHEMA = {
                                 "choice": {"type": "integer"},
                                 "reason": {"type": "string"},
                                 "replaced": {"type": "boolean"},
+                                "is_wrong": {"type": "boolean"},
                             },
-                            "required": ["choice", "reason", "replaced"],
+                            "required": ["choice", "reason", "replaced", "is_wrong"],
                             "additionalProperties": False,
                         },
                     },
@@ -226,6 +227,8 @@ aspect=example の問題が、資料の具体例ではなく定義の言い換�
 問題文が「〜を問う。」で終わっている、または正答に当たる関係ラベルの名前を含んでいれば、問題文を学習者向けの疑問文に直してください。
 answer と distractor_reasons の choice は 0 始まりの添字（0〜3）です。choices の順番は変えないでください。
 answer_text は choices[answer] と同じ文字列にしてください。
+distractor_reasons の is_wrong は、最終的に choices に残したその誤答が、資料に照らして誤りだと言えるなら true、
+言えない（実は正答にもなる、資料から判断できない）なら false にしてください。
 
 ## クイズ
 {json.dumps({"questions": questions}, ensure_ascii=False, indent=1)}
@@ -357,19 +360,44 @@ def check_relation_direction(q: dict, inner: list[dict], concepts: dict[str, dic
 
 # ------------------------------------------------------------------ 誤答の差し替え（#34）
 
-def check_replaced(q: dict, before: dict | None) -> list[str]:
-    """replaced=true の誤答が、自己確認前と同じ文字列のままなら警告する（差し替えたと記録しただけ）。"""
+# 自己確認の reason が「この誤答も当てはまる」と認めている言い方（is_wrong の無い古い出力のための予備）
+_ADMITS_CORRECT = ("該当する", "正しい", "差し替える", "also correct", "also applies", "should be replaced")
+
+
+def _admits_correct(d: dict) -> bool:
+    """自己確認がその誤答を「誤りとは言えない」と判断したか。is_wrong があればそれを使い、無ければ reason の言い方で見る。"""
+    if "is_wrong" in d:
+        return d["is_wrong"] is False
+    reason = d.get("reason", "").lower()
+    return any(k.lower() in reason for k in _ADMITS_CORRECT)
+
+
+def settle_replaced(q: dict, before: dict | None) -> tuple[dict | None, list[str]]:
+    """replaced=true なのに自己確認前と同じ文字列のままの誤答を片付ける（#34）。LLM は呼ばない。
+
+    - 自己確認がその誤答を誤りとは言えないと認めている → 正答が 2 つある問題なので外す（None）
+    - そうでない（reason が誤りの理由になっている）→ replaced を false に直すだけ
+    戻り値: (使う問題 または None, 警告)
+    """
     if q.get("type") != "mcq" or before is None:
-        return []
+        return q, []
     qid = q.get("id", "?")
     old, new = before.get("choices", []), q.get("choices", [])
-    warnings = []
+    warnings: list[str] = []
+    reasons = []
     for d in q.get("distractor_reasons", []):
         c = d.get("choice")
         if d.get("replaced") and isinstance(c, int) and 0 <= c < len(new) and c < len(old) \
                 and _norm(old[c]) == _norm(new[c]):
-            warnings.append(f"{qid}: 誤答 {c}「{new[c]}」は差し替えたと記録されたが、文字列が変わっていない")
-    return warnings
+            if _admits_correct(d):
+                warnings.append(f"{qid}: 誤答 {c}「{new[c]}」は自己確認で誤りと言えないとされたのに差し替わっていないので、この問題を外した")
+                return None, warnings
+            warnings.append(f"{qid}: 誤答 {c}「{new[c]}」は差し替えたと記録されたが文字列が同じで、理由は誤りの説明なので replaced を false に直した")
+            d = {**d, "replaced": False}
+        reasons.append(d)
+    if warnings:
+        q = {**q, "distractor_reasons": reasons}
+    return q, warnings
 
 
 # ------------------------------------------------------------------ 問題文（#33）
@@ -473,7 +501,8 @@ def generate_quiz(client, model: str, graph: dict, vocab: dict, pages: list[dict
         q2, w = fix_answer_index(q, before)
         answer_warnings += w
         if q2 is not None and q2 is not before:
-            answer_warnings += check_replaced(q2, before)
+            q2, w = settle_replaced(q2, before)
+            answer_warnings += w
         if q2 is not None:
             fixed.append(q2)
     final = fixed
