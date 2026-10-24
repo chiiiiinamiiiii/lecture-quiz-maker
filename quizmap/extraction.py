@@ -20,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from quizmap.common import OTHER_LABEL, Lecture, call_json, lecture_as_prompt_text, normalize_text, write_json
+from quizmap.vocab import kind_examples
 
 # ------------------------------------------------------------------ 概念抽出
 
@@ -86,6 +87,8 @@ RELATION_USER = """授業「{course}」の第{lecture}回の資料です（ペ�
 - 資料に明示的に書かれている関係だけを挙げる。一般知識から補わない
 - from と to は上の id から選ぶ。同じ id を両端にしない
 - label はラベルの定義に従って選ぶ。無理に当てはめず、合わなければ「{other}」にする
+- from と to はラベルの定義が決める向きに従う。逆向きの関係ならば from と to を入れ替える
+- A が B の定義そのもの、または A と B が同じものの言い換えである場合、それに合うラベルが無ければ「{other}」にする。ほかのラベルに押し込まない
 - page はその関係が書かれているこの回のページ番号
 - evidence には、その関係が書かれている箇所を page のページ本文からそのまま 40 字以内で抜き出す。抜き出せない関係は出さない
 - 同じページに二つの概念が出てくるだけでは関係にしない。二つの概念を結びつける記述があるときだけ挙げる
@@ -128,7 +131,9 @@ def clean_id(raw: str, fallback: str) -> str:
 
 def extract_concepts(client, model: str, course: str, vocab: dict, lectures: list[Lecture], log=print):
     """回ごとに順番に呼ぶ。既出の概念一覧を渡して label/id を揃えさせる。"""
-    kinds_text = "\n".join(f"- {k['name']}: {k['definition']}（例: {k['example']}）" for k in vocab["kinds"])
+    kinds_text = "\n".join(
+        f"- {k['name']}: {k['definition']}（例: {'、'.join(kind_examples(k))}）" for k in vocab["kinds"]
+    )
     kind_names = {k["name"] for k in vocab["kinds"]}
     concepts: dict[str, dict] = {}          # id -> concept
     by_label: dict[str, str] = {}           # label -> id
@@ -217,12 +222,20 @@ def evidence_rank(evidence: str, end_labels: list[str], page_text: str) -> tuple
     return sum(h in evidence for h in heads), sum(h in page for h in heads)
 
 
+def _direction_text(rel: dict) -> str:
+    """関係ラベルの向き（from 側・to 側の種類）。旧形式の vocab.json には無いので空にする。"""
+    f, t = rel.get("from_kinds") or [], rel.get("to_kinds") or []
+    if not f and not t:
+        return ""
+    return f"【向き: from は {'・'.join(f) or '指定なし'}、to は {'・'.join(t) or '指定なし'}】"
+
+
 def extract_relations(client, model: str, course: str, vocab: dict, lectures: list[Lecture],
                       concepts: dict[str, dict], workers: int, log=print) -> tuple[list[dict], dict]:
     """概念 id を固定して、回ごとに関係を出させる（回は独立なので並列）。"""
     labels = {r["label"] for r in vocab["relations"]} | {OTHER_LABEL}
     rel_text = "\n".join(
-        f"- {r['label']}: {r['definition']}（例: {r['example']}）"
+        f"- {r['label']}: {r['definition']}{_direction_text(r)}（例: {r['example']}）"
         for r in vocab["relations"] if r["label"] != OTHER_LABEL
     )
     concept_text = "\n".join(f"- {c['id']}: {c['label']}" for c in concepts.values())
