@@ -65,7 +65,9 @@ USER_TEMPLATE = """以下は「{course_hint}」という授業の資料です（
  (b) 定義（どういうときにこのラベルを付けるか。from が何で to が何かを必ず書くこと。例: from が手段、to が目的）
  (c) その関係をクイズにするときの問い方（例: 「AとBの違いを問う」「誰がAを提唱したかを問う」）
  (d) 資料中の実例（「A → B」のように概念名で。from → to の順）
- (e) from 側・to 側になる概念の種類（下で提案する種類の名前で。複数可）
+ (e) from 側・to 側になる概念の種類（下で提案する種類の名前で。複数可）。
+     from 側・to 側の種類は、そのラベルの実例として資料に出てくる関係の両端の種類をすべて含めること。
+     人物・思想家を主語とするラベル（例えば 提唱・批判）の相手には、概念・立場・学説の種類をすべて含めること
 を書いてください。
 
 守ること:
@@ -81,6 +83,7 @@ USER_TEMPLATE = """以下は「{course_hint}」という授業の資料です（
 - 各種類について、その種類に属する概念が、資料が出典・参考・引用元として挙げた文献・作品（本・論文・報告書・記事・作品など）であれば cited_work を true、そうでなければ false にする。
   文献・作品と、授業の内容の概念・人物を同じ種類に混ぜない
 - cited_work を true にした種類の definition には、「出典・参考として名前が挙がるだけの本。授業で内容が論じられる作品や、本の題名と同じ名前の学説・考え方は含めない」という範囲を書く
+- 各種類について、その種類に属する概念が人物（人名）であれば person を true、そうでなければ false にする
 - 種類の名前を、その種類に属する概念の名前と同じにしない（例: 「X」という概念を入れるための「X」という種類は作らない）
 - 各種類について、異なる単元（異なる人物・話題）から実例を 3 つ以上挙げられること。挙げられないものは種類ではなく概念として扱う
 
@@ -103,8 +106,9 @@ SCHEMA = {
                     "definition": {"type": "string"},
                     "examples": {"type": "array", "items": {"type": "string"}},
                     "cited_work": {"type": "boolean"},
+                    "person": {"type": "boolean"},
                 },
-                "required": ["name", "definition", "examples", "cited_work"],
+                "required": ["name", "definition", "examples", "cited_work", "person"],
                 "additionalProperties": False,
             },
         },
@@ -194,6 +198,28 @@ def find_kind_warnings(vocab: dict) -> list[str]:
             warnings.append(f"種類「{k['name']}」の実例に、同じ名前の概念がある")
         if len(ex) < 3:
             warnings.append(f"種類「{k['name']}」の実例が {len(ex)} 個（指示は 3 個以上）")
+    warnings += find_narrow_person_targets(vocab)
+    return warnings
+
+
+def find_narrow_person_targets(vocab: dict) -> list[str]:
+    """人物の種類が from にあるラベルで、to の人物以外の種類が 1 つ以下のもの（#74）。警告だけ。
+
+    人物を主語とするラベルの相手が 1 つの種類に限られると、意味の上では合う関係まで、
+    抽出の端の種類の照合（check_end_kinds）で「その他」になる。人物かどうかは種類の person の旗で見る
+    （種類の名前では決めない。person の無い古い vocab.json では何も出さない）。
+    """
+    persons = {k["name"] for k in vocab["kinds"] if k.get("person") is True}
+    if not persons:
+        return []
+    warnings = []
+    for r in vocab["relations"]:
+        if r["label"] == OTHER_LABEL or not persons & set(r.get("from_kinds") or []):
+            continue
+        others = [k for k in (r.get("to_kinds") or []) if k not in persons]
+        if len(others) <= 1:
+            warnings.append(f"関係「{r['label']}」は人物の種類が from にあるのに、to の人物以外の種類が "
+                            f"{len(others)} 個（{'・'.join(others) or 'なし'}）だけ")
     return warnings
 
 
