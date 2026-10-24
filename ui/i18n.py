@@ -36,13 +36,14 @@ TEXTS = {
     "unasked": {"ja": "未出題", "en": "Not asked"},
     "asked": {"ja": "出題済み", "en": "Asked"},
     "selected": {"ja": "選択中", "en": "Selected"},
-    "rel_other": {"ja": "その他", "en": "Other"},
     "hint": {"ja": "2本指でズーム ・ スペース＋ドラッグで移動 ・ Shift 追加 ・ ⌘ 除外",
              "en": "Two fingers to zoom · Space + drag to pan · Shift add · ⌘ subtract"},
     "by_lecture": {"ja": "講義回で選ぶ", "en": "By lecture"},
     "all": {"ja": "全部", "en": "All"},
     "lecture_fmt": {"ja": "第{n}回", "en": "L{n}"},
     "count_fmt": {"ja": "{n} 個を選択中", "en": "{n} selected"},
+
+    "rel_other": {"ja": "その他", "en": "Other"},   # 関係ラベル「その他」の表示
 
     # 右側: 選択
     "sel_title": {"ja": "選択した範囲", "en": "Selection"},
