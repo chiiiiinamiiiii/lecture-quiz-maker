@@ -37,6 +37,8 @@ CONCEPT_USER = """授業「{course}」の第{lecture}回の資料です（ペー
 {known_block}
 守ること:
 - 出てくる概念はすべて挙げる。1 度しか出てこない概念も挙げる。数の上限はない
+- スライドに出典・参考文献・引用元として書かれているだけの書名・報告書名・論文名は、概念として挙げない。
+  その本の内容として説明されている概念や、著者の人物を挙げる
 - 一方で、資料に書かれていない概念を足さない
 - label は資料中の表記に合わせた短い{language}（人名は姓名、立場は正式名称）
 - id は label をローマ字にした snake_case の ASCII（例: kant, gimu_ron）。既出の概念は既出の id と label をそのまま使う
@@ -395,6 +397,19 @@ def resolve_pair_conflicts(candidates: list[dict]) -> tuple[list[dict], collecti
     return [{k2: v for k2, v in first[k].items() if k2 != "_rank"} for k in kept], dropped
 
 
+def remove_cited_works(concepts: dict[str, dict], vocab: dict) -> tuple[dict[str, dict], list[str]]:
+    """cited_work が true の種類（資料が出典・参考として挙げた文献・作品）の概念を落とす（#50）。
+
+    種類の名前ではなく vocab の旗で決めるので、分野に依らない。関係の抽出の前に落とすので、
+    その概念を端にする関係は作られない（関係ごと落ちる）。cited_work の無い古い vocab.json では何も落とさない。
+    戻り値: (残った概念, 落とした種類の名前)
+    """
+    cited = {k["name"] for k in vocab["kinds"] if k.get("cited_work") is True}
+    if not cited:
+        return concepts, []
+    return {cid: c for cid, c in concepts.items() if c["kind"] not in cited}, sorted(cited)
+
+
 # ------------------------------------------------------------------ 画像
 
 def render_slides(lectures: list[Lecture], slides_dir: Path, dpi: int) -> int:
@@ -427,6 +442,11 @@ def run_extraction(client, model: str, vocab: dict, lectures: list[Lecture], out
 
     step("concepts")
     concepts, unmatched_kind = extract_concepts(client, model, course, vocab, lectures, log=log)
+    n_before = len(concepts)
+    concepts, cited_kinds = remove_cited_works(concepts, vocab)
+    n_cited = n_before - len(concepts)
+    if cited_kinds:
+        log(f"出典・参考の文献・作品の種類（{'・'.join(cited_kinds)}）の概念 {n_cited} 件を落とした（関係の抽出の前）")
     step("relations")
     relations, dropped, adjusted = extract_relations(client, model, course, vocab, lectures, concepts, workers, log=log,
                                                      end_kind_mismatch=end_kind_mismatch)
@@ -451,6 +471,8 @@ def run_extraction(client, model: str, vocab: dict, lectures: list[Lecture], out
         "other_kind_count": n_other_kind,
         "other_kind_rate": round(other_kind_rate, 4),
         "unmatched_kind_count": len(unmatched_kind),
+        "removed_cited_work_concepts": n_cited,
+        "cited_work_kinds": cited_kinds,
         "unmatched_kind_examples": unmatched_kind[:20],
         "relations_by_label": dict(label_counts.most_common()),
         "concepts_by_kind": dict(kind_counts.most_common()),
