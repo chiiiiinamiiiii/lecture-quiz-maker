@@ -196,15 +196,28 @@ def test_full_flow_from_upload_to_asked_on_map(fresh_page, fresh_data_dir):
         assert set(q["concepts"]) <= selected, f"確定した範囲の外の概念が出題された: {q['concepts']}"
 
     # 4 択は 1 つ目の選択肢を選び、記述は何か書く → 採点
-    for i, q in enumerate(questions, start=1):
-        box = main.locator("[data-testid='stVerticalBlockBorderWrapper']").filter(has_text=f"問 {i}").last
+    # 問題は上から順に並ぶ。4 択は k 番目の radiogroup、記述は k 番目の文字入力欄（枠の要素には testid が無いので、種類ごとの順番で探す）
+    groups = main.get_by_role("radiogroup")
+    texts = main.locator("[data-testid='stTextInput'] input")
+    n_mcq = sum(q["type"] == "mcq" for q in questions)
+    expect(groups).to_have_count(n_mcq, timeout=10000)
+    expect(texts).to_have_count(len(questions) - n_mcq, timeout=10000)
+    k_mcq = k_short = 0
+    for q in questions:
         if q["type"] == "mcq":
             assert len(q["choices"]) == 4
-            box.locator("[data-testid='stRadio'] label").first.click()
+            group = groups.nth(k_mcq)
+            expect(group.get_by_role("radio")).to_have_count(4)
+            group.locator("label").first.click()
+            pg.wait_for_timeout(800)
+            assert group.get_by_role("radio").first.is_checked()
+            k_mcq += 1
         else:
-            box.locator("input[type='text']").fill("わからない")
-            box.locator("input[type='text']").press("Enter")
-        pg.wait_for_timeout(800)
+            box = texts.nth(k_short)
+            box.fill("わからない")
+            box.press("Enter")
+            pg.wait_for_timeout(800)
+            k_short += 1
     main.get_by_role("button", name="採点する").click()
 
     # 結果と解説が出る
