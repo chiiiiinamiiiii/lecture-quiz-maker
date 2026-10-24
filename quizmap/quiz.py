@@ -9,6 +9,7 @@ from __future__ import annotations
 import datetime as dt
 import random
 import time
+import unicodedata
 from collections import Counter
 
 from quizmap.common import OTHER_LABEL, call_json
@@ -24,7 +25,7 @@ QUESTION_PROPS = {
     "answer": {"type": "integer"},
     "answer_text": {"type": "string"},
     "explanation": {"type": "string"},
-    "concepts": {"type": "array", "items": {"type": "string"}},
+    "concept_labels": {"type": "array", "items": {"type": "string"}},
     "sources": {
         "type": "array",
         "items": {
@@ -36,7 +37,7 @@ QUESTION_PROPS = {
     },
 }
 QUESTION_REQUIRED = ["id", "type", "aspect", "prompt", "choices", "answer", "answer_text",
-                     "explanation", "concepts", "sources"]
+                     "explanation", "concept_labels", "sources"]
 
 GEN_SCHEMA = {
     "type": "object",
@@ -145,10 +146,10 @@ def build_materials(graph: dict, vocab: dict, pages: list[dict], concept_ids: li
 
 
 def materials_text(concepts, selected, inner, neighbors, needed, page_text, styles) -> str:
-    parts = ["## 出題範囲の概念（問題の根拠にしてよいのはこれだけ。concepts にはこの id だけを書く）"]
+    parts = ["## 出題範囲の概念（問題の根拠にしてよいのはこれだけ。concept_labels にはここの「」内の表記をそのまま書く）"]
     for c in selected:
         src = "、".join(f"第{s['lecture']}回p.{s['page']}" for s in c["sources"])
-        parts.append(f"- {c['id']}: {c['label']}（{c['kind']}）: {c['definition']} [{src}]")
+        parts.append(f"- 「{c['label']}」（{c['kind']}）: {c['definition']} [{src}]")
     parts.append("\n## 出題範囲の概念どうしの関係（関係を問う問題はここから作る）")
     if inner:
         for r in inner:
@@ -159,7 +160,7 @@ def materials_text(concepts, selected, inner, neighbors, needed, page_text, styl
     parts.append("\n## 関係ラベルごとの問い方（この授業の語彙。関係を問う問題は必ずこれに沿う）")
     for v in styles:
         parts.append(f"- {v['label']}: 定義「{v['definition']}」／問い方「{v['question_style']}」／例: {v['example']}")
-    parts.append("\n## 誤答に使ってよい隣接概念（地図上で隣り合う概念。紛らわしい誤答にする。concepts には書かない）")
+    parts.append("\n## 誤答に使ってよい隣接概念（地図上で隣り合う概念。紛らわしい誤答にする。concept_labels には書かない）")
     for cid, ns in neighbors.items():
         if ns:
             parts.append(f"- {concepts[cid]['label']} の隣: " + "、".join(concepts[n]["label"] for n in sorted(ns)))
@@ -182,7 +183,8 @@ def gen_user(materials: str, n: int, counts: dict[str, int], n_short: int) -> st
 - 定義を問う問題は、資料の記述に基づく定義を問う
 - 誤答には「誤答に使ってよい隣接概念」や出題範囲内の別の概念を使い、紛らわしくする
 - 問題文・選択肢・解説は資料に書かれていることだけを根拠にする
-- concepts には根拠となる概念の id（出題範囲の概念の id のみ）を 1 つ以上書く
+- concept_labels には、問題の根拠となる概念を「出題範囲の概念」の表記そのままで 1 つ以上書く。
+  問題文・正答に出てくる概念を書き、名前の似た別の概念（例: 「X」と「X性」）と取り違えない。誤答にだけ使った概念は書かない
 - sources には根拠となるページ（lecture, page）を 1 つ以上書く。資料本文の見出し [第N回 p.M] から取る
 - explanation には正答の理由を 1〜3 文で書く
 - id は q_01, q_02, … とする
@@ -205,6 +207,66 @@ def verify_user(questions: list[dict], materials: str) -> str:
 
 {materials}
 """
+
+
+# ------------------------------------------------------------------ 概念の対応づけ（#20）
+
+def _norm(text: str) -> str:
+    return unicodedata.normalize("NFKC", text).replace(" ", "").replace("\u3000", "")
+
+
+def mentioned_labels(text: str, labels: list[str]) -> set[str]:
+    """text に出てくる label。長い label の中に含まれるだけの短い label は数えない（「尊厳性」の中の「尊厳」）。"""
+    t = _norm(text)
+    spans = []
+    for label in labels:
+        key = _norm(label)
+        if not key:
+            continue
+        start = t.find(key)
+        while start != -1:
+            spans.append((start, start + len(key), label))
+            start = t.find(key, start + 1)
+    found = set()
+    for a, b, label in spans:
+        inside_longer = any(a2 <= a and b <= b2 and (b2 - a2) > (b - a) for a2, b2, _ in spans)
+        if not inside_longer:
+            found.add(label)
+    return found
+
+
+def resolve_concepts(q: dict, selected: list[dict]) -> tuple[list[str], list[str]]:
+    """LLM が書いた concept_labels を概念 id にする。戻り値: (id のリスト, 警告)。
+
+    id は label のローマ字化と衝突回避の「_」だけで区別されることがあり、LLM が取り違えやすい（#20）。
+    そこで LLM には label を書かせ、id への対応はここで行う。さらに、書かれた label が
+    問題文・正答・解説に出てこず、名前の似た別の概念（一方が他方を含む）が出てくるなら、それに差し替える。
+    """
+    qid = q.get("id", "?")
+    by_label = {_norm(c["label"]): c for c in selected}
+    labels = [c["label"] for c in selected]
+    text = " ".join([q.get("prompt", ""), q.get("answer_text", ""), q.get("explanation", "")])
+    mentioned = mentioned_labels(text, labels)
+    warnings: list[str] = []
+    chosen: list[dict] = []
+    for raw in q.get("concept_labels", []):
+        c = by_label.get(_norm(raw))
+        if c is None:
+            warnings.append(f"{qid}: 出題範囲に無い概念「{raw}」を concept_labels に書いた（外した）")
+            continue
+        if c["label"] not in mentioned:
+            similar = [m for m in mentioned
+                       if m != c["label"] and (_norm(m) in _norm(c["label"]) or _norm(c["label"]) in _norm(m))
+                       and all(x["label"] != m for x in chosen)]
+            if len(similar) == 1:
+                warnings.append(f"{qid}: 「{c['label']}」は問題に出てこないので「{similar[0]}」に差し替えた")
+                c = by_label[_norm(similar[0])]
+        if all(x["id"] != c["id"] for x in chosen):
+            chosen.append(c)
+    if not chosen and mentioned:
+        chosen = [by_label[_norm(m)] for m in sorted(mentioned)]
+        warnings.append(f"{qid}: concept_labels が使えないので、問題に出てくる概念を記録した")
+    return [c["id"] for c in chosen], warnings
 
 
 # ------------------------------------------------------------------ 検証
@@ -266,10 +328,16 @@ def generate_quiz(client, model: str, graph: dict, vocab: dict, pages: list[dict
     verified = ver["questions"]
     by_id = {q["id"]: q for q in verified}
     final = [by_id.get(q["id"], q) for q in questions]      # 返ってこなかった問題は生成時のまま
+
+    # concept_labels を概念 id にする。UI・採点・results.json は従来どおり concepts（id）を使う
+    resolve_warnings: list[str] = []
+    for q in final:
+        q["concepts"], w = resolve_concepts(q, selected)
+        resolve_warnings += w
     n_replaced = sum(1 for q in final for d in q.get("distractor_reasons", []) if d.get("replaced"))
 
     # (3) 自動検証
-    warnings = validate(final, confirmed_ids, pages)
+    warnings = resolve_warnings + validate(final, confirmed_ids, pages)
     meta = {
         "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
         "model": model,
