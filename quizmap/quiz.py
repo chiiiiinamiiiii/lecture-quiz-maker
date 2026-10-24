@@ -184,7 +184,9 @@ def gen_user(materials: str, n: int, counts: dict[str, int], n_short: int) -> st
 - 1 つの問題で問うラベルは 1 つだけ
 - 関係を問う問題では、材料の関係の from と to を入れ替えない。出題の方針の A・B がどちらに当たるかは、関係の行の括弧の説明で決める
 - relation_used には、関係を問う問題で根拠にした関係の行の from・to・label を、概念の表記そのままで書く。関係を問う問題でなければ 3 つとも空文字列にする
-- 具体例を問う問題は、資料に出てくる具体例と概念の対応を問う
+- 具体例を問う問題は、資料が概念の例として挙げている事例・比喩・身近な例（例: 第◯回で概念 X の例として挙げられている事柄）と概念の対応を問う。概念の定義文を言い換えて語を当てさせる問題は、具体例ではなく定義の問題として数える
+- 資料に具体例が見つからない概念で、具体例の問題を作らない。具体例の枠が埋まらなければ、その分を定義の問題にして、aspect を definition にする
+- 「出題範囲の概念どうしの関係」に、ある概念を別の概念の具体例として結ぶラベル（ラベルの意味で判断する）の関係があれば、具体例の問題はその対を優先して使う
 - 定義を問う問題は、資料の記述に基づく定義を問う
 - 誤答には「誤答に使ってよい隣接概念」や出題範囲内の別の概念を使い、紛らわしくする
 - 問題文・選択肢・解説は資料に書かれていることだけを根拠にする
@@ -210,7 +212,8 @@ def verify_user(questions: list[dict], materials: str) -> str:
 関係を問う問題（aspect=relation）は、正答が材料の「出題範囲の概念どうしの関係」のどの行に当たるかを確かめ、向きが逆なら問題文か正答を直してください。
 どの行にも当たらなければ、問題を資料の記述に合わせて直してください。relation_used はその行の from・to・label にしてください。
 記述式の問題は distractor_reasons を空配列にして、そのまま返してください。
-問題の数・id・aspect・type は変えないでください。
+問題の数・id・type は変えないでください。aspect は次の場合だけ直してよい。
+aspect=example の問題が、資料の具体例ではなく定義の言い換えを問うていれば、aspect を definition に直してください。
 問題文が「〜を問う。」で終わっている、または正答に当たる関係ラベルの名前を含んでいれば、問題文を学習者向けの疑問文に直してください。
 answer と distractor_reasons の choice は 0 始まりの添字（0〜3）です。choices の順番は変えないでください。
 answer_text は choices[answer] と同じ文字列にしてください。
@@ -445,6 +448,15 @@ def generate_quiz(client, model: str, graph: dict, vocab: dict, pages: list[dict
     by_id = {q["id"]: q for q in verified}
     final = [by_id.get(q["id"], q) for q in questions]      # 返ってこなかった問題は生成時のまま
 
+    # 自己確認で aspect が変わった問題を数える（#35）。直してよいのは example → definition だけ
+    aspect_changes: list[str] = []
+    for q, before in zip(final, questions):
+        if q.get("aspect") != before.get("aspect"):
+            aspect_changes.append(f"{q.get('id', '?')}: {before.get('aspect')} → {q.get('aspect')}")
+            if (before.get("aspect"), q.get("aspect")) != ("example", "definition"):
+                q["aspect"] = before.get("aspect")
+                aspect_changes[-1] += "（認めていない変更なので元に戻した）"
+
     # 正答の添字を answer_text に合わせる（#31）。合わせられない問題は外す
     answer_warnings: list[str] = []
     fixed = []
@@ -467,7 +479,7 @@ def generate_quiz(client, model: str, graph: dict, vocab: dict, pages: list[dict
     # (3) 自動検証
     direction_warnings = [w for q in final for w in check_relation_direction(q, inner, concepts)]
     style_warnings = [w for q in final for w in check_prompt_style(q, styles)]
-    warnings = (answer_warnings + resolve_warnings + direction_warnings + style_warnings
+    warnings = (["aspect を自己確認で直した: " + c for c in aspect_changes] + answer_warnings + resolve_warnings + direction_warnings + style_warnings
                 + validate(final, confirmed_ids, pages))
     # 補正の後でも正答の添字が answer_text と合わない 4 択は出さない（正しく答えても不正解になるため）
     final = [q for q in final if q.get("type") != "mcq" or _answer_matches(q)]
@@ -478,6 +490,7 @@ def generate_quiz(client, model: str, graph: dict, vocab: dict, pages: list[dict
         "n_generated": len(final),
         "aspect_plan": counts,
         "aspect_actual": dict(Counter(q["aspect"] for q in final)),
+        "aspect_changed_in_verify": len(aspect_changes),
         "type_actual": dict(Counter(q["type"] for q in final)),
         "concepts": confirmed_ids,
         "inner_relations": len(inner),
