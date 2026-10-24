@@ -85,7 +85,77 @@ Only the map drawing and the selection are plain code.
 
 ## Evaluation
 
-EVALUATION_PLACEHOLDER
+<!-- EVAL:BEGIN（data/team/output-reviewer/summary-for-readme.md から差し込み） -->
+All numbers are counts with denominators. Model: `gemini-3.1-flash-lite`. "Before" = prompts at commit `fb02246` (vocab/graph generated 2026-10-19). The evaluation protocol is in `eval-protocol.md` (fixed random seed 20261024, so the samples are reproducible). "After" for vocabulary and extraction = the fixes for #8–#12 (regenerated 2026-10-24) plus the kind check of #49. The kind check was applied afterwards to the regenerated graph, so the numbers may change slightly when everything is regenerated with the final code. The After sample is a new random 30 from the regenerated graph. Each version was extracted only once; run-to-run variation was not measured.
+
+#### 1. Vocabulary quality (§12-1, §12-2)
+
+| | Ethics before (17 lectures, 185 pages) | NLP before (4 lectures, 136 pages, English slides) | Ethics after |
+|---|---|---|---|
+| Concept kinds | 6 | 5 | 5 |
+| Relation labels | 6 + Other | 7 + Other | 6 + Other |
+| Concepts / relations extracted | 74 / 104 | 13 / 26 | 129 / 79 |
+| Relations labelled "Other" | 32 / 104 (30.8%) | 3 / 26 (11.5%) | 49 / 79 (62%); 14 / 44 (32%) without book relations |
+| Concepts with kind "Other" | 28 / 74 (37.8%) | 5 / 13 (38.5%) | 0 / 129 |
+| Label with 0 relations | Proposes | Opposes | none |
+| Person concepts | 0 | – | 30 |
+| Relations whose end kinds break the vocabulary | – | – | 0 / 30 |
+| Relations usable for questions (not "Other") | 72 | – | 30 |
+| Concept–concept relations (no person, no book) | 104 | – | 25 |
+
+The derived vocabulary differs by field. Ethics got *proposes, opposes, means–end, grounds, transformation, inclusion*. NLP got *depends on, composed of, purpose, inclusion, conversion, metric, opposes*. Only *opposes* and *inclusion* appear in both.
+
+The same defect showed up in both courses: a relation label has no concept kind that can fill its subject or object slot. For example, there is no "person" kind for *proposes* and no "metric" kind for *metric*. As a result, Ethics has 0 person concepts, although Kant appears in 10 lectures.
+
+After the fix, the vocabulary has a person kind (30 person concepts), and no concept falls into "Other". Each relation label now states which kinds may appear at each end, and relations that break this are relabelled "Other". Most of the "Other" relations are author → book. Without them, the "Other" rate (32%) is about the same as before.
+
+Two problems remain. Books still become concepts (36 of 129). Concept–concept relations fell from 104 to 25, so relation questions have less material.
+
+With English slides (NLP lecture 1), the vocabulary, concepts and questions came out in English: 0 of 27 concepts and 0 of 5 questions contain Japanese. Only the fixed label "その他" (Other) stays in Japanese.
+
+#### 2. Extraction accuracy (§12-6, 30 random relations)
+
+| | Before | After |
+|---|---|---|
+| Correct | 6 / 30 | 22 / 30 |
+| Ambiguous | 16 / 30 | 6 / 30 |
+| Wrong | 8 / 30 | 2 / 30 |
+| Correct / ambiguous / wrong, book relations excluded | 6 / 16 / 8 (no books) | 10 / 5 / 2 (17 relations) |
+| Concept pairs with conflicting labels | 10 pairs | 0 pairs |
+| Relations whose cited page contains both concept names | 67 / 104 | 52 / 79 (69 / 79 when person names are matched by surname) |
+
+#### 3. Question quality (§12-3, 30 questions over 6 lecture ranges)
+
+"After" uses the fixed question-generation code (`97635f3`) on the *same old* graph as "Before", so the change comes from the question-generation fixes only.
+
+| | Before | After |
+|---|---|---|
+| Usable | 15 / 30 | 20 / 30 |
+| Usable after a fix | 5 / 30 | 8 / 30 |
+| Not usable | 10 / 30 | 2 / 30 |
+| Correct answer wrong | 9 / 30 | 1 / 30 |
+| A distractor is actually correct (MCQ) | 6 / 24 | 1 / 24 |
+| Answer index points to the wrong choice | 4 / 24 | 0 / 24 |
+| Relation asked in the reverse direction | 4 / 30 | 1 / 30 |
+| Not usable, by aspect: relation / example / definition | 6/12 · 4/12 · 0/6 | 1/12 · 1/7 · 0/11 |
+| Short-answer grading matches the expected score (6 questions × 5 answers, graded twice) | 25 / 30 (too lenient 0, too strict 3, unstable 2) | 29 / 30 (too lenient 0, too strict 1, unstable 0) |
+
+#### 4. Selection and map value (§12-4, §12-5)
+
+| | Before | After |
+|---|---|---|
+| Questions using a concept outside the selection | 0 / 30 | 0 / 30 |
+| Selected concepts covered by at least one question | 35 / 80 | 38 / 80 |
+| Near-duplicate question pairs across ranges | 5 | 2 |
+
+| Same size (8 concepts), 5 ranges each | Lasso on the map | Random |
+|---|---|---|
+| Relations inside the range | 29 | 3 |
+| Isolated concepts | 0 / 40 | 30 / 40 |
+| Largest connected group (mean) | 8.0 | 1.8 |
+
+Selecting by lasso gives about 10 times more relations inside the range, and those relations are the material for relation questions. We have not yet compared questions generated from the two kinds of range. That comparison needs API calls.
+<!-- EVAL:END -->
 
 ## Known limitations
 
