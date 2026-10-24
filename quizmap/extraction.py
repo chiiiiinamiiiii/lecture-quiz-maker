@@ -19,7 +19,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from quizmap.common import OTHER_LABEL, Lecture, call_json, lecture_as_prompt_text, write_json
+from quizmap.common import OTHER_LABEL, Lecture, call_json, lecture_as_prompt_text, normalize_text, write_json
 
 # ------------------------------------------------------------------ 概念抽出
 
@@ -87,6 +87,8 @@ RELATION_USER = """授業「{course}」の第{lecture}回の資料です（ペ�
 - from と to は上の id から選ぶ。同じ id を両端にしない
 - label はラベルの定義に従って選ぶ。無理に当てはめず、合わなければ「{other}」にする
 - page はその関係が書かれているこの回のページ番号
+- evidence には、その関係が書かれている箇所を page のページ本文からそのまま 40 字以内で抜き出す。抜き出せない関係は出さない
+- 同じページに二つの概念が出てくるだけでは関係にしない。二つの概念を結びつける記述があるときだけ挙げる
 - 1 度しか書かれていない関係も挙げる。数の上限はない
 
 === 資料 ===
@@ -105,8 +107,9 @@ RELATION_SCHEMA = {
                     "to": {"type": "string"},
                     "label": {"type": "string"},
                     "page": {"type": "integer"},
+                    "evidence": {"type": "string"},
                 },
-                "required": ["from", "to", "label", "page"],
+                "required": ["from", "to", "label", "page", "evidence"],
                 "additionalProperties": False,
             },
         }
@@ -179,6 +182,31 @@ def extract_concepts(client, model: str, course: str, vocab: dict, lectures: lis
     return concepts, unmatched_kind
 
 
+_SPACE_RE = re.compile(r"\s+")
+
+
+def _squash(text: str) -> str:
+    """出典の照合用。ページ本文と同じ正規化をかけ、空白をすべて除く。"""
+    return _SPACE_RE.sub("", normalize_text(text))
+
+
+def _label_head(label: str) -> str:
+    """概念名の照合用。括弧より前（例: 「理（ロゴス）を伴う活動」→「理」）。"""
+    return _squash(label).split("(")[0]
+
+
+def check_evidence(evidence: str, end_labels: list[str], page_text: str) -> str | None:
+    """関係が出典ページに根拠を持つか（Issue #11）。落とす理由、または None を返す。"""
+    page = _squash(page_text)
+    evidence = _squash(evidence)
+    if not evidence or evidence not in page:
+        return "evidence が本文に無い"
+    heads = [_label_head(l) for l in end_labels]
+    if not any(h and h in page for h in heads):
+        return "両端の概念名が本文に無い"
+    return None
+
+
 def extract_relations(client, model: str, course: str, vocab: dict, lectures: list[Lecture],
                       concepts: dict[str, dict], workers: int, log=print) -> tuple[list[dict], dict]:
     """概念 id を固定して、回ごとに関係を出させる（回は独立なので並列）。"""
@@ -214,7 +242,16 @@ def extract_relations(client, model: str, course: str, vocab: dict, lectures: li
                 if label not in labels:
                     dropped["vocab にないラベル→その他"] += 1
                     label = OTHER_LABEL
-                page = r["page"] if 1 <= r["page"] <= lec.page_count else 1
+                if not 1 <= r["page"] <= lec.page_count:
+                    dropped["ページ番号が範囲外"] += 1
+                    continue
+                page = r["page"]
+                reason = check_evidence(r.get("evidence", ""), [concepts[f]["label"], concepts[t]["label"]],
+                                        lec.pages[page - 1])
+                if reason:
+                    dropped[reason] += 1
+                    continue
+                # evidence は検証に使うだけで保存しない（講義資料の本文を graph.json に増やさない）
                 candidates.append({"from": f, "to": t, "label": label,
                                    "source": {"lecture": lec.number, "page": page}})
                 kept += 1
