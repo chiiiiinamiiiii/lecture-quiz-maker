@@ -40,9 +40,11 @@ def short(qid="q_02"):
             "relation_used": {"from": "", "to": "", "label": ""}, "sources": [{"lecture": 1, "page": 1}]}
 
 
-def check(qid, supported=True, support=((1, 1),), quote="甲野は乙説を唱えた", distractors=(), other=False):
+def check(qid, supported=True, support=((1, 1),), quote="甲野は乙説を唱えた", distractors=(), other=False,
+          same_as="", conflicts_with=""):
     return {"id": qid, "answer_supported": supported, "support": [{"lecture": l, "page": p} for l, p in support],
-            "quote": quote, "distractors": list(distractors), "other_answer": other, "reason_other": "別解" if other else ""}
+            "quote": quote, "distractors": list(distractors), "other_answer": other, "reason_other": "別解" if other else "",
+            "same_as": same_as, "conflicts_with": conflicts_with}
 
 
 def D(choice, bad=False, replacement="", wiki=0):
@@ -93,18 +95,43 @@ def test_supported_question_is_kept_and_one_call(llm):
     assert len(rec[0]["distractors"]) == 3
 
 
-def test_unsupported_or_bad_quote_is_dropped(llm):
+def test_unsupported_is_dropped_but_bad_quote_is_kept(llm):
+    """外すのは LLM が導けないと判定したときだけ。引用の照合に落ちただけでは外さない（#91）。"""
     llm["checks"] = [check("q_01", supported=False), check("q_02", quote="甲野は乙説を否定した")]
     kept, rec = run([mcq("q_01"), mcq("q_02")])
-    assert kept == []
-    assert rec[0]["reasons"] == ["正答が資料の記述から導けない"]
-    assert rec[1]["reasons"] == ["正答の根拠の引用が、挙げた資料のページに無い"]
+    assert [q["id"] for q in kept] == ["q_02"]
+    assert rec[0]["reasons"] == ["正答が資料の記述から導けない"] and rec[0]["action"] == "dropped"
+    assert rec[1]["reasons"] == ["引用の照合に失敗（残した）"] and rec[1]["quote_check"] == "failed"
+    assert rec[1]["action"] == "kept"
 
 
-def test_support_page_must_be_one_shown(llm):
-    llm["checks"] = [check("q_01", support=((1, 2),), quote="丙は丁説を唱えた")]
-    kept, rec = run([mcq()])
-    assert kept == [] and rec[0]["action"] == "dropped"
+def test_quote_matched_on_any_shown_page_and_support_rewritten(llm):
+    """support に挙げたページが違っても、見せたページのどれかに引用があれば通し、support を入れ直す（#91）。"""
+    index = FakeIndex([{"lecture": 1, "page": 2, "text": "", "score": 0.8}])
+    llm["checks"] = [check("q_01", support=((1, 1),), quote="丙は丁説を唱えた")]
+    kept, rec = run([mcq()], index=index)
+    assert len(kept) == 1 and rec[0]["quote_check"] == "ok"
+    assert rec[0]["support"] == [{"lecture": 1, "page": 2}]
+    assert rec[0]["support_claimed"] == [{"lecture": 1, "page": 1}]
+
+
+def test_quote_fragments_split_by_ellipsis():
+    page_text = {(1, 1): "甲野は乙説を唱えた。", (1, 2): "丙は丁説を唱えた。戊も登場する。"}
+    keys = [(1, 1), (1, 2)]
+    assert quiz.match_quote("甲野は乙説を唱えた…丙は丁説を唱えた", keys, page_text) == [(1, 1), (1, 2)]
+    assert quiz.match_quote("甲野は乙説を唱えた...丙は丁説を唱え", keys, page_text) == [(1, 1), (1, 2)]
+    assert quiz.match_quote("甲野は乙説を唱えた……戊も", keys, page_text) == [(1, 1)]   # 6 字未満の断片は見ない
+    assert quiz.match_quote("甲野は乙説を唱えた…丙は乙説を唱えた", keys, page_text) is None
+    assert quiz.match_quote("甲野は", keys, page_text) is None                            # 断片が全部短い
+    assert quiz.match_quote("丙は丁説を唱えた", [(1, 1)], page_text) is None               # 見せていないページ
+
+
+def test_overlapping_question_dropped_and_conflict_recorded(llm):
+    llm["checks"] = [check("q_01"), check("q_02", same_as="q_01"), check("q_03", conflicts_with="q_01")]
+    kept, rec = run([mcq("q_01"), mcq("q_02"), mcq("q_03")])
+    assert [q["id"] for q in kept] == ["q_01", "q_03"]
+    assert rec[1]["action"] == "dropped" and rec[1]["reasons"] == ["q_01 と重なる問題"]
+    assert rec[2]["action"] == "kept" and "q_01 と正答が食い違う（残した）" in rec[2]["reasons"]
 
 
 def test_distractor_replaced_with_slide_term_or_dropped(llm):
@@ -118,7 +145,8 @@ def test_distractor_replaced_with_slide_term_or_dropped(llm):
     assert rec[0]["action"] == "replaced" and rec[0]["distractors"][0]["replaced"] is True
     assert rec[1]["action"] == "dropped"
     assert {"term": "丙", "title": "丙", "url": "https://ja.wikipedia.org/wiki/丙"} in rec[0]["wiki"]
-    assert {"term": "己", "title": "", "url": ""} in rec[0]["wiki"]
+    assert all(w["term"] != "己" for w in rec[0]["wiki"])                # 概念に当たらない選択肢は引かない（#93）
+    assert {"term": "丁説", "title": "", "url": ""} in rec[0]["wiki"]
     assert wiki.terms.count("丙") == 1                                  # 同じ語は 1 度だけ引く
 
 
@@ -184,3 +212,19 @@ def test_generate_quiz_calls_verify_and_keeps_before(monkeypatch):
 
     out = quiz.generate_quiz(None, "m", GRAPH, vocab, PAGES, ["kouno", "otsu"], 1, verify=False)
     assert len(out["questions"]) == 1 and "uniqueness" not in out["meta"] and out["meta"]["api_calls"] == 2
+
+
+def test_wiki_terms_are_concept_labels_not_choice_sentences(llm):
+    """Wikipedia で引くのは、選択肢・正答に出てくる概念の label だけ（#93）。"""
+    wiki = FakeWiki({})
+    q = mcq(choices=("甲野が乙説を唱えた", "丙が丁説を唱えた", "誰も唱えていない", "己"))
+    llm["checks"] = [check("q_01")]
+    _, rec = run([q], wiki=wiki)
+    assert wiki.terms == ["甲野", "乙説", "丙", "丁説"]
+    assert [w["term"] for w in rec[0]["wiki"]] == ["甲野", "乙説", "丙", "丁説"]
+
+
+def test_concept_terms_skip_label_inside_longer_label():
+    graph = {"concepts": [{"label": "尊厳"}, {"label": "尊厳性"}, {"label": "人格"}]}
+    assert quiz.concept_terms(["人格の尊厳性"], graph) == ["人格", "尊厳性"]
+    assert quiz.concept_terms(["関係の無い文"], graph) == []

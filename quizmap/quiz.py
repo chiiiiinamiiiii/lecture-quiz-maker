@@ -483,13 +483,16 @@ UNIQUENESS_USER = """次のクイズの各問題を点検してください。
 
 各問題について 1 件ずつ答える。守ること:
 - answer_supported: 正答（4 択は answer の選択肢、記述式は模範解答）が、その問題に付けた資料のページの記述から導けるなら true。
-  導けるときは support に根拠のページを 1 つ以上挙げ、quote にそのページ本文から根拠の箇所をそのまま 60 字以内で抜き出す。
+  導けるときは support に根拠のページを 1 つ以上挙げ、quote には、根拠のページの本文から 1 続きの文を、そのまま 80 字以内で写す。
+  省略記号で継ぎ合わせない。support にはその文があるページを書く。
   資料に書かれておらず、一般知識や Wikipedia でしか確かめられないなら false にする
 - distractors: 4 択の問題では、正答以外の選択肢ごとに 1 件。その選択肢が、資料のページまたは Wikipedia の記事に照らして、
   問題文の条件で正解と言えてしまうなら could_be_correct を true にし、reason に理由を、wiki に根拠にした記事の番号（無ければ 0）を書く。
   true のときは replacement に、資料のページに載っている語で、問題文の条件に当てはまらない別の選択肢を書く（見つからなければ空）。
   正解と言えないなら could_be_correct を false にし、replacement を空にする。記述式の問題は distractors を空配列にする
 - other_answer: 記述式の問題で、模範解答とは別の答えが資料から正答として成り立つなら true、reason_other に理由を書く。4 択の問題は false
+- same_as: このクイズの別の問題と、問うている内容と正答が同じ（重なっている）なら、その問題の id を書く。無ければ空
+- conflicts_with: このクイズの別の問題と、同じことについて正答が食い違う（両方は正しくありえない）なら、その問題の id を書く。無ければ空
 - 問題文・選択肢・正答は書き換えない。判定だけを返す
 - 使わない欄は、文字列なら空、数なら 0 にする
 """
@@ -531,8 +534,11 @@ UNIQUENESS_SCHEMA = {
                     },
                     "other_answer": {"type": "boolean"},
                     "reason_other": {"type": "string"},
+                    "same_as": {"type": "string"},
+                    "conflicts_with": {"type": "string"},
                 },
-                "required": ["id", "answer_supported", "support", "quote", "distractors", "other_answer", "reason_other"],
+                "required": ["id", "answer_supported", "support", "quote", "distractors", "other_answer", "reason_other",
+                             "same_as", "conflicts_with"],
                 "additionalProperties": False,
             },
         }
@@ -580,20 +586,64 @@ def _on_slides(term: str, graph: dict, page_text: dict) -> bool:
     return any(t in _flat(text) for text in page_text.values())
 
 
+_ELLIPSIS_RE = re.compile(r"(?:\.{2,}|…+|‥+)")
+QUOTE_MIN_FRAGMENT = 6     # これより短い断片は照合に使わない（どこにでも出てくるため）
+
+
+def match_quote(quote: str, keys: list[tuple[int, int]], page_text: dict) -> list[tuple[int, int]] | None:
+    """正答の根拠の引用を、見せたページすべてと照合する（#91）。
+
+    引用を「...」「…」「……」で断片に分け、6 字以上の断片がすべて、見せたページのどれかの本文に
+    そのまま（_flat で空白・改行を除いて）あれば通す。断片はページをまたいでもよい。
+    戻り値: 断片が見つかったページ（keys の順）、通らなければ None
+    """
+    frags = [f for f in (_flat(x) for x in _ELLIPSIS_RE.split(quote or "")) if len(f) >= QUOTE_MIN_FRAGMENT]
+    if not frags:
+        return None
+    texts = {k: _flat(page_text[k]) for k in keys if k in page_text}
+    hit: list[tuple[int, int]] = []
+    for f in frags:
+        where = [k for k, t in texts.items() if f in t]
+        if not where:
+            return None
+        hit += [k for k in where if k not in hit]
+    return [k for k in keys if k in hit]
+
+
+def concept_terms(texts: list[str], graph: dict) -> list[str]:
+    """Wikipedia で引く語（#93）。選択肢・正答の文に出てくる概念の label（graph の概念）だけ。
+
+    文そのものは引かない。概念に当たらない選択肢からは何も引かない。長い label の中の短い label は数えない
+    （mentioned_labels）。読みの括弧などの正規化は rag.Wiki.lookup 側で行う。出てきた順に並べる。
+    """
+    labels = [c["label"] for c in graph["concepts"]]
+    out: list[str] = []
+    for text in texts:
+        found = mentioned_labels(text, labels)
+        pos = {l: _norm(text).find(_norm(l)) for l in found}
+        out += [l for l in sorted(found, key=lambda l: (pos[l], l)) if l not in out]
+    return out
+
+
 def verify_uniqueness(client, model, questions, graph, pages, index, wiki) -> tuple[list, list]:
     """出題の検証。全問をまとめて 1 回の LLM 呼び出しで判定する。
 
-    1. 正答がスライドの記述から導けるか。導けなければ外す（根拠の引用が挙げたページに無いときも外す）
+    1. 正答がスライドの記述から導けるか。LLM が導けないと判定したら外す。
+       根拠の引用は見せたページすべてと断片ごとに照合し（match_quote）、照合に落ちただけでは外さない（記録に残す）
     2. 正答以外の選択肢が、スライドか Wikipedia で正解と言えてしまうなら、資料に載っている語に差し替える。
        差し替えられなければ外す
     3. 記述式で、模範解答以外に資料から別の正答が成り立つなら外す
+    4. 同じ範囲の別の問題と重なる問題は、後のほうを外す。正答が食い違う問題は記録だけ残す（どちらが誤りかは決めない）
+    Wikipedia で引くのは、選択肢・正答に出てくる概念の label だけ（concept_terms）。
     関係を問う問題で origin: external の関係を使ったものは、LLM に見せる前に外す。
     index（SlideIndex）と wiki（Wiki）は None でもよい（使える層だけで判定する）。
     戻り値: (残す問題, 検証の記録)。記録は問題ごとに 1 件:
       {"id", "action": "kept" / "replaced" / "dropped", "reasons": [...],
        "pages": [{"lecture", "page", "score", "via": "source" / "search"}],   # LLM に見せたスライドのページ
-       "wiki": [{"term", "title", "url"}],                                   # 引いた語（見つからなければ title・url は空）
-       "support": [{"lecture", "page"}], "quote",                            # LLM が挙げた正答の根拠
+       "wiki": [{"term", "title", "url"}],                                   # 引いた概念名（見つからなければ title・url は空）
+       "support": [{"lecture", "page"}], "quote",                            # 正答の根拠（照合で見つかったページ）
+       "support_claimed": [{"lecture", "page"}], "quote_check": "ok" / "failed" / "",
+       "same_as", "conflicts_with",
        "distractors": [{"choice", "text", "could_be_correct", "reason", "wiki_url", "replacement", "replaced"}],
        "other_answer", "reason_other"}
     """
@@ -603,7 +653,8 @@ def verify_uniqueness(client, model, questions, graph, pages, index, wiki) -> tu
 
     def new_record(q: dict) -> dict:
         return {"id": q.get("id", "?"), "action": "kept", "reasons": [], "pages": [], "wiki": [],
-                "support": [], "quote": "", "distractors": [], "other_answer": False, "reason_other": ""}
+                "support": [], "support_claimed": [], "quote": "", "quote_check": "", "distractors": [],
+                "other_answer": False, "reason_other": "", "same_as": "", "conflicts_with": ""}
 
     for q in questions:
         if uses_external_relation(q, graph):
@@ -633,12 +684,12 @@ def verify_uniqueness(client, model, questions, graph, pages, index, wiki) -> tu
                     rec["pages"].append({"lecture": k[0], "page": k[1], "score": h.get("score"), "via": "search"})
         rec["pages"] = rec["pages"][:UNIQUENESS_PAGES_PER_QUESTION]
 
-    # 正答と各選択肢の語を Wikipedia で引く（Wiki がキャッシュするので、同じ語は二度問い合わせない）
+    # 正答と各選択肢に出てくる概念の名前を Wikipedia で引く（#93。Wiki がキャッシュするので、同じ語は二度問い合わせない）
     articles: list[dict] = []                         # [W番号 - 1] → 記事
     found: dict[str, dict | None] = {}
     q_wiki: dict[str, list[int]] = {}
     for q in targets:
-        terms = list(q.get("choices") or []) or [q.get("answer_text", "")]
+        terms = concept_terms(list(q.get("choices") or []) or [q.get("answer_text", "")], graph)
         nums: list[int] = []
         for term in (t.strip() for t in terms):
             if not term or wiki is None:
@@ -701,18 +752,31 @@ def verify_uniqueness(client, model, questions, graph, pages, index, wiki) -> tu
             kept.append(q)
             continue
         allowed = set(keys_of(qid))
-        support = [(s["lecture"], s["page"]) for s in c["support"] if (s["lecture"], s["page"]) in allowed]
-        rec.update(support=[{"lecture": l, "page": n} for l, n in support], quote=c["quote"],
-                   other_answer=c["other_answer"], reason_other=c["reason_other"])
+        claimed = [(s["lecture"], s["page"]) for s in c["support"] if (s["lecture"], s["page"]) in allowed]
+        rec.update(support_claimed=[{"lecture": s["lecture"], "page": s["page"]} for s in c["support"]],
+                   quote=c["quote"], other_answer=c["other_answer"], reason_other=c["reason_other"],
+                   same_as=c["same_as"].strip(), conflicts_with=c["conflicts_with"].strip())
         if not c["answer_supported"]:
             rec["action"] = "dropped"
             rec["reasons"].append("正答が資料の記述から導けない")
             continue
-        quote = _flat(c["quote"])
-        if not support or not quote or not any(quote in _flat(page_text[k]) for k in support):
+        # 引用の照合（#91）。見せたページすべてと断片ごとに照合し、見つかったページを support にする。
+        # 照合に落ちても、LLM が導けると判定した問題は外さない（引用の書き方の違いで外しすぎたため）
+        found_at = match_quote(c["quote"], keys_of(qid), page_text)
+        if found_at:
+            rec.update(support=[{"lecture": l, "page": n} for l, n in found_at], quote_check="ok")
+        else:
+            rec.update(support=[{"lecture": l, "page": n} for l, n in claimed], quote_check="failed")
+            rec["reasons"].append("引用の照合に失敗（残した）")
+        # 同じ範囲の別の問題と重なるなら、後のほうを外す。食い違いは記録だけ（どちらが誤りかは決めない）
+        earlier = [x["id"] for x in kept]
+        if rec["same_as"] and rec["same_as"] != qid and rec["same_as"] in earlier:
             rec["action"] = "dropped"
-            rec["reasons"].append("正答の根拠の引用が、挙げた資料のページに無い")
+            rec["reasons"].append(f"{rec['same_as']} と重なる問題")
             continue
+        if rec["conflicts_with"] and rec["conflicts_with"] != qid and \
+                rec["conflicts_with"] in {x.get("id") for x in targets}:
+            rec["reasons"].append(f"{rec['conflicts_with']} と正答が食い違う（残した）")
         if q.get("type") != "mcq":
             if c["other_answer"]:
                 rec["action"] = "dropped"
@@ -829,6 +893,8 @@ def generate_quiz(client, model: str, graph: dict, vocab: dict, pages: list[dict
             "records": records,
             "dropped": sum(1 for r in records if r["action"] == "dropped"),
             "replaced": sum(1 for r in records if r["action"] == "replaced"),
+            "quote_check_failed": sum(1 for r in records if r.get("quote_check") == "failed"),
+            "conflicts": sum(1 for r in records if r.get("conflicts_with")),
             "index": index is not None,
             "wiki": wiki is not None,
             # 索引の検索（埋め込み）は、LLM に見せた問題ごとに 1 回
