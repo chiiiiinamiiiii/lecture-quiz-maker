@@ -1,7 +1,7 @@
 """取り込み画面の戻り確認。"""
 import json
 
-from conftest import exception_text
+from conftest import exception_text, main_text
 
 NAME = "readd_test_資料.pdf"            # ファイル名から講義回が読めない名前
 OLD = b"%PDF-1.4 readd old"
@@ -64,3 +64,29 @@ def test_readd_different_content_adds_new_entry_and_keeps_old(page, data_dir, tm
     assert (course / "uploads" / NAME).read_bytes() == OLD
     assert "readd_test_資料 (2).pdf" in files
     assert "追加しました" in toast
+
+
+def test_ingest_page_in_english(page, data_dir, tmp_path):
+    """取り込み画面の文言が英語に切り替わり、追加の知らせも英語になる。手で決めた講義回は残る。"""
+    course = _course(data_dir)
+    _set_hand_edited(course)
+    page.get_by_text("English", exact=True).click()
+    page.wait_for_timeout(3000)
+    page.get_by_text("Import materials", exact=True).click()
+    page.wait_for_selector("text=Lecture numbers", timeout=15000)
+    text = main_text(page)
+    assert exception_text(page) is None
+    for s in ("Import materials:", "Add PDFs", "Lecture numbers"):
+        assert s in text
+    for s in ("資料の取り込み：", "講義回の割り当て", "資料を追加する"):
+        assert s not in text
+    # 表（st.data_editor）の見出しは canvas に描かれ DOM から読めないので、ここでは見ない
+
+    src = tmp_path / NAME
+    src.write_bytes(OLD)
+    page.locator("[data-testid='stFileUploader'] input[type='file']").first.set_input_files(str(src))
+    page.get_by_role("button", name="Add", exact=True).click(timeout=15000)
+    page.wait_for_selector("[data-testid='stToast']", timeout=15000)
+    assert "already in the list" in page.locator("[data-testid='stToast']").first.inner_text()
+    files = _files(course)
+    assert files[NAME]["lecture"] == 4 and files[NAME]["use"] is True

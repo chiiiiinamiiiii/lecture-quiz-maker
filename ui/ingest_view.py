@@ -9,6 +9,7 @@ from quizmap.courses import (
     PHASE_LABEL, course_info, create_course, current_job, lecture_numbers_conflict, running_job,
     save_course_info, save_upload, start_ingest,
 )
+from ui.i18n import TEXTS, t
 from ui.state import clear_course_state
 
 SECONDS_PER_LECTURE = 15     # 目安。概念と関係で 2 回呼び、呼び出しの間に待機が入る
@@ -37,13 +38,12 @@ def _add_files(d: Path, uploaded) -> tuple[int, int]:
 
 
 def render_new_course() -> None:
-    st.subheader("新しいコースを作る")
-    st.caption("講義資料の PDF をまとめてアップロードしてください。ファイル名の「第3回」「week3」"
-               "「Lecture 03」などから講義回を読み取ります。読み取れないものは次の画面で指定できます。")
-    name = st.text_input("コース名", placeholder="例: 倫理学の世界")
-    files = st.file_uploader("講義資料（PDF、複数可）", type=["pdf"], accept_multiple_files=True,
+    st.subheader(t("new_course_title"))
+    st.caption(t("new_course_help"))
+    name = st.text_input(t("course_name"), placeholder=t("course_name_ph"))
+    files = st.file_uploader(t("pdf_files"), type=["pdf"], accept_multiple_files=True,
                              key="new_course_files")
-    if st.button("コースを作る", type="primary", disabled=not (name.strip() and files)):
+    if st.button(t("create_course"), type="primary", disabled=not (name.strip() and files)):
         d = create_course(name.strip())
         _add_files(d, files)
         clear_course_state()
@@ -54,7 +54,7 @@ def render_new_course() -> None:
 
 def render_ingest_page(d: Path) -> None:
     info = course_info(d)
-    st.subheader(f"資料の取り込み：{info['name']}")
+    st.subheader(t("ingest_title", name=info["name"]))
 
     job = current_job(d)
     busy = running_job()
@@ -63,17 +63,17 @@ def render_ingest_page(d: Path) -> None:
         return
 
     # 追加のアップロード
-    more = st.file_uploader("資料を追加する（PDF、複数可）", type=["pdf"], accept_multiple_files=True,
+    more = st.file_uploader(t("add_files"), type=["pdf"], accept_multiple_files=True,
                             key=f"more-{d.name}-{st.session_state.get('upload_epoch', 0)}")
-    if more and st.button("追加する"):
+    if more and st.button(t("add_btn")):
         added, kept = _add_files(d, more)
         st.session_state["upload_epoch"] = st.session_state.get("upload_epoch", 0) + 1
         msg = []
         if added:
-            msg.append(f"{added} 件を追加しました")
+            msg.append(t("added_toast", n=added))
         if kept:
-            msg.append(f"{kept} 件は一覧にある同じファイルのため、講義回と「使う」はそのまま残しました")
-        st.session_state["ingest_notice"] = "。".join(msg)   # rerun の直前の toast は消えることがあるので次の回で出す
+            msg.append(t("kept_toast", n=kept))
+        st.session_state["ingest_notice"] = t("sentence_sep").join(msg)   # rerun の直前の toast は消えることがあるので次の回で出す
         st.rerun()
     notice = st.session_state.pop("ingest_notice", None)
     if notice:
@@ -81,24 +81,26 @@ def render_ingest_page(d: Path) -> None:
 
     files = course_info(d)["files"]
     if not files:
-        st.info("まだ資料がありません。上からアップロードしてください。")
+        st.info(t("no_files"))
         return
 
-    st.markdown("**講義回の割り当て**　講義回が空欄のものや、講義資料ではないもの（読書課題など）は「使う」を外してください。")
-    df = pd.DataFrame([{"使う": f["use"], "講義回": f["lecture"], "ファイル": f["name"]} for f in files])
+    st.markdown(t("assign_title"))
+    # 列名は言語によらない名前にし、見出しだけ訳す（言語を切り替えても表の編集状態が崩れないように）
+    df = pd.DataFrame([{"use": f["use"], "lecture": f["lecture"], "file": f["name"]} for f in files])
     edited = st.data_editor(
         df, hide_index=True, use_container_width=True, key=f"files-{d.name}",
         column_config={
-            "使う": st.column_config.CheckboxColumn(width="small"),
-            "講義回": st.column_config.NumberColumn(min_value=1, max_value=99, step=1, width="small"),
-            "ファイル": st.column_config.TextColumn(disabled=True),
+            "use": st.column_config.CheckboxColumn(t("col_use"), width="small"),
+            "lecture": st.column_config.NumberColumn(t("col_lecture"), min_value=1, max_value=99, step=1,
+                                                     width="small"),
+            "file": st.column_config.TextColumn(t("col_file"), disabled=True),
         },
-        disabled=["ファイル"],
+        disabled=["file"],
     )
     new_files = []
     for _, row in edited.iterrows():
-        n = None if pd.isna(row["講義回"]) else int(row["講義回"])
-        new_files.append({"name": row["ファイル"], "lecture": n, "use": bool(row["使う"]) and n is not None})
+        n = None if pd.isna(row["lecture"]) else int(row["lecture"])
+        new_files.append({"name": row["file"], "lecture": n, "use": bool(row["use"]) and n is not None})
     if new_files != files:
         info = course_info(d)
         info["files"] = new_files
@@ -107,19 +109,18 @@ def render_ingest_page(d: Path) -> None:
     used = [f for f in new_files if f["use"]]
     dup = lecture_numbers_conflict(new_files)
     if dup:
-        st.error("同じ講義回が重なっています: " + "、".join(f"第{n}回" for n in dup))
+        st.error(t("dup_lectures", l=t("list_sep").join(t("lecture_fmt", n=n) for n in dup)))
 
     has_vocab = (d / "vocab.json").exists()
     rebuild = False
     if has_vocab:
-        rebuild = st.checkbox("語彙（概念の種類と関係の種類）も作り直す", value=False,
-                              help="既定では前回の語彙を使い回す。使い回すと、取り込み直しても結果を比べられる（§4）")
+        rebuild = st.checkbox(t("rebuild_vocab"), value=False, help=t("rebuild_help"))
 
     minutes = max(1, round(len(used) * SECONDS_PER_LECTURE / 60))
-    st.caption(f"{len(used)} 回分を取り込みます。目安 {minutes} 分。処理中も画面は操作できます。")
+    st.caption(t("ingest_estimate", n=len(used), m=minutes))
     if busy and busy.course_dir != str(d):
-        st.warning("別のコースの取り込みが実行中です。終わってから始めてください。")
-    label = "取り込み直す" if (d / "graph.json").exists() else "取り込みを始める"
+        st.warning(t("other_running"))
+    label = t("reingest") if (d / "graph.json").exists() else t("start_ingest")
     if st.button(label, type="primary", disabled=bool(dup or not used or busy)):
         try:
             start_ingest(d, rebuild_vocab=rebuild)
@@ -129,11 +130,11 @@ def render_ingest_page(d: Path) -> None:
         st.rerun()
 
     if job and job.status == "error":
-        st.error(f"前回の取り込みは失敗しました: {job.error}")
-        with st.expander("ログ"):
+        st.error(t("last_failed", e=job.error))
+        with st.expander(t("log")):
             st.code("\n".join(job.log[-40:]))
     elif job and job.status == "done":
-        st.success(f"前回の取り込みは完了しています（{job.finished_at}）。")
+        st.success(t("last_done", t=job.finished_at))
 
 
 @st.fragment(run_every="2s")
@@ -143,6 +144,11 @@ def _progress(d: Path) -> None:
         return
     if job.status != "running":
         st.rerun(scope="app")          # 終わったら画面全体を描き直す（地図を開けるようにする）
-    st.progress(min(1.0, job.progress), text=f"{PHASE_LABEL.get(job.phase, job.phase)}…")
-    st.caption(f"開始 {job.started_at}。この画面を開いたままでも、ほかの操作をしても処理は続きます。")
-    st.code("\n".join(job.log[-12:]) or "開始しています…")
+    st.progress(min(1.0, job.progress), text=f"{_phase_label(job.phase)}…")
+    st.caption(t("progress_note", t=job.started_at))
+    st.code("\n".join(job.log[-12:]) or t("starting"))
+
+
+def _phase_label(phase: str) -> str:
+    key = f"phase_{phase}"
+    return t(key) if key in TEXTS else PHASE_LABEL.get(phase, phase)
