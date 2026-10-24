@@ -87,6 +87,8 @@ RELATION_USER = """授業「{course}」の第{lecture}回の資料です（ペ�
 - 資料に明示的に書かれている関係だけを挙げる。一般知識から補わない
 - from と to は上の id から選ぶ。同じ id を両端にしない
 - label はラベルの定義に従って選ぶ。無理に当てはめず、合わなければ「{other}」にする
+- from と to はラベルの定義が決める向きに従う。逆向きの関係ならば from と to を入れ替える
+- A が B の定義そのもの、または A と B が同じものの言い換えである場合、それに合うラベルが無ければ「{other}」にする。ほかのラベルに押し込まない
 - page はその関係が書かれているこの回のページ番号
 - 1 度しか書かれていない関係も挙げる。数の上限はない
 
@@ -182,12 +184,20 @@ def extract_concepts(client, model: str, course: str, vocab: dict, lectures: lis
     return concepts, unmatched_kind
 
 
+def _direction_text(rel: dict) -> str:
+    """関係ラベルの向き（from 側・to 側の種類）。旧形式の vocab.json には無いので空にする。"""
+    f, t = rel.get("from_kinds") or [], rel.get("to_kinds") or []
+    if not f and not t:
+        return ""
+    return f"【向き: from は {'・'.join(f) or '指定なし'}、to は {'・'.join(t) or '指定なし'}】"
+
+
 def extract_relations(client, model: str, course: str, vocab: dict, lectures: list[Lecture],
                       concepts: dict[str, dict], workers: int, log=print) -> tuple[list[dict], dict]:
     """概念 id を固定して、回ごとに関係を出させる（回は独立なので並列）。"""
     labels = {r["label"] for r in vocab["relations"]} | {OTHER_LABEL}
     rel_text = "\n".join(
-        f"- {r['label']}: {r['definition']}（例: {r['example']}）"
+        f"- {r['label']}: {r['definition']}{_direction_text(r)}（例: {r['example']}）"
         for r in vocab["relations"] if r["label"] != OTHER_LABEL
     )
     concept_text = "\n".join(f"- {c['id']}: {c['label']}" for c in concepts.values())
