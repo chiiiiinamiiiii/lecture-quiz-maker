@@ -23,6 +23,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
+# データの置き場。テストや別の作業ツリーから、本物のデータを触らずに動かすときは環境変数で差し替える
+DATA_DIR = Path(os.environ.get("QUIZMAP_DATA_DIR", PROJECT_DIR / "data"))
+# API キーを書いた .env の場所。作業ツリーには .env が無いので、本体のものを指せるようにする
+ENV_FILE = Path(os.environ.get("QUIZMAP_ENV_FILE", PROJECT_DIR / ".env"))
 # 仕様 §10: 無料枠で使える最も安いモデル。環境変数 QUIZMAP_MODEL か --model で切り替えられる。
 # 2026-10-19 に /models と料金表で確認: 最安の gemini-2.5-flash-lite は新規ユーザーに提供終了（404）、
 # 次に安い gemini-3.1-flash-lite（$0.25 / $1.50 per 1M tokens、無料枠あり）を既定にした
@@ -32,12 +36,18 @@ MIN_CALL_INTERVAL = float(os.environ.get("QUIZMAP_MIN_INTERVAL", "6"))
 MAX_RETRIES = 6
 OTHER_LABEL = "その他"  # 仕様 §3: 当てはまらない関係のためのラベル。常に 1 つ用意する
 
-LECTURE_RE = re.compile(r"第\s*(\d+)\s*回")
+# ファイル名から講義回を読む。上から順に試す（「2026A GEH032 … 第10回」の 2026 を拾わないよう、
+# 年度などの裸の数字は使わない）
+LECTURE_PATTERNS = [
+    re.compile(r"第\s*(\d+)\s*[回講]"),
+    re.compile(r"(?:week|wk|lecture|lect|lec|class|session|unit|chapter|ch)[\s_\-.]*0*(\d+)", re.I),
+    re.compile(r"(?:^|[\s_\-])0*(\d{1,2})(?:[\s_\-.]|$)"),
+]
 
 
 # ---------------------------------------------------------------- env / client
 
-def load_dotenv(path: Path = PROJECT_DIR / ".env") -> None:
+def load_dotenv(path: Path = ENV_FILE) -> None:
     """project/.env の KEY=VALUE を環境変数に入れる（既にある変数は上書きしない）。"""
     if not path.exists():
         return
@@ -108,8 +118,12 @@ class Lecture:
 
 
 def lecture_number_of(path: Path) -> int | None:
-    m = LECTURE_RE.search(unicodedata.normalize("NFKC", path.stem))
-    return int(m.group(1)) if m else None
+    name = unicodedata.normalize("NFKC", path.stem)
+    for pat in LECTURE_PATTERNS:
+        m = pat.search(name)
+        if m:
+            return int(m.group(1))
+    return None
 
 
 def find_lectures(pdf_dir: Path) -> tuple[list[Lecture], list[Path]]:
@@ -153,6 +167,14 @@ def load_lectures(pdf_dir: Path) -> tuple[list[Lecture], list[Path]]:
         print(f"[warn] 正規化で戻らなかった部首文字: {''.join(sorted(leftover))} "
               f"(quizmap/common.py の RADICAL_SUPPLEMENT_MAP に追加すること)", file=sys.stderr)
     return lectures, skipped
+
+
+def load_lecture_files(pairs: list[tuple[Path, int]]) -> list[Lecture]:
+    """(PDF のパス, 講義回) の組から Lecture を作り、ページを読む。アプリの取り込み画面用。"""
+    lectures = [Lecture(number=n, path=path) for path, n in sorted(pairs, key=lambda x: x[1])]
+    for lec in lectures:
+        lec.pages = extract_pages(lec.path)
+    return lectures
 
 
 def lecture_as_prompt_text(lec: Lecture) -> str:
