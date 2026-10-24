@@ -80,8 +80,19 @@ def llm(monkeypatch):
 
 
 def J(pair, origin, f="", t="", label="", lecture=0, page=0, wiki=0, evidence=""):
-    return {"pair": pair, "origin": origin, "from": f, "to": t, "label": label,
-            "lecture": lecture, "page": page, "wiki": wiki, "evidence": evidence}
+    """判定 1 件。origin で、資料の根拠（slide）か Wikipedia の根拠（external）の欄だけを埋める。"""
+    slide, ext = origin == "slide", origin == "external"
+    return {"pair": pair, "from": f, "to": t, "label": label if origin != "none" else "",
+            "slide_found": slide, "lecture": lecture if slide else 0, "page": page if slide else 0,
+            "slide_evidence": evidence if slide else "",
+            "external_found": ext, "wiki": wiki if ext else 0, "wiki_evidence": evidence if ext else ""}
+
+
+def JB(pair, f, t, label, lecture, page, slide_evidence, wiki, wiki_evidence):
+    """資料と Wikipedia の両方の根拠を書いた判定。"""
+    return {"pair": pair, "from": f, "to": t, "label": label,
+            "slide_found": True, "lecture": lecture, "page": page, "slide_evidence": slide_evidence,
+            "external_found": True, "wiki": wiki, "wiki_evidence": wiki_evidence}
 
 
 def pair_no(user, a, b):
@@ -228,7 +239,7 @@ def test_pair_records_for_evaluation(llm):
     bad = recs[("hei", "tei")]
     assert bad["result"] == "rejected" and bad["reason"] == "evidence が本文に無い"
     assert bad["pages"] == [{"lecture": 2, "page": 1, "score": 0.9, "via": "search"}]
-    assert bad["judgement"]["evidence"] == "無い文"
+    assert bad["judgement"]["slide_evidence"] == "無い文"
 
 
 def test_isolated_concepts_use_one_embedding_call(llm, monkeypatch):
@@ -269,3 +280,53 @@ def test_own_pages_excluded_after_search_many(llm):
     assert exclude == set() and k == extraction.COMPLETION_SEARCH_K + 1
     rec = {(r["a"], r["b"]): r for r in g["stats"]["completion"]["pairs"]}[("hei", "tei")]
     assert rec["pages"] == [{"lecture": 2, "page": 1, "score": 0.5, "via": "search"}]
+
+
+WIKI_KOUNO = {"甲野": {"title": "甲野", "url": "U甲野", "extract": "甲野は哲学者で、乙説を唱えたことで知られる。"}}
+
+
+def test_external_used_when_slide_evidence_fails(llm):
+    """資料の根拠が照合で落ちても、Wikipedia の根拠が通れば external で足す（#88）。"""
+    def answer(user):
+        return [JB(pair_no(user, "kouno", "otsu"), "kouno", "otsu", "提唱", 1, 1, "甲野は乙説を否定した",
+                   1, "甲野は哲学者で、乙説を唱えたことで知られる")]
+    llm["answer"] = answer
+    g = extraction.complete_relations(None, "m", VOCAB, graph(), PAGES, index=None, wiki=FakeWiki(WIKI_KOUNO),
+                                      log=lambda s: None)
+    rec = {(r["a"], r["b"]): r for r in g["stats"]["completion"]["pairs"]}[("kouno", "otsu")]
+    assert rec["result"] == "added" and rec["relation"]["origin"] == "external"
+    assert rec["relation"]["evidence_url"] == "U甲野"
+    assert rec["reason"] == "資料の根拠は通らなかった: evidence が本文に無い"
+    assert rec["judgement"]["origin"] == "slide" and rec["judgement"]["external_found"] is True
+
+
+def test_slide_preferred_when_both_pass(llm):
+    def answer(user):
+        return [JB(pair_no(user, "kouno", "otsu"), "kouno", "otsu", "提唱", 1, 1, "甲野は乙説を唱えた",
+                   1, "甲野は哲学者で、乙説を唱えたことで知られる")]
+    llm["answer"] = answer
+    g = extraction.complete_relations(None, "m", VOCAB, graph(), PAGES, index=None, wiki=FakeWiki(WIKI_KOUNO),
+                                      log=lambda s: None)
+    c = g["stats"]["completion"]
+    assert c["added_slide"] == 1 and c["added_external"] == 0
+
+
+def test_both_evidence_fail_records_both_reasons(llm):
+    def answer(user):
+        return [JB(pair_no(user, "kouno", "otsu"), "kouno", "otsu", "提唱", 1, 1, "無い文", 1, "記事に無い文")]
+    llm["answer"] = answer
+    g = extraction.complete_relations(None, "m", VOCAB, graph(), PAGES, index=None, wiki=FakeWiki(WIKI_KOUNO),
+                                      log=lambda s: None)
+    c = g["stats"]["completion"]
+    rec = {(r["a"], r["b"]): r for r in c["pairs"]}[("kouno", "otsu")]
+    assert rec["result"] == "rejected" and rec["reason"] == "evidence が本文に無い / evidence が記事に無い"
+    assert c["dropped"]["evidence が本文に無い"] == 1 and "evidence が記事に無い" not in c["dropped"]
+
+
+def test_prompt_asks_for_wikipedia_evidence_separately(llm):
+    extraction.complete_relations(None, "m", VOCAB, graph(), PAGES, index=None, wiki=FakeWiki(WIKI_KOUNO),
+                                  log=lambda s: None)
+    user = llm["users"][0]
+    assert "資料に明示が無くても" in user and "external_found" in user and "wiki_evidence" in user
+    props = extraction.COMPLETION_SCHEMA["properties"]["judgements"]["items"]["properties"]
+    assert "origin" not in props and {"slide_found", "external_found"} <= set(props)

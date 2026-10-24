@@ -426,7 +426,7 @@ def cited_work_labels(concepts: dict[str, dict], vocab: dict) -> list[str]:
 # 利用者が決めた方針: 地図の概念はアップロードした資料にあるものだけ。外部の資料（Wikipedia）は
 # 概念どうしの関係を確かめるためだけに使う。なので両端は既存の概念 id に限り、新しい概念は作らない。
 
-COMPLETION_SYSTEM = """あなたは大学の授業資料の概念どうしに、資料に書かれた関係、または百科事典で確かめられる関係があるかを判定する専門家です。
+COMPLETION_SYSTEM = """あなたは大学の授業資料の概念どうしに関係があるかを、資料のページと百科事典（Wikipedia）の記事の記述で確かめる専門家です。
 関係の両端には与えられた概念対の id だけを使い、関係ラベルには与えられたラベルだけを使います。"""
 
 COMPLETION_USER = """授業「{course}」の概念の対について、関係があるかを判定してください。
@@ -443,15 +443,17 @@ COMPLETION_USER = """授業「{course}」の概念の対について、関係が
 === 判定する概念の対 ===
 {pairs}
 
-各対について 1 件ずつ答える。守ること:
-- 根拠は次の順で探す。
-  1. 対に付けた資料のページに、二つの概念を結びつける記述があれば origin を "slide" にする。lecture と page にそのページを、evidence にその箇所をページ本文からそのまま 40 字以内で抜き出す
-  2. 資料に記述が無く、対に付けた Wikipedia の記事に二つの概念を結びつける記述があれば origin を "external" にする。wiki にその記事の番号を、evidence にその箇所を記事の本文からそのまま 60 字以内で抜き出す
-  3. どちらにも結びつける記述が無ければ origin を "none" にする
-- 同じページや同じ記事に二つの概念が出てくるだけでは関係にしない。一般知識から補わない
-- label は上のラベルの定義に従って選ぶ。どのラベルにも当てはまらなければ origin を "none" にする
-- from と to は対の 2 つの id。ラベルの定義が決める向きに従い、逆向きなら入れ替える。ほかの id は使わない
-- 使わない欄は、文字列なら空、数なら 0 にする
+各対について 1 件ずつ答える。資料の根拠と Wikipedia の根拠は、それぞれ別に探して、両方の欄に書く。
+- from・to・label: 二つの概念の関係を、上のラベルの定義で表す。from と to は対の 2 つの id で、ラベルの定義が決める向きに従う（逆向きなら入れ替える）。
+  ほかの id は使わず、新しい概念も作らない。関係が無い、またはどのラベルにも当てはまらなければ label を空にする
+- 資料の根拠: 対に付けた資料のページに、二つの概念を結びつける記述があれば slide_found を true にし、lecture と page にそのページを、
+  slide_evidence にその箇所をページ本文からそのまま 40 字以内で抜き出す
+- Wikipedia の根拠: 資料に明示が無くても、対に付けた Wikipedia の記事の本文に二つの概念を結びつける記述があれば、external_found を true にする。
+  wiki にその記事の番号を、wiki_evidence にその箇所を記事の本文からそのまま 80 字以内で抜き出す。
+  引用には、記事の題名でないほうの概念の名前が入っていること。資料の根拠があるときも、Wikipedia の根拠があれば書く
+- 判断の基準: 根拠にしてよいのは、資料のページか記事の本文にそのまま書かれた記述だけ（引用は必須）。あなた自身の知識だけで関係を決めない。
+  同じページや同じ記事に二つの名前が出てくるだけでは根拠にしない。二つの概念の間柄を述べた記述（一方を主語に、他方を目的語や補語にした文など）が要る
+- 使わない欄は、文字列なら空、数なら 0、真偽なら false にする
 """
 
 COMPLETION_SCHEMA = {
@@ -463,16 +465,19 @@ COMPLETION_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "pair": {"type": "integer"},
-                    "origin": {"type": "string", "enum": ["slide", "external", "none"]},
                     "from": {"type": "string"},
                     "to": {"type": "string"},
                     "label": {"type": "string"},
+                    "slide_found": {"type": "boolean"},
                     "lecture": {"type": "integer"},
                     "page": {"type": "integer"},
+                    "slide_evidence": {"type": "string"},
+                    "external_found": {"type": "boolean"},
                     "wiki": {"type": "integer"},
-                    "evidence": {"type": "string"},
+                    "wiki_evidence": {"type": "string"},
                 },
-                "required": ["pair", "origin", "from", "to", "label", "lecture", "page", "wiki", "evidence"],
+                "required": ["pair", "from", "to", "label", "slide_found", "lecture", "page", "slide_evidence",
+                             "external_found", "wiki", "wiki_evidence"],
                 "additionalProperties": False,
             },
         }
@@ -590,7 +595,9 @@ def complete_relations(client, model, vocab, graph, pages, index, wiki, log=prin
     照合は抽出と同じ規則（端の種類、evidence の本文照合）を通す。
     stats.completion.pairs に候補ごとの記録を残す（eval-protocol.md §7.5）:
       {"a", "b", "pages": [{"lecture", "page", "score", "via"}], "wiki": [{"term", "title", "url"}],
-       "judgement": LLM の答え（origin・label・from・to・lecture・page・wiki・evidence）, "result": "added" / "rejected" / "none" / "no_answer",
+       "judgement": LLM の答え（origin（slide_found・external_found から決めた主張）・label・from・to・
+                    slide_found・lecture・page・slide_evidence・external_found・wiki・wiki_evidence）,
+       "result": "added" / "rejected" / "none" / "no_answer",
        "reason": 落とした理由, "relation": 足した関係}
     index（SlideIndex）と wiki（Wiki）は None でもよい。そのときは使える層だけで判定する。
     """
@@ -672,12 +679,16 @@ def complete_relations(client, model, vocab, graph, pages, index, wiki, log=prin
             done.add(n)
             p = pairs[n]
             rec = pair_records[n]
-            rec["judgement"] = {k: j[k] for k in ("origin", "label", "from", "to", "lecture", "page", "wiki", "evidence")}
-            if j["origin"] == "none":
+            # 資料の根拠を先に、通らなければ Wikipedia の根拠を使う（#88。LLM には両方を別の欄に書かせる）
+            claimed = "slide" if j["slide_found"] else "external" if j["external_found"] else "none"
+            rec["judgement"] = {"origin": claimed, **{k: j[k] for k in (
+                "label", "from", "to", "slide_found", "lecture", "page", "slide_evidence",
+                "external_found", "wiki", "wiki_evidence")}}
+            f, t, label = j["from"].strip(), j["to"].strip(), j["label"].strip()
+            if claimed == "none" or not label:
                 dropped["関係なし"] += 1
                 rec["result"] = "none"
                 continue
-            f, t, label = j["from"].strip(), j["to"].strip(), j["label"].strip()
             if {f, t} != {p["a"], p["b"]}:
                 reject("対に無い id")
                 continue
@@ -692,35 +703,36 @@ def complete_relations(client, model, vocab, graph, pages, index, wiki, log=prin
                 adjusted["向きを直した"] += 1
             ends = [concepts[f]["label"], concepts[t]["label"]]
             rel = {"from": f, "to": t, "label": label}
-            if j["origin"] == "slide":
+            reasons = []
+            if j["slide_found"]:
                 page = (j["lecture"], j["page"])
-                if page not in p["pages"]:
-                    reject("対に付けていないページ")
-                    continue
-                reason = check_evidence(j["evidence"], ends, page_text[page])
+                reason = "対に付けていないページ" if page not in p["pages"] else \
+                    check_evidence(j["slide_evidence"], ends, page_text[page])
                 if reason:
-                    reject(reason)
-                    continue
-                rel.update(source={"lecture": page[0], "page": page[1]}, origin="slide",
-                           evidence=j["evidence"].strip())
-            else:
-                if not 1 <= j["wiki"] <= len(wiki_ids):
-                    reject("記事の番号が無い")
-                    continue
-                cid = wiki_ids[j["wiki"] - 1]
-                if cid not in (f, t):
-                    reject("対に付けていない記事")
-                    continue
-                article = articles[cid]
-                reason = check_external_evidence(j["evidence"], ends, article)
+                    reasons.append(reason)
+                else:
+                    rel.update(source={"lecture": page[0], "page": page[1]}, origin="slide",
+                               evidence=j["slide_evidence"].strip())
+            if "origin" not in rel and j["external_found"]:
+                cid = wiki_ids[j["wiki"] - 1] if 1 <= j["wiki"] <= len(wiki_ids) else None
+                reason = ("記事の番号が無い" if cid is None else "対に付けていない記事" if cid not in (f, t)
+                          else check_external_evidence(j["wiki_evidence"], ends, articles[cid]))
                 if reason:
-                    reject(reason)
-                    continue
-                shared = sorted(_pages_of(concepts[f]) & _pages_of(concepts[t]))
-                lec, pg = (shared or p["pages"])[0]
-                rel.update(source={"lecture": lec, "page": pg}, origin="external",
-                           evidence=j["evidence"].strip(), evidence_url=article.get("url", ""),
-                           evidence_title=article.get("title", ""))
+                    reasons.append(reason)
+                else:
+                    article = articles[cid]
+                    shared = sorted(_pages_of(concepts[f]) & _pages_of(concepts[t]))
+                    lec, pg = (shared or p["pages"])[0]
+                    rel.update(source={"lecture": lec, "page": pg}, origin="external",
+                               evidence=j["wiki_evidence"].strip(), evidence_url=article.get("url", ""),
+                               evidence_title=article.get("title", ""))
+            if "origin" not in rel:
+                reject(reasons[0])                      # dropped には 1 対 1 件で数える（最初の理由）
+                if len(reasons) > 1:
+                    rec["reason"] = " / ".join(reasons)
+                continue
+            if reasons:
+                rec["reason"] = "資料の根拠は通らなかった: " + reasons[0]
             rel["added_by"] = "completion"
             added.append(rel)
             rec.update(result="added", relation=rel)
