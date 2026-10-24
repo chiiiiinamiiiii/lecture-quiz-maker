@@ -13,6 +13,7 @@ import unicodedata
 from collections import Counter
 
 from quizmap.common import OTHER_LABEL, call_json
+from quizmap.vocab import language_of, language_rule
 
 ASPECT_RATIO = {"relation": 4, "example": 3, "definition": 3}   # 仕様 §7 の目安
 
@@ -92,9 +93,9 @@ VERIFY_SCHEMA = {
 }
 
 GEN_SYSTEM = """あなたは大学の授業資料から学習用のクイズを作る専門家です。
-資料に書かれていることだけを根拠にし、一般知識で補わないでください。出力は日本語です。"""
+資料に書かれていることだけを根拠にし、一般知識で補わないでください。{language_rule}"""
 
-VERIFY_SYSTEM = """あなたは作成済みのクイズを点検する専門家です。資料に書かれていることだけを根拠に判断します。出力は日本語です。"""
+VERIFY_SYSTEM = """あなたは作成済みのクイズを点検する専門家です。資料に書かれていることだけを根拠に判断します。{language_rule}"""
 
 
 # ------------------------------------------------------------------ 材料の組み立て
@@ -472,13 +473,14 @@ def generate_quiz(client, model: str, graph: dict, vocab: dict, pages: list[dict
     materials = materials_text(concepts, selected, inner, neighbors, needed, page_text, styles)
 
     # (1) 生成
-    gen = call_json(client, model=model, system=GEN_SYSTEM, schema=GEN_SCHEMA,
+    lang = language_of(vocab, (p["text"] for p in pages))
+    gen = call_json(client, model=model, system=GEN_SYSTEM.replace("{language_rule}", language_rule(lang)), schema=GEN_SCHEMA,
                     user=gen_user(materials, n, counts, n_short))
     calls += 1
     questions = gen["questions"][:n]
 
     # (2) 誤答の自己確認
-    ver = call_json(client, model=model, system=VERIFY_SYSTEM, schema=VERIFY_SCHEMA,
+    ver = call_json(client, model=model, system=VERIFY_SYSTEM.replace("{language_rule}", language_rule(lang)), schema=VERIFY_SCHEMA,
                     user=verify_user(questions, materials))
     calls += 1
     verified = ver["questions"]
@@ -524,6 +526,7 @@ def generate_quiz(client, model: str, graph: dict, vocab: dict, pages: list[dict
     meta = {
         "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
         "model": model,
+        "language": lang,
         "n_requested": n,
         "n_generated": len(final),
         "aspect_plan": counts,
