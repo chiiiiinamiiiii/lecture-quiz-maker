@@ -249,3 +249,50 @@ def test_wiki_uses_language_and_keeps_other_language_cache(tmp_path, fake_wiki):
 def test_wiki_empty_term(tmp_path, fake_wiki):
     assert rag.Wiki(tmp_path, "ja").lookup("  ") is None
     assert fake_wiki == []
+
+
+# ---------------------------------------------------------------- search_many (#84)
+
+def test_search_many_embeds_all_queries_in_one_call(client, fake_embed_api):
+    index = rag.SlideIndex.build(client, PAGES)
+    before = len(fake_embed_api)
+    queries = ["定言命法と義務", "功利主義", "アリストテレスの徳", "功利主義"]
+    results = index.search_many(client, queries, k=2)
+    assert len(fake_embed_api) == before + 1                 # N 件でも HTTP は 1 回
+    sent = [r["content"]["parts"][0]["text"] for r in fake_embed_api[-1]["body"]["requests"]]
+    assert sent == ["定言命法と義務", "功利主義", "アリストテレスの徳"]   # 重複は 1 回だけ送る
+    assert all(r["taskType"] == "RETRIEVAL_QUERY" for r in fake_embed_api[-1]["body"]["requests"])
+    assert len(results) == 4 and results[1] == results[3]
+    # 1 件ずつ search した結果と同じ（キャッシュが埋まっているので search は API を呼ばない）
+    assert results == [index.search(client, q, k=2) for q in queries]
+    assert len(fake_embed_api) == before + 1
+
+
+def test_search_many_reuses_cache_from_search(client, fake_embed_api):
+    index = rag.SlideIndex.build(client, PAGES)
+    index.search(client, "徳", k=1)
+    before = len(fake_embed_api)
+    index.search_many(client, ["徳", "義務"], k=1)
+    assert len(fake_embed_api) == before + 1
+    assert [r["content"]["parts"][0]["text"] for r in fake_embed_api[-1]["body"]["requests"]] == ["義務"]
+    index.search_many(client, ["徳", "義務"], k=1)
+    assert len(fake_embed_api) == before + 1                 # 全部キャッシュにあれば呼ばない
+
+
+def test_search_many_batches_by_100(client, fake_embed_api):
+    index = rag.SlideIndex.build(client, PAGES)
+    before = len(fake_embed_api)
+    results = index.search_many(client, [f"問い{i}" for i in range(150)], k=1)
+    assert [len(c["body"]["requests"]) for c in fake_embed_api[before:]] == [100, 50]
+    assert len(results) == 150
+
+
+def test_search_many_exclude_blank_and_empty_index(client, fake_embed_api):
+    index = rag.SlideIndex.build(client, PAGES)
+    res = index.search_many(client, ["定言命法と義務", "  "], k=10, exclude={(1, 2)})
+    assert res[1] == []
+    assert (1, 2) not in [(h["lecture"], h["page"]) for h in res[0]]
+    before = len(fake_embed_api)
+    assert rag.SlideIndex.build(client, []).search_many(client, ["a", "b"]) == [[], []]
+    assert index.search_many(client, []) == []
+    assert len(fake_embed_api) == before
