@@ -93,3 +93,14 @@ def test_ingest_page_in_english(page, data_dir, tmp_path):
     assert "already in the list" in page.locator("[data-testid='stToast']").first.inner_text()
     files = _files(course)
     assert files[NAME]["lecture"] == 40 and files[NAME]["use"] is True
+
+
+def test_rag_phase_labels():
+    """取り込みの「索引づくり」「関係の補完」の段階名が日英で出る（#78）。"""
+    import streamlit as st
+    from ui.ingest_view import _phase_label
+    for lang, idx, comp in (("ja", "索引づくり", "関係の補完"), ("en", "Building the search index", "Completing relations")):
+        st.session_state["lang"] = lang
+        assert _phase_label("index") == idx
+        assert _phase_label("completion") == comp
+    st.session_state["lang"] = "ja"
