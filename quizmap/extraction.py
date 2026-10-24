@@ -207,6 +207,16 @@ def check_evidence(evidence: str, end_labels: list[str], page_text: str) -> str 
     return None
 
 
+def evidence_rank(evidence: str, end_labels: list[str], page_text: str) -> tuple[int, int]:
+    """同じ対で同点のときに使う、根拠の確かさ（Issue #11・#12）。大きいほど確か。
+
+    (evidence に出てくる端の概念名の数, ページ本文に出てくる端の概念名の数)。どちらも 0〜2。
+    """
+    page, evidence = _squash(page_text), _squash(evidence)
+    heads = [h for h in (_label_head(l) for l in end_labels) if h]
+    return sum(h in evidence for h in heads), sum(h in page for h in heads)
+
+
 def extract_relations(client, model: str, course: str, vocab: dict, lectures: list[Lecture],
                       concepts: dict[str, dict], workers: int, log=print) -> tuple[list[dict], dict]:
     """概念 id を固定して、回ごとに関係を出させる（回は独立なので並列）。"""
@@ -246,14 +256,15 @@ def extract_relations(client, model: str, course: str, vocab: dict, lectures: li
                     dropped["ページ番号が範囲外"] += 1
                     continue
                 page = r["page"]
-                reason = check_evidence(r.get("evidence", ""), [concepts[f]["label"], concepts[t]["label"]],
-                                        lec.pages[page - 1])
+                ends = [concepts[f]["label"], concepts[t]["label"]]
+                reason = check_evidence(r.get("evidence", ""), ends, lec.pages[page - 1])
                 if reason:
                     dropped[reason] += 1
                     continue
-                # evidence は検証に使うだけで保存しない（講義資料の本文を graph.json に増やさない）
+                # evidence は検証と同点の判定に使うだけで保存しない（講義資料の本文を graph.json に増やさない）
                 candidates.append({"from": f, "to": t, "label": label,
-                                   "source": {"lecture": lec.number, "page": page}})
+                                   "source": {"lecture": lec.number, "page": page},
+                                   "_rank": evidence_rank(r.get("evidence", ""), ends, lec.pages[page - 1])})
                 kept += 1
             log(f"関係 第{lec.number}回: {len(data['relations'])} 件 → 候補 {kept}")
     relations, merged = resolve_pair_conflicts(candidates)
@@ -272,16 +283,20 @@ def resolve_pair_conflicts(candidates: list[dict]) -> tuple[list[dict], collecti
        「その他」も同じように比べる。語彙に合うラベルが無いときは「その他」が正しいことがあるため
     2. そのラベルが両向きにあれば、支持数の多い向きを残す
        （対立のように向きの無いラベルでも、両向きは同じ関係の重複なので 1 本にしてよい）
-    同点は先に出たもの（若い回）を残す。残した関係の source は、その (from, to, label) が最初に出た箇所。
+    支持数が同点なら、根拠の確かさ（候補の "_rank"。evidence_rank の値）の大きいものを残す。
+    それも同点なら先に出たもの（若い回）を残す。残した関係の source は、その (from, to, label) が最初に出た箇所。
     candidates は出現順に並んでいること。完全に同じ (from, to, label) も支持数として数える。
+    "_rank" は判定に使うだけで、戻り値には残さない。
     """
     dropped = collections.Counter()
     first: dict[tuple, dict] = {}                     # (from, to, label) -> 最初に出た関係
     support = collections.Counter()                   # (from, to, label) -> 出た回数
     order: dict[tuple, int] = {}                      # (from, to, label) -> 最初に出た位置
+    rank: dict[tuple, tuple] = {}                     # (from, to, label) -> 根拠の確かさの最大
     for i, r in enumerate(candidates):
         key = (r["from"], r["to"], r["label"])
         support[key] += 1
+        rank[key] = max(rank.get(key, ()), tuple(r.get("_rank", ())))
         if key not in first:
             first[key], order[key] = r, i
         else:
@@ -296,17 +311,21 @@ def resolve_pair_conflicts(candidates: list[dict]) -> tuple[list[dict], collecti
         if len(keys) > 1:
             label_support = collections.Counter()
             label_order: dict[str, int] = {}
+            label_rank: dict[str, tuple] = {}
             for k in keys:
                 label_support[k[2]] += support[k]
                 label_order[k[2]] = min(label_order.get(k[2], order[k]), order[k])
-            best_label = min(label_support, key=lambda l: (-label_support[l], label_order[l]))
-            best = min((k for k in keys if k[2] == best_label), key=lambda k: (-support[k], order[k]))
+                label_rank[k[2]] = max(label_rank.get(k[2], ()), rank[k])
+            # 支持数の多い順 → 根拠の確かな順 → 先に出た順。rank は大きいほうを先にするので符号を反転して比べる
+            best_label = min(label_support, key=lambda l: (-label_support[l], [-x for x in label_rank[l]], label_order[l]))
+            best = min((k for k in keys if k[2] == best_label),
+                       key=lambda k: (-support[k], [-x for x in rank[k]], order[k]))
             dropped["同じ対の食い違い"] += len(keys) - 1
             keys = [best]
         kept.append(keys[0])
 
     kept.sort(key=order.__getitem__)
-    return [dict(first[k]) for k in kept], dropped
+    return [{k2: v for k2, v in first[k].items() if k2 != "_rank"} for k in kept], dropped
 
 
 # ------------------------------------------------------------------ 画像
