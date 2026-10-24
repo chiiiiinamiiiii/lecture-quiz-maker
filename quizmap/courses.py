@@ -12,6 +12,7 @@
         job.json         直近の取り込み処理の状態（アプリを再起動しても結果が分かるように）
         rag_index.json   RAG のスライド索引（quizmap.rag.SlideIndex。QUIZMAP_RAG=off なら作らない）
         wiki_cache.json  Wikipedia の検索結果のキャッシュ（quizmap.rag.Wiki）
+        graph_before_completion.json  関係の補完の前の graph（補完の前後を比べるため。RAG ありのときだけ）
 
 取り込み処理は数分かかり、API 呼び出しも数十回あるので、別スレッドで走らせて進捗を Job に書く。
 画面はそれを定期的に読みに行くだけにする（Streamlit の再実行で処理が中断されないように）。
@@ -357,6 +358,7 @@ def _extract_with_rag(job: Job, d: Path, client, model: str, vocab: dict, lectur
 
     graph = extraction.run_extraction(client, model, vocab, lectures, d, slides=False,
                                       log=job.add, step=job.set_phase)
+    write_json(d / "graph_before_completion.json", graph)     # 補完の前後を比べるため（出力評価）
 
     job.set_phase("completion")
     if index is None:

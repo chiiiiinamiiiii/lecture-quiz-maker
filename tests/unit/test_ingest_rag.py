@@ -7,7 +7,9 @@ quizmap.rag（RAG 担当）と extraction.complete_relations（プロンプト�
 - 補完の結果が graph.json になる
 - 索引・補完の失敗では取り込みは止まらず、抽出だけの地図が残る
 - QUIZMAP_RAG=off なら今まで通り（rag を使わない）
+- 補完の前の graph を graph_before_completion.json に残す
 - open_rag: 索引と Wiki を開く。言語は vocab の meta.language
+- 本物の quizmap.rag（埋め込みだけ差し替え）でも、取り込み → open_rag がつながる
 """
 from __future__ import annotations
 
@@ -180,6 +182,8 @@ def test_completion_gets_extracted_graph_and_result_is_saved(rag_fakes):
     assert saved["stats"]["completion"]["external"] == 1
     assert saved["course"] == "Natural Language Processing"               # 授業名は利用者のもの
     assert rag_fakes["slides_kw"] is False                                # スライド画像は補完の後に作る
+    before = read_json(d / "graph_before_completion.json")
+    assert [r.get("origin") for r in before["relations"]] == [None]       # 補完の前の graph
 
 
 def test_index_failure_skips_completion_but_ingest_finishes(rag_fakes):
@@ -191,6 +195,7 @@ def test_index_failure_skips_completion_but_ingest_finishes(rag_fakes):
     assert not (d / "rag_index.json").exists()
     assert any("索引を作れなかった" in m for m in job.log)
     assert len(read_json(d / "graph.json")["relations"]) == 1
+    assert read_json(d / "graph_before_completion.json")["relations"] == read_json(d / "graph.json")["relations"]
 
 
 def test_completion_failure_keeps_extracted_graph(rag_fakes):
@@ -215,6 +220,7 @@ def test_rag_off_is_previous_behaviour(rag_fakes, monkeypatch, value):
     assert rag_fakes["slides_kw"] is True
     assert "index" not in _phases(job) and "completion" not in _phases(job)
     assert not (d / "rag_index.json").exists()
+    assert not (d / "graph_before_completion.json").exists()
 
 
 @pytest.mark.parametrize("value,expected", [(None, True), ("on", True), ("1", True), ("off", False)])
@@ -256,3 +262,52 @@ def test_open_rag_off(rag_fakes, monkeypatch):
     monkeypatch.setenv("QUIZMAP_RAG", "off")
     d = _course()
     assert courses.open_rag(d) == (None, None)
+
+
+# ------------------------------------------------------------------ 本物の quizmap.rag
+
+@pytest.fixture
+def real_rag(rag_fakes, monkeypatch):
+    """偽の rag を外し、本物の quizmap.rag を使う。埋め込み（HTTP）だけ差し替える。"""
+    import importlib
+    import quizmap
+
+    monkeypatch.delitem(sys.modules, "quizmap.rag", raising=False)
+    rag = importlib.import_module("quizmap.rag")
+    monkeypatch.setattr(quizmap, "rag", rag, raising=False)
+
+    def fake_embed(client, texts, task="RETRIEVAL_DOCUMENT"):
+        return [[float(len(t) % 7 + 1), float(i + 1), 1.0] for i, t in enumerate(texts)]
+
+    monkeypatch.setattr(rag, "embed", fake_embed)
+    return rag
+
+
+def test_real_rag_ingest_then_open(real_rag, rag_fakes):
+    d = _course()
+    job = _run(d)
+    assert job.status == "done", job.log
+    assert rag_fakes["order"] == ["extract", "complete", "render"]
+    index, wiki = courses.open_rag(d)
+    assert isinstance(index, real_rag.SlideIndex) and len(index) == 4
+    assert [(p["lecture"], p["page"]) for p in index.pages] == [(1, 1), (1, 2), (2, 1), (2, 2)]
+    assert isinstance(wiki, real_rag.Wiki) and wiki.lang == "en"
+    _, _, idx, w = rag_fakes["complete_args"]
+    assert isinstance(idx, real_rag.SlideIndex) and isinstance(w, real_rag.Wiki)
+
+
+def test_real_rag_broken_index_opens_as_none(real_rag, rag_fakes):
+    d = _course()
+    _run(d)
+    (d / "rag_index.json").write_text("{\"model\": \"gemini-embedding-001\"}", encoding="utf-8")
+    index, wiki = courses.open_rag(d)
+    assert index is None and wiki is not None
+
+
+def test_real_rag_other_embed_model_opens_as_none(real_rag, rag_fakes):
+    d = _course()
+    _run(d)
+    data = read_json(d / "rag_index.json")
+    data["model"] = "some-other-embedding"
+    write_json(d / "rag_index.json", data)
+    assert courses.open_rag(d)[0] is None
