@@ -11,7 +11,7 @@
 //   点のクリック … その点を選択（同じ修飾キーの規則）。何もない所のクリックでは選択は変わらない
 //   ダブルクリック … 拡大だけ（選択は変えない）
 //   講義回ボタン … その回に出てくる概念を選択（同じ修飾キーの規則）
-//   H / L / M … 手のひら / 投げ縄 / 矩形、0 … 全体表示、Esc … 選択を解除
+//   H / L / M … 手のひら（最初のツール）/ 投げ縄 / 矩形、0 … 全体表示、Esc … 選択を解除
 
 const CLICK_DELAY = 250;   // 点のクリックを反映するまで待つ時間（ms）。この間のダブルクリックは拡大だけにする
 
@@ -71,7 +71,7 @@ class MapApp {
     this.canvas = root.querySelector("canvas");
     this.ctx = this.canvas.getContext("2d");
     this.tooltip = root.querySelector(".qm-tooltip");
-    this.tool = "lasso";
+    this.tool = "hand";          // 開いた直後はドラッグで移動（Google Map と同じ。#47）
     this.layout = "force";
     this.view = null;               // {scale, tx, ty}
     this.selected = new Set();
