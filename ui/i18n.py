@@ -69,7 +69,7 @@ TEXTS = {
     "generate": {"ja": "クイズを作る", "en": "Generate quiz"},
     "generating": {"ja": "問題を作っています（作成 → 誤答の自己確認）…", "en": "Generating (draft → self-check of distractors)…"},
     "gen_failed": {"ja": "問題を作れませんでした: {e}", "en": "Could not generate questions: {e}"},
-    "quiz_meta": {"ja": "{n} 問 ・ 誤答の差し替え {r} 件 ・ {s} 秒", "en": "{n} questions · {r} distractors replaced · {s}s"},
+    "quiz_meta": {"ja": "{n} 問", "en": "{n} questions"},
     "q_label": {"ja": "問 {i}", "en": "Q{i}"},
     "answer_short": {"ja": "解答（記述）", "en": "Your answer"},
     "answer_placeholder": {"ja": "ここに答えを書く", "en": "Type your answer"},

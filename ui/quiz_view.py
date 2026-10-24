@@ -25,7 +25,7 @@ def quiz_section(graph, vocab, ids: list[str]) -> None:
         return
 
     m = result["meta"]
-    st.caption(t("quiz_meta", n=m["n_generated"], r=m["distractors_replaced"], s=m["seconds"]))
+    st.caption(t("quiz_meta", n=m["n_generated"]))
     # 自動検証の警告（誤答の差し替えなど）は学習者向けではないので画面に出さない。生成結果の JSON には残る
     questions = result["questions"]
     if "graded" in st.session_state:
