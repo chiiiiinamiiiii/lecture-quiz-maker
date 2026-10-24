@@ -47,6 +47,8 @@ Tests (no API calls): `.venv/bin/pip install -r requirements-dev.txt && .venv/bi
 | Question writing | Question text and four choices, following each relation's `question_style` | — |
 | Distractor self-check | Whether each wrong choice is really wrong according to the slides | Prevents “distractor that is actually correct” |
 | Short-answer grading | 1 / 0.5 / 0 with feedback (LLM-as-judge) | Free-text answers |
+| Relation completion (RAG) | Whether two concepts that the slides leave unconnected are related, backed by a slide passage or a Wikipedia passage | Slides often skip steps between ideas |
+| Answer verification (RAG) | Whether the answer follows from the slides, and whether another choice is also correct in general knowledge | A question can have one answer within the slides but two in reality |
 
 Only the map drawing and the selection are plain code.
 
@@ -72,6 +74,8 @@ Only the map drawing and the selection are plain code.
 
 **Output follows the language of the material.** The app detects whether the slides are Japanese or English and asks the model to write the vocabulary, concepts, questions and explanations in that language. The interface language is a separate setting.
 
+**Retrieval (RAG) checks relations and answers, but never adds words to the map.** The rules were set by the user: every concept on the map must appear in the uploaded material; outside sources may only be used to check relations between those concepts and to check that a question has one correct answer; and every answer must follow from the uploaded material. During import, all slide pages are embedded (`gemini-embedding-001`) into a per-course index. A completion step then looks at concepts left without relations and at concepts that share a slide but have no relation. For each pair it retrieves related slide pages and the Wikipedia introductions of both concepts, and asks the model whether a relation from the course vocabulary holds. A relation backed by a slide quote is added as a normal relation; one backed only by Wikipedia is added as an *external* relation, drawn dashed on the map with its source. External relations are never used as material for questions. After questions are generated, a verification step retrieves slide pages and Wikipedia introductions for the answer and every choice, removes questions whose answer cannot be traced to a slide, and replaces or removes choices that would also be correct. Every retrieval and decision is logged, so retrieval errors and generation errors can be told apart. The design is in `docs/rag-design.md`.
+
 **Display density is not extraction depth.** The map can show fewer dots, but it never deletes extracted data. How many concepts are extracted at all is decided at extraction time and depends on the model and the number of calls (see Known limitations).
 
 **Map component.** The first map used Plotly. Streamlit resets a Plotly chart's selection whenever the figure changes, so keeping a lasso selection, lecture-button selection and the current zoom alive required layers of browser-side workarounds that broke repeatedly. The map is now a small canvas component (Streamlit components v2) that keeps its view and selection in the browser and only reports the selection back to Python.
@@ -80,7 +84,7 @@ Only the map drawing and the selection are plain code.
 
 **Development:** Claude Code (harness) with Claude Fable 5.1 and Claude Opus 5.5 (models). Development ran as a team of Claude Code sessions: one coordinator and five roles (UI reviewer, UI improver, output reviewer, prompt improver, feature developer), each in its own git worktree and terminal, coordinated through GitHub issues and pull requests. Reviewers never fix and fixers never judge their own fixes. See `CLAUDE.md` and `.claude/agents/`.
 
-**Inside the app:** `gemini-3.1-flash-lite` through the Google AI Studio free tier. The work is structured extraction, not hard reasoning, so the cheapest model that does the job was chosen, following the course principle. I listed the available models with the API before choosing: the cheapest free-tier model, `gemini-2.5-flash-lite`, is no longer offered to new users, so the next cheapest was used. The model name is a setting (`QUIZMAP_MODEL`) so other models can be compared. All calls use JSON-schema structured output, wait between calls, and back off on HTTP 429.
+**Inside the app:** `gemini-3.1-flash-lite` for generation and `gemini-embedding-001` for the retrieval index, through the Google AI Studio free tier. The work is structured extraction, not hard reasoning, so the cheapest model that does the job was chosen, following the course principle. I listed the available models with the API before choosing: the cheapest free-tier model, `gemini-2.5-flash-lite`, is no longer offered to new users, so the next cheapest was used. The model name is a setting (`QUIZMAP_MODEL`) so other models can be compared. All calls use JSON-schema structured output, wait between calls, and back off on HTTP 429.
 
 | Operation | API calls | Time |
 |---|---|---|
