@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import collections
 import datetime as dt
+import os
 import re
 import shutil
 import subprocess
@@ -232,6 +233,12 @@ def _direction_text(rel: dict) -> str:
     return f"【向き: from は {'・'.join(f) or '指定なし'}、to は {'・'.join(t) or '指定なし'}】"
 
 
+# 端の種類が合わない関係の扱い（#49）。"other" はラベルを「その他」にして残す、"drop" は関係を落とす。
+# 2 つを比べるために切り替えられるようにしている。run_extraction の引数で渡すか、環境変数で既定を変える
+END_KIND_MISMATCH_POLICIES = ("other", "drop")
+END_KIND_MISMATCH_DEFAULT = os.environ.get("QUIZMAP_END_KIND_MISMATCH", "other")
+
+
 def check_end_kinds(f: str, t: str, label: str, concepts: dict[str, dict],
                     rel_by_label: dict[str, dict]) -> tuple[str, str, str, str | None]:
     """関係の両端の概念の種類が、ラベルの from_kinds・to_kinds に合うか（Issue #49）。LLM は呼ばない。
@@ -256,8 +263,15 @@ def check_end_kinds(f: str, t: str, label: str, concepts: dict[str, dict],
 
 
 def extract_relations(client, model: str, course: str, vocab: dict, lectures: list[Lecture],
-                      concepts: dict[str, dict], workers: int, log=print) -> tuple[list[dict], dict, dict]:
-    """概念 id を固定して、回ごとに関係を出させる（回は独立なので並列）。"""
+                      concepts: dict[str, dict], workers: int, log=print,
+                      end_kind_mismatch: str = END_KIND_MISMATCH_DEFAULT) -> tuple[list[dict], dict, dict]:
+    """概念 id を固定して、回ごとに関係を出させる（回は独立なので並列）。
+
+    end_kind_mismatch: 両端の種類がラベルの from_kinds・to_kinds に合わない関係の扱い。
+      "other" = ラベルを「その他」にして残す / "drop" = 落とす（#49）
+    """
+    if end_kind_mismatch not in END_KIND_MISMATCH_POLICIES:
+        raise ValueError(f"end_kind_mismatch は {END_KIND_MISMATCH_POLICIES} のどれか: {end_kind_mismatch!r}")
     labels = {r["label"] for r in vocab["relations"]} | {OTHER_LABEL}
     rel_by_label = {r["label"]: r for r in vocab["relations"]}
     adjusted = collections.Counter()      # 落とさずに直した数（dropped とは別に数える）
@@ -295,6 +309,9 @@ def extract_relations(client, model: str, course: str, vocab: dict, lectures: li
                 f, t, label, fix = check_end_kinds(f, t, label, concepts, rel_by_label)
                 if fix == "swapped":
                     adjusted["向きを直した"] += 1
+                elif fix == "other" and end_kind_mismatch == "drop":
+                    dropped["端の種類が合わない"] += 1
+                    continue
                 elif fix == "other":
                     dropped["端の種類が合わない→その他"] += 1
                 if not 1 <= r["page"] <= lec.page_count:
@@ -316,9 +333,9 @@ def extract_relations(client, model: str, course: str, vocab: dict, lectures: li
     dropped.update(merged)
     log("同じ概念対の整理: " + (", ".join(f"{k} {v}" for k, v in merged.items()) or "なし")
         + f" → 関係 {len(relations)}")
-    if adjusted or dropped.get("端の種類が合わない→その他"):
-        log(f"端の種類の照合: 向きを直した {adjusted['向きを直した']}、"
-            f"合わないので「その他」にした {dropped.get('端の種類が合わない→その他', 0)}")
+    if adjusted or dropped.get("端の種類が合わない→その他") or dropped.get("端の種類が合わない"):
+        log(f"端の種類の照合（{end_kind_mismatch}）: 向きを直した {adjusted['向きを直した']}、"
+            f"「その他」にした {dropped.get('端の種類が合わない→その他', 0)}、落とした {dropped.get('端の種類が合わない', 0)}")
     return relations, dict(dropped), dict(adjusted)
 
 
@@ -397,7 +414,7 @@ def render_slides(lectures: list[Lecture], slides_dir: Path, dpi: int) -> int:
 
 def run_extraction(client, model: str, vocab: dict, lectures: list[Lecture], out_dir: Path,
                    workers: int = 4, dpi: int = 80, slides: bool = True, log=print,
-                   step=lambda name: None) -> dict:
+                   step=lambda name: None, end_kind_mismatch: str = END_KIND_MISMATCH_DEFAULT) -> dict:
     """抽出して out_dir に pages.json / graph.json / slides/ を書き、graph を返す。"""
     course = vocab.get("course", "")
     total_pages = sum(l.page_count for l in lectures)
@@ -409,7 +426,8 @@ def run_extraction(client, model: str, vocab: dict, lectures: list[Lecture], out
     step("concepts")
     concepts, unmatched_kind = extract_concepts(client, model, course, vocab, lectures, log=log)
     step("relations")
-    relations, dropped, adjusted = extract_relations(client, model, course, vocab, lectures, concepts, workers, log=log)
+    relations, dropped, adjusted = extract_relations(client, model, course, vocab, lectures, concepts, workers, log=log,
+                                                     end_kind_mismatch=end_kind_mismatch)
     if slides:
         step("slides")
         n_imgs = render_slides(lectures, out_dir / "slides", dpi)
@@ -436,6 +454,7 @@ def run_extraction(client, model: str, vocab: dict, lectures: list[Lecture], out
         "concepts_by_kind": dict(kind_counts.most_common()),
         "dropped": dropped,
         "adjusted": adjusted,
+        "end_kind_mismatch": end_kind_mismatch,
         "model": model,
         "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
     }
