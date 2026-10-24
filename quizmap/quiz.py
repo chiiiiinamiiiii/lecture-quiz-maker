@@ -25,6 +25,12 @@ QUESTION_PROPS = {
     "answer_text": {"type": "string"},
     "explanation": {"type": "string"},
     "concept_labels": {"type": "array", "items": {"type": "string"}},
+    "relation_used": {
+        "type": "object",
+        "properties": {"from": {"type": "string"}, "to": {"type": "string"}, "label": {"type": "string"}},
+        "required": ["from", "to", "label"],
+        "additionalProperties": False,
+    },
     "sources": {
         "type": "array",
         "items": {
@@ -36,7 +42,7 @@ QUESTION_PROPS = {
     },
 }
 QUESTION_REQUIRED = ["id", "type", "aspect", "prompt", "choices", "answer", "answer_text",
-                     "explanation", "concept_labels", "sources"]
+                     "explanation", "concept_labels", "relation_used", "sources"]
 
 GEN_SCHEMA = {
     "type": "object",
@@ -143,8 +149,11 @@ def materials_text(concepts, selected, inner, neighbors, needed, page_text, styl
         parts.append(f"- 「{c['label']}」（{c['kind']}）: {c['definition']} [{src}]")
     parts.append("\n## 出題範囲の概念どうしの関係（関係を問う問題はここから作る）")
     if inner:
+        definition = {v["label"]: v["definition"] for v in styles}
         for r in inner:
-            parts.append(f"- {concepts[r['from']]['label']} —{r['label']}→ {concepts[r['to']]['label']}"
+            a, b = concepts[r["from"]]["label"], concepts[r["to"]]["label"]
+            # 向きを言葉にする（#32）。ラベルの定義に from / to の説明があればそれで A・B のどちらが何かが決まる
+            parts.append(f"- {a} —{r['label']}→ {b}（from は「{a}」、to は「{b}」。{r['label']}の意味: {definition.get(r['label'], '')}）"
                          f" [第{r['source']['lecture']}回p.{r['source']['page']}]")
     else:
         parts.append("- （なし）")
@@ -171,6 +180,8 @@ def gen_user(materials: str, n: int, counts: dict[str, int], n_short: int) -> st
 
 守ること:
 - 関係を問う問題は「関係ラベルごとの問い方」に沿って問う。問い方はそこに書かれたものだけを使う
+- 関係を問う問題では、材料の関係の from と to を入れ替えない。問い方の A・B がどちらに当たるかは、関係の行の括弧の説明で決める
+- relation_used には、関係を問う問題で根拠にした関係の行の from・to・label を、概念の表記そのままで書く。関係を問う問題でなければ 3 つとも空文字列にする
 - 具体例を問う問題は、資料に出てくる具体例と概念の対応を問う
 - 定義を問う問題は、資料の記述に基づく定義を問う
 - 誤答には「誤答に使ってよい隣接概念」や出題範囲内の別の概念を使い、紛らわしくする
@@ -191,6 +202,8 @@ def verify_user(questions: list[dict], materials: str) -> str:
 資料に基づいて誤りだと述べられない誤答（実は正しい、資料から判断できない）は、別の誤答に差し替えて replaced を true にしてください。
 差し替えた場合も、その新しい誤答がなぜ誤りかを述べてください。
 正答そのものが資料と食い違っていれば、問題文・選択肢・answer・explanation を資料に合わせて直してください。
+関係を問う問題（aspect=relation）は、正答が材料の「出題範囲の概念どうしの関係」のどの行に当たるかを確かめ、向きが逆なら問題文か正答を直してください。
+どの行にも当たらなければ、問題を資料の記述に合わせて直してください。relation_used はその行の from・to・label にしてください。
 記述式の問題は distractor_reasons を空配列にして、そのまま返してください。
 問題の数・id・aspect・type は変えないでください。
 answer と distractor_reasons の choice は 0 始まりの添字（0〜3）です。choices の順番は変えないでください。
@@ -305,6 +318,25 @@ def fix_answer_index(q: dict, before: dict | None) -> tuple[dict | None, list[st
     return q, warnings
 
 
+# ------------------------------------------------------------------ 関係の向き（#32）
+
+def check_relation_direction(q: dict, inner: list[dict], concepts: dict[str, dict]) -> list[str]:
+    """関係を問う問題の relation_used が、材料の関係と同じ向きかを確かめる。警告だけ出す（LLM は呼ばない）。"""
+    if q.get("aspect") != "relation":
+        return []
+    qid = q.get("id", "?")
+    used = q.get("relation_used") or {}
+    f, t, label = (_norm(used.get(k, "")) for k in ("from", "to", "label"))
+    if not (f and t and label):
+        return [f"{qid}: 関係を問う問題なのに relation_used が空"]
+    rows = {(_norm(concepts[r["from"]]["label"]), _norm(concepts[r["to"]]["label"]), _norm(r["label"])) for r in inner}
+    if (f, t, label) in rows:
+        return []
+    if (t, f, label) in rows:
+        return [f"{qid}: 関係の向きが材料と逆（{used.get('from')} —{used.get('label')}→ {used.get('to')}）"]
+    return [f"{qid}: relation_used が材料の関係のどれにも当たらない（{used.get('from')} —{used.get('label')}→ {used.get('to')}）"]
+
+
 # ------------------------------------------------------------------ 検証
 
 def validate(questions: list[dict], confirmed_ids: list[str], pages: list[dict]) -> list[str]:
@@ -385,7 +417,8 @@ def generate_quiz(client, model: str, graph: dict, vocab: dict, pages: list[dict
     n_replaced = sum(1 for q in final for d in q.get("distractor_reasons", []) if d.get("replaced"))
 
     # (3) 自動検証
-    warnings = answer_warnings + resolve_warnings + validate(final, confirmed_ids, pages)
+    direction_warnings = [w for q in final for w in check_relation_direction(q, inner, concepts)]
+    warnings = answer_warnings + resolve_warnings + direction_warnings + validate(final, confirmed_ids, pages)
     # 補正の後でも正答の添字が answer_text と合わない 4 択は出さない（正しく答えても不正解になるため）
     final = [q for q in final if q.get("type") != "mcq" or _answer_matches(q)]
     meta = {
