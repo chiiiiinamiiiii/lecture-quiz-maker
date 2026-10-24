@@ -1,0 +1,203 @@
+"""quizmap.extraction.complete_relations（関係の補完、docs/rag-design.md）。
+
+LLM は extraction.call_json を差し替え、SlideIndex と Wiki は偽物を渡す。API は呼ばない。
+"""
+from __future__ import annotations
+
+import pytest
+
+from quizmap import extraction
+from quizmap.common import OTHER_LABEL
+
+VOCAB = {
+    "course": "テスト",
+    "kinds": [{"name": "人物"}, {"name": "学説"}],
+    "relations": [
+        {"label": "提唱", "definition": "人物が学説を唱えた", "example": "A → B",
+         "from_kinds": ["人物"], "to_kinds": ["学説"]},
+        {"label": OTHER_LABEL, "definition": "", "example": ""},
+    ],
+}
+
+PAGES = [
+    {"lecture": 1, "page": 1, "text": "甲野は乙説を唱えた。丙も出てくる。"},
+    {"lecture": 1, "page": 2, "text": "丁説の説明。"},
+    {"lecture": 2, "page": 1, "text": "丙と丁説の話。"},
+]
+
+
+def concept(cid, label, kind, *pages):
+    return {"id": cid, "label": label, "kind": kind, "definition": "",
+            "sources": [{"lecture": l, "page": p} for l, p in pages], "lectures": sorted({l for l, _ in pages})}
+
+
+def graph():
+    return {
+        "course": "テスト",
+        "concepts": [
+            concept("kouno", "甲野", "人物", (1, 1)),
+            concept("otsu", "乙説", "学説", (1, 1)),
+            concept("hei", "丙", "人物", (1, 1)),
+            concept("tei", "丁説", "学説", (1, 2)),
+        ],
+        "relations": [{"from": "hei", "to": "otsu", "label": OTHER_LABEL, "source": {"lecture": 1, "page": 1}}],
+        "stats": {"concepts": 4, "relations": 1},
+    }
+
+
+class FakeIndex:
+    def __init__(self, hits):
+        self.hits, self.queries = hits, []
+
+    def search(self, client, query, k=5, exclude=frozenset()):
+        self.queries.append((query, set(exclude)))
+        return [h for h in self.hits.get(query, []) if (h["lecture"], h["page"]) not in exclude][:k]
+
+
+class FakeWiki:
+    def __init__(self, articles):
+        self.articles, self.terms = articles, []
+
+    def lookup(self, term):
+        self.terms.append(term)
+        return self.articles.get(term)
+
+
+@pytest.fixture
+def llm(monkeypatch):
+    """call_json を差し替える。answer(user) が judgements を返す。呼ばれたプロンプトを残す。"""
+    state = {"answer": lambda user: [], "users": []}
+
+    def fake(client, *, model, system, user, schema, max_tokens=32000):
+        state["users"].append(user)
+        return {"judgements": state["answer"](user)}
+
+    monkeypatch.setattr(extraction, "call_json", fake)
+    return state
+
+
+def J(pair, origin, f="", t="", label="", lecture=0, page=0, wiki=0, evidence=""):
+    return {"pair": pair, "origin": origin, "from": f, "to": t, "label": label,
+            "lecture": lecture, "page": page, "wiki": wiki, "evidence": evidence}
+
+
+def pair_no(user, a, b):
+    """プロンプトの対の一覧から、a と b の対の番号を探す。"""
+    for line in user.splitlines():
+        head, _, rest = line.partition(". ")
+        if head.isdigit() and rest.startswith(a + "（"):
+            nxt = user.split(line, 1)[1].splitlines()[1]
+            if nxt.strip().startswith("と " + b + "（"):
+                return int(head)
+    raise AssertionError(f"対 {a}-{b} がプロンプトに無い")
+
+
+def test_slide_relation_is_added_with_origin_and_existing_get_slide(llm):
+    def answer(user):
+        n = pair_no(user, "kouno", "otsu")
+        return [J(n, "slide", "kouno", "otsu", "提唱", 1, 1, evidence="甲野は乙説を唱えた")]
+    llm["answer"] = answer
+    g = extraction.complete_relations(None, "m", VOCAB, graph(), PAGES, index=None, wiki=None, log=lambda s: None)
+    new = [r for r in g["relations"] if r["from"] == "kouno"]
+    assert new == [{"from": "kouno", "to": "otsu", "label": "提唱", "source": {"lecture": 1, "page": 1},
+                    "origin": "slide", "evidence": "甲野は乙説を唱えた"}]
+    assert all(r["origin"] == "slide" for r in g["relations"])
+    c = g["stats"]["completion"]
+    assert c["added_slide"] == 1 and c["added_external"] == 0 and c["api_calls"] == 1
+    assert g["stats"]["relations"] == 2
+    assert {x["id"] for x in g["concepts"]} == {"kouno", "otsu", "hei", "tei"}
+
+
+def test_existing_pair_is_not_a_candidate(llm):
+    extraction.complete_relations(None, "m", VOCAB, graph(), PAGES, index=None, wiki=None, log=lambda s: None)
+    user = llm["users"][0]
+    with pytest.raises(AssertionError):
+        pair_no(user, "hei", "otsu")
+
+
+def test_new_or_other_ids_are_rejected(llm):
+    def answer(user):
+        n = pair_no(user, "kouno", "otsu")
+        return [J(n, "slide", "kouno", "shin", "提唱", 1, 1, evidence="甲野は乙説を唱えた")]
+    llm["answer"] = answer
+    g = extraction.complete_relations(None, "m", VOCAB, graph(), PAGES, index=None, wiki=None, log=lambda s: None)
+    assert len(g["relations"]) == 1
+    assert g["stats"]["completion"]["dropped"]["対に無い id"] == 1
+
+
+def test_slide_evidence_must_be_in_page(llm):
+    def answer(user):
+        n = pair_no(user, "kouno", "otsu")
+        return [J(n, "slide", "kouno", "otsu", "提唱", 1, 1, evidence="甲野は乙説を否定した")]
+    llm["answer"] = answer
+    g = extraction.complete_relations(None, "m", VOCAB, graph(), PAGES, index=None, wiki=None, log=lambda s: None)
+    assert g["stats"]["completion"]["dropped"]["evidence が本文に無い"] == 1
+
+
+def test_direction_is_fixed_by_end_kinds_and_other_label_is_not_added(llm):
+    def answer(user):
+        return [J(pair_no(user, "kouno", "otsu"), "slide", "otsu", "kouno", "提唱", 1, 1, evidence="甲野は乙説を唱えた"),
+                J(pair_no(user, "hei", "kouno"), "slide", "hei", "kouno", OTHER_LABEL, 1, 1, evidence="丙も出てくる")]
+    llm["answer"] = answer
+    g = extraction.complete_relations(None, "m", VOCAB, graph(), PAGES, index=None, wiki=None, log=lambda s: None)
+    c = g["stats"]["completion"]
+    assert c["adjusted"] == {"向きを直した": 1}
+    assert c["dropped"]["語彙にないラベル"] == 1
+    assert [(r["from"], r["to"]) for r in g["relations"] if r["label"] == "提唱"] == [("kouno", "otsu")]
+
+
+def test_isolated_concept_uses_index_and_external_needs_wiki_text(llm):
+    # 丁説（tei）はどの関係にもつながらず、ほかの概念と同じページにも出ない。索引で第2回 p1 が見つかり、丙と対になる
+    index = FakeIndex({"丁説": [{"lecture": 2, "page": 1, "text": "", "score": 0.9}]})
+    g0 = graph()
+    g0["concepts"][2]["sources"].append({"lecture": 2, "page": 1})
+    wiki = FakeWiki({"丁説": {"title": "丁説", "url": "https://ja.wikipedia.org/wiki/丁説",
+                             "extract": "丁説は丙が唱えた学説である。"}})
+
+    def answer(user):
+        n = pair_no(user, "hei", "tei")
+        w = next(int(x.split("]")[0]) for x in user.split("[W")[1:] if x.split("]")[1].strip().startswith("丁説"))
+        return [J(n, "external", "hei", "tei", "提唱", wiki=w, evidence="丁説は丙が唱えた学説である")]
+    llm["answer"] = answer
+    g = extraction.complete_relations(None, "m", VOCAB, g0, PAGES, index=index, wiki=wiki, log=lambda s: None)
+    ext = [r for r in g["relations"] if r["origin"] == "external"]
+    assert ext == [{"from": "hei", "to": "tei", "label": "提唱", "source": {"lecture": 2, "page": 1},
+                    "origin": "external", "evidence": "丁説は丙が唱えた学説である",
+                    "evidence_url": "https://ja.wikipedia.org/wiki/丁説", "evidence_title": "丁説"}]
+    c = g["stats"]["completion"]
+    assert c["searches"] >= 1 and ("丁説", {(1, 2)}) in index.queries
+    assert c["isolated_after"] < c["isolated_before"]
+
+
+def test_external_rejects_text_not_in_article(llm):
+    wiki = FakeWiki({"甲野": {"title": "甲野", "url": "u", "extract": "甲野は哲学者。"}})
+
+    def answer(user):
+        return [J(pair_no(user, "kouno", "otsu"), "external", "kouno", "otsu", "提唱", wiki=1,
+                  evidence="甲野は乙説を唱えた")]
+    llm["answer"] = answer
+    g = extraction.complete_relations(None, "m", VOCAB, graph(), PAGES, index=None, wiki=wiki, log=lambda s: None)
+    assert g["stats"]["completion"]["dropped"]["evidence が記事に無い"] == 1
+    assert len(g["relations"]) == 1
+
+
+def test_external_needs_both_names_in_article():
+    art = {"title": "甲野", "extract": "甲野は哲学者で、多くの説を唱えた。"}
+    assert extraction.check_external_evidence("多くの説を唱えた", ["甲野", "乙説"], art) == "両端の概念名が記事に無い"
+    art2 = {"title": "甲野", "extract": "甲野は乙説を唱えた哲学者。"}
+    assert extraction.check_external_evidence("乙説を唱えた", ["甲野", "乙説"], art2) is None
+
+
+def test_max_pairs_and_batches(llm, monkeypatch):
+    monkeypatch.setattr(extraction, "COMPLETION_BATCH", 1)
+    g = extraction.complete_relations(None, "m", VOCAB, graph(), PAGES, index=None, wiki=None,
+                                      log=lambda s: None, max_pairs=2)
+    c = g["stats"]["completion"]
+    assert c["judged"] == 2 and c["api_calls"] == 2 and c["candidates"] == 2
+    assert c["dropped"]["答えの無い対"] == 2
+
+
+def test_input_graph_is_not_modified(llm):
+    g0 = graph()
+    extraction.complete_relations(None, "m", VOCAB, g0, PAGES, index=None, wiki=None, log=lambda s: None)
+    assert "origin" not in g0["relations"][0] and g0["stats"] == {"concepts": 4, "relations": 1}
