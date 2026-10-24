@@ -198,9 +198,16 @@ def _match_key(text: str) -> str:
 
 
 def title_matches(term: str, title: str) -> bool:
-    """記事の題名が引いた語と合うか。正規化して、どちらかがもう一方に含まれれば合う（#93）。"""
+    """記事の題名が引いた語と合うか（#93）。正規化して比べる。
+
+    - 語が題名に含まれれば合う（カント → イマヌエル・カント）
+    - 題名が語に含まれるときは、題名が語の半分より長いときだけ合う。
+      語より広い短い記事（自己目的 → 目的、理性的存在者 → 理性）は使わない
+    """
     a, b = _match_key(term), _match_key(title)
-    return bool(a and b) and (a in b or b in a)
+    if not (a and b):
+        return False
+    return a in b or (b in a and len(b) * 2 > len(a))
 
 
 class Wiki:

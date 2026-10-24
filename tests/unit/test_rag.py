@@ -320,7 +320,12 @@ def test_normalize_term(raw, expected):
 @pytest.mark.parametrize("term,title,ok", [
     ("功利主義", "功利主義", True),
     ("カント", "イマヌエル・カント", True),                # 語が題名に含まれる
-    ("イマヌエル・カント", "カント", True),                # 題名が語に含まれる
+    ("イマヌエル・カント", "カント", False),               # 題名が語に含まれるが、語の半分以下（3 / 8 字。中黒は数えない）
+    ("自己目的", "目的", False),                           # 題名がちょうど半分: 広い記事なので使わない
+    ("理性的存在者", "理性", False),
+    ("機械論的自然観", "機械論", False),
+    ("功利主義者", "功利主義", True),                      # 4 / 5 字
+    ("尊厳", "個人の尊厳", True),                          # 語が題名に含まれる
     ("Kant", "Immanuel Kant", True),                        # 大文字・小文字は区別しない
     ("Kant (philosopher)", "Immanuel Kant", True),
     ("word embedding", "Word embedding", True),
