@@ -7,13 +7,15 @@ LLM 呼び出しは quizmap.common.call_json（プロバイダ非依存）だけ
 from __future__ import annotations
 
 import datetime as dt
+import os
 import random
+import re
 import time
 import unicodedata
 from collections import Counter
 
 from quizmap.common import OTHER_LABEL, call_json
-from quizmap.vocab import language_of, language_rule
+from quizmap.vocab import detect_language, language_of, language_rule
 
 ASPECT_RATIO = {"relation": 4, "example": 3, "definition": 3}   # 仕様 §7 の目安
 
@@ -129,9 +131,11 @@ def build_materials(graph: dict, vocab: dict, pages: list[dict], concept_ids: li
     selected = [concepts[i] for i in concept_ids if i in concepts]
     sel = set(c["id"] for c in selected)
 
-    # 囲んだ概念どうしの関係（「その他」は問い方が無いので除く）
+    # 囲んだ概念どうしの関係（「その他」は問い方が無いので除く）。
+    # 外部資料（Wikipedia）で補った関係（origin: external）は、答えが資料から導けないので使わない（docs/rag-design.md）
     inner = [r for r in graph["relations"]
-             if r["from"] in sel and r["to"] in sel and r["label"] != OTHER_LABEL]
+             if r["from"] in sel and r["to"] in sel and r["label"] != OTHER_LABEL
+             and r.get("origin", "slide") != "external"]
     # 誤答候補: 地図上で隣接する概念（選択の外側も含む）
     neighbors: dict[str, set[str]] = {i: set() for i in sel}
     for r in graph["relations"]:
@@ -458,11 +462,310 @@ def validate(questions: list[dict], confirmed_ids: list[str], pages: list[dict])
     return warnings
 
 
+# ------------------------------------------------------------------ 出題の検証（docs/rag-design.md、#78）
+#
+# 利用者が決めた方針: 答えは必ずアップロードした資料から導けること。外部の資料（Wikipedia）は
+# ほかの選択肢が正解になっていないか、答えが一意かを確かめるためだけに使う（答えの根拠にはしない）。
+
+UNIQUENESS_SYSTEM = """あなたは作成済みのクイズの正しさを点検する専門家です。
+正答の根拠にしてよいのは授業の資料のページだけです。Wikipedia の記事は、正答以外の選択肢が正解と言えてしまわないか、答えが一つに決まるかを確かめるためだけに使います。{language_rule}"""
+
+UNIQUENESS_USER = """次のクイズの各問題を点検してください。
+
+=== 資料のページ（[第N回 pM] の形で示す。正答の根拠にしてよいのはこれだけ） ===
+{pages}
+
+=== Wikipedia の記事の冒頭（[W番号] の形で示す。正答の根拠にはしない） ===
+{wiki}
+
+=== クイズ ===
+{questions}
+
+各問題について 1 件ずつ答える。守ること:
+- answer_supported: 正答（4 択は answer の選択肢、記述式は模範解答）が、その問題に付けた資料のページの記述から導けるなら true。
+  導けるときは support に根拠のページを 1 つ以上挙げ、quote にそのページ本文から根拠の箇所をそのまま 60 字以内で抜き出す。
+  資料に書かれておらず、一般知識や Wikipedia でしか確かめられないなら false にする
+- distractors: 4 択の問題では、正答以外の選択肢ごとに 1 件。その選択肢が、資料のページまたは Wikipedia の記事に照らして、
+  問題文の条件で正解と言えてしまうなら could_be_correct を true にし、reason に理由を、wiki に根拠にした記事の番号（無ければ 0）を書く。
+  true のときは replacement に、資料のページに載っている語で、問題文の条件に当てはまらない別の選択肢を書く（見つからなければ空）。
+  正解と言えないなら could_be_correct を false にし、replacement を空にする。記述式の問題は distractors を空配列にする
+- other_answer: 記述式の問題で、模範解答とは別の答えが資料から正答として成り立つなら true、reason_other に理由を書く。4 択の問題は false
+- 問題文・選択肢・正答は書き換えない。判定だけを返す
+- 使わない欄は、文字列なら空、数なら 0 にする
+"""
+
+UNIQUENESS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "checks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "answer_supported": {"type": "boolean"},
+                    "support": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {"lecture": {"type": "integer"}, "page": {"type": "integer"}},
+                            "required": ["lecture", "page"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "quote": {"type": "string"},
+                    "distractors": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "choice": {"type": "integer"},
+                                "could_be_correct": {"type": "boolean"},
+                                "reason": {"type": "string"},
+                                "wiki": {"type": "integer"},
+                                "replacement": {"type": "string"},
+                            },
+                            "required": ["choice", "could_be_correct", "reason", "wiki", "replacement"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "other_answer": {"type": "boolean"},
+                    "reason_other": {"type": "string"},
+                },
+                "required": ["id", "answer_supported", "support", "quote", "distractors", "other_answer", "reason_other"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["checks"],
+    "additionalProperties": False,
+}
+
+UNIQUENESS_PAGES_PER_QUESTION = 5   # 1 問に付ける資料のページの上限（出典 + 索引の検索）
+UNIQUENESS_SEARCH_K = 3
+UNIQUENESS_PAGE_CHARS = 1500
+UNIQUENESS_WIKI_CHARS = 600
+_WS_RE = re.compile(r"\s+")
+EXTERNAL_RELATION_REASON = "関係を問う問題に外部資料で補った関係を使っている"
+
+
+def _flat(text: str) -> str:
+    """引用の照合用。NFKC にして空白・改行をすべて除く。"""
+    return _WS_RE.sub("", unicodedata.normalize("NFKC", text or ""))
+
+
+def uses_external_relation(q: dict, graph: dict) -> bool:
+    """関係を問う問題の relation_used が origin: external の関係か（答えが資料から導けないので出さない）。"""
+    if q.get("aspect") != "relation":
+        return False
+    used = q.get("relation_used") or {}
+    key = tuple(_norm(used.get(k, "")) for k in ("from", "to", "label"))
+    labels = {c["id"]: c["label"] for c in graph["concepts"]}
+    for r in graph["relations"]:
+        if r.get("origin") != "external":
+            continue
+        a, b = _norm(labels.get(r["from"], "")), _norm(labels.get(r["to"], ""))
+        if key in ((a, b, _norm(r["label"])), (b, a, _norm(r["label"]))):
+            return True
+    return False
+
+
+def _on_slides(term: str, graph: dict, page_text: dict) -> bool:
+    """差し替えの選択肢が資料に載っている語か（概念名、またはどこかのページ本文にそのまま出てくる）。"""
+    t = _flat(term)
+    if not t:
+        return False
+    if any(_flat(c["label"]) == t for c in graph["concepts"]):
+        return True
+    return any(t in _flat(text) for text in page_text.values())
+
+
+def verify_uniqueness(client, model, questions, graph, pages, index, wiki) -> tuple[list, list]:
+    """出題の検証。全問をまとめて 1 回の LLM 呼び出しで判定する。
+
+    1. 正答がスライドの記述から導けるか。導けなければ外す（根拠の引用が挙げたページに無いときも外す）
+    2. 正答以外の選択肢が、スライドか Wikipedia で正解と言えてしまうなら、資料に載っている語に差し替える。
+       差し替えられなければ外す
+    3. 記述式で、模範解答以外に資料から別の正答が成り立つなら外す
+    関係を問う問題で origin: external の関係を使ったものは、LLM に見せる前に外す。
+    index（SlideIndex）と wiki（Wiki）は None でもよい（使える層だけで判定する）。
+    戻り値: (残す問題, 検証の記録)。記録は問題ごとに 1 件:
+      {"id", "action": "kept" / "replaced" / "dropped", "reasons": [...],
+       "pages": [{"lecture", "page", "score", "via": "source" / "search"}],   # LLM に見せたスライドのページ
+       "wiki": [{"term", "title", "url"}],                                   # 引いた語（見つからなければ title・url は空）
+       "support": [{"lecture", "page"}], "quote",                            # LLM が挙げた正答の根拠
+       "distractors": [{"choice", "text", "could_be_correct", "reason", "wiki_url", "replacement", "replaced"}],
+       "other_answer", "reason_other"}
+    """
+    page_text = {(p["lecture"], p["page"]): p["text"] for p in pages}
+    records: list[dict] = []
+    targets: list[dict] = []
+
+    def new_record(q: dict) -> dict:
+        return {"id": q.get("id", "?"), "action": "kept", "reasons": [], "pages": [], "wiki": [],
+                "support": [], "quote": "", "distractors": [], "other_answer": False, "reason_other": ""}
+
+    for q in questions:
+        if uses_external_relation(q, graph):
+            rec = new_record(q)
+            rec.update(action="dropped", reasons=[EXTERNAL_RELATION_REASON])
+            records.append(rec)
+        else:
+            targets.append(q)
+    if not targets:
+        return [], records
+    by_id = {q["id"]: new_record(q) for q in targets}
+
+    # 問題ごとの資料のページ: 出典のページ + 索引で問題文と正答から探したページ
+    for q in targets:
+        rec = by_id[q["id"]]
+        seen: set[tuple[int, int]] = set()
+        for s in q.get("sources", []):
+            k = (s["lecture"], s["page"])
+            if k in page_text and k not in seen:
+                seen.add(k)
+                rec["pages"].append({"lecture": k[0], "page": k[1], "score": None, "via": "source"})
+        if index is not None:
+            for h in index.search(client, f"{q.get('prompt', '')} {q.get('answer_text', '')}", k=UNIQUENESS_SEARCH_K):
+                k = (h["lecture"], h["page"])
+                if k in page_text and k not in seen:
+                    seen.add(k)
+                    rec["pages"].append({"lecture": k[0], "page": k[1], "score": h.get("score"), "via": "search"})
+        rec["pages"] = rec["pages"][:UNIQUENESS_PAGES_PER_QUESTION]
+
+    # 正答と各選択肢の語を Wikipedia で引く（Wiki がキャッシュするので、同じ語は二度問い合わせない）
+    articles: list[dict] = []                         # [W番号 - 1] → 記事
+    found: dict[str, dict | None] = {}
+    q_wiki: dict[str, list[int]] = {}
+    for q in targets:
+        terms = list(q.get("choices") or []) or [q.get("answer_text", "")]
+        nums: list[int] = []
+        for term in (t.strip() for t in terms):
+            if not term or wiki is None:
+                continue
+            if term not in found:
+                found[term] = wiki.lookup(term)
+            art = found[term]
+            by_id[q["id"]]["wiki"].append({"term": term, "title": (art or {}).get("title", ""),
+                                           "url": (art or {}).get("url", "")})
+            if not art:
+                continue
+            urls = [a.get("url") for a in articles]
+            if art.get("url") not in urls:
+                articles.append(art)
+                urls.append(art.get("url"))
+            n = urls.index(art.get("url")) + 1
+            if n not in nums:
+                nums.append(n)
+        q_wiki[q["id"]] = nums
+
+    def keys_of(qid: str) -> list[tuple[int, int]]:
+        return [(p["lecture"], p["page"]) for p in by_id[qid]["pages"]]
+
+    all_pages = sorted({k for q in targets for k in keys_of(q["id"])})
+    pages_block = "\n\n".join(f"[第{l}回 p{n}]\n{page_text[(l, n)][:UNIQUENESS_PAGE_CHARS]}" for l, n in all_pages) or "（なし）"
+    wiki_block = "\n\n".join(
+        f"[W{i + 1}] {a.get('title', '')}\n{unicodedata.normalize('NFKC', a.get('extract', ''))[:UNIQUENESS_WIKI_CHARS]}"
+        for i, a in enumerate(articles)) or "（なし）"
+
+    def describe(q: dict) -> str:
+        lines = [f"- id: {q['id']}（{'4 択' if q.get('type') == 'mcq' else '記述式'}）", f"  問題文: {q.get('prompt', '')}"]
+        if q.get("type") == "mcq":
+            for i, c in enumerate(q.get("choices", [])):
+                lines.append(f"  選択肢 {i}: {c}{'（正答）' if i == q.get('answer') else ''}")
+        else:
+            lines.append(f"  模範解答: {q.get('answer_text', '')}")
+        lines.append("  資料のページ: " + ("、".join(f"第{l}回 p{n}" for l, n in keys_of(q["id"])) or "（なし）"))
+        lines.append("  記事: " + ("、".join(f"W{n}" for n in q_wiki[q["id"]]) or "（なし）"))
+        return "\n".join(lines)
+
+    lang = detect_language([q.get("prompt", "") + q.get("answer_text", "") for q in targets])
+    data = call_json(
+        client, model=model, system=UNIQUENESS_SYSTEM.replace("{language_rule}", language_rule(lang)),
+        schema=UNIQUENESS_SCHEMA,
+        user=UNIQUENESS_USER.format(pages=pages_block, wiki=wiki_block,
+                                    questions="\n".join(describe(q) for q in targets)),
+    )
+    checks: dict[str, dict] = {}
+    for c in data["checks"]:
+        checks.setdefault(c["id"], c)
+
+    kept: list[dict] = []
+    for q in targets:
+        qid = q["id"]
+        rec = by_id[qid]
+        records.append(rec)
+        c = checks.get(qid)
+        if c is None:
+            rec["reasons"].append("検証の答えが返らなかった（そのまま残した）")
+            kept.append(q)
+            continue
+        allowed = set(keys_of(qid))
+        support = [(s["lecture"], s["page"]) for s in c["support"] if (s["lecture"], s["page"]) in allowed]
+        rec.update(support=[{"lecture": l, "page": n} for l, n in support], quote=c["quote"],
+                   other_answer=c["other_answer"], reason_other=c["reason_other"])
+        if not c["answer_supported"]:
+            rec["action"] = "dropped"
+            rec["reasons"].append("正答が資料の記述から導けない")
+            continue
+        quote = _flat(c["quote"])
+        if not support or not quote or not any(quote in _flat(page_text[k]) for k in support):
+            rec["action"] = "dropped"
+            rec["reasons"].append("正答の根拠の引用が、挙げた資料のページに無い")
+            continue
+        if q.get("type") != "mcq":
+            if c["other_answer"]:
+                rec["action"] = "dropped"
+                rec["reasons"].append(f"模範解答のほかに資料から別の正答が成り立つ: {c['reason_other']}")
+                continue
+            kept.append(q)
+            continue
+
+        choices = list(q.get("choices", []))
+        ok = True
+        for d in c["distractors"]:
+            i = d["choice"]
+            if not 0 <= i < len(choices) or i == q.get("answer"):
+                continue
+            url = articles[d["wiki"] - 1].get("url", "") if 1 <= d["wiki"] <= len(articles) else ""
+            entry = {"choice": i, "text": choices[i], "could_be_correct": d["could_be_correct"], "reason": d["reason"],
+                     "wiki_url": url, "replacement": d["replacement"], "replaced": False}
+            rec["distractors"].append(entry)
+            if not d["could_be_correct"]:
+                continue
+            new = d["replacement"].strip()
+            if new and _on_slides(new, graph, page_text) and all(_flat(new) != _flat(x) for x in choices):
+                rec["reasons"].append(f"選択肢 {i}「{choices[i]}」も正解と言えるので「{new}」に差し替えた: {d['reason']}")
+                choices[i] = new
+                entry["replaced"] = True
+                rec["action"] = "replaced"
+            else:
+                rec["reasons"].append(f"選択肢 {i}「{choices[i]}」も正解と言え、資料に載っている差し替え先が無い: {d['reason']}")
+                ok = False
+        if not ok:
+            rec["action"] = "dropped"
+            continue
+        kept.append({**q, "choices": choices} if rec["action"] == "replaced" else q)
+    order = {q.get("id"): i for i, q in enumerate(questions)}
+    records.sort(key=lambda r: order.get(r["id"], len(order)))
+    return kept, records
+
+
 # ------------------------------------------------------------------ 本体
 
+# 出題の検証（verify_uniqueness）を通すか。generate_quiz の verify を省いたときの既定。QUIZMAP_RAG=off で通さない
+UNIQUENESS_DEFAULT = os.environ.get("QUIZMAP_RAG", "on").strip().lower() != "off"
+
 def generate_quiz(client, model: str, graph: dict, vocab: dict, pages: list[dict],
-                  confirmed_ids: list[str], n: int) -> dict:
-    """戻り値: {"questions": [...], "warnings": [...], "meta": {...}}"""
+                  confirmed_ids: list[str], n: int, index=None, wiki=None, verify: bool | None = None) -> dict:
+    """戻り値: {"questions": [...], "warnings": [...], "meta": {...}}
+
+    index（rag.SlideIndex）と wiki（rag.Wiki）は省略できる。verify が真なら、生成と自己確認の後に
+    verify_uniqueness を 1 回通す（index・wiki が None でも、スライドの本文だけで検証する）。
+    verify を省くと UNIQUENESS_DEFAULT（QUIZMAP_RAG が off でなければ真）。
+    """
+    if verify is None:
+        verify = UNIQUENESS_DEFAULT
     t0 = time.monotonic()
     calls = 0
     concepts, selected, inner, neighbors, needed, page_text, styles = build_materials(graph, vocab, pages, confirmed_ids)
@@ -516,6 +819,22 @@ def generate_quiz(client, model: str, graph: dict, vocab: dict, pages: list[dict
         resolve_warnings += w
     n_replaced = sum(1 for q in final for d in q.get("distractor_reasons", []) if d.get("replaced"))
 
+    # 出題の検証（docs/rag-design.md）。通す前の問題も評価のために meta に残す
+    before_verify = [dict(q) for q in final] if verify else None
+    uniqueness = None
+    if verify and final:
+        final, records = verify_uniqueness(client, model, final, graph, pages, index, wiki)
+        calls += 1
+        uniqueness = {
+            "records": records,
+            "dropped": sum(1 for r in records if r["action"] == "dropped"),
+            "replaced": sum(1 for r in records if r["action"] == "replaced"),
+            "index": index is not None,
+            "wiki": wiki is not None,
+            # 索引の検索（埋め込み）は、LLM に見せた問題ごとに 1 回
+            "searches": sum(1 for r in records if r["reasons"] != [EXTERNAL_RELATION_REASON]) if index is not None else 0,
+        }
+
     # (3) 自動検証
     direction_warnings = [w for q in final for w in check_relation_direction(q, inner, concepts)]
     style_warnings = [w for q in final for w in check_prompt_style(q, styles)]
@@ -541,4 +860,7 @@ def generate_quiz(client, model: str, graph: dict, vocab: dict, pages: list[dict
         "api_calls": calls,
         "seconds": round(time.monotonic() - t0, 1),
     }
+    if verify:
+        meta["questions_before_verify"] = before_verify
+        meta["uniqueness"] = uniqueness
     return {"questions": final, "warnings": warnings, "meta": meta}
