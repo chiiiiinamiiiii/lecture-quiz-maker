@@ -113,6 +113,16 @@ TEXTS = {
     "last_done": {"ja": "前回の取り込みは完了しています（{t}）。", "en": "The last import finished ({t})."},
     "progress_note": {"ja": "開始 {t}。この画面を離れても処理は続きます。", "en": "Started {t}. The import keeps running if you leave this view."},
     "starting": {"ja": "開始しています…", "en": "Starting…"},
+    "course_name": {"ja": "コース名", "en": "Course name"},
+    "kept_toast": {"ja": "{n} 件は一覧にある同じファイルのため、講義回と「使う」はそのまま残しました",
+                   "en": "{n} file(s) already in the list; their lecture number and “Use” were kept"},
+    "sentence_sep": {"ja": "。", "en": ". "},
+    "list_sep": {"ja": "、", "en": ", "},
+    "phase_read": {"ja": "PDF の読み込み", "en": "Reading PDFs"},
+    "phase_vocab": {"ja": "語彙の導出", "en": "Deriving the vocabulary"},
+    "phase_concepts": {"ja": "概念の抽出", "en": "Extracting concepts"},
+    "phase_relations": {"ja": "関係の抽出", "en": "Extracting relations"},
+    "phase_slides": {"ja": "スライド画像の作成", "en": "Rendering slide images"},
 }
 
 
