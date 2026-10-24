@@ -7,7 +7,8 @@ from pathlib import Path
 
 import streamlit as st
 
-from ui.i18n import map_texts
+from quizmap.common import OTHER_LABEL
+from ui.i18n import map_texts, t
 from ui.layout import compute_weights, layout_relation, layout_timeline
 
 _STATIC = Path(__file__).parent / "static"
@@ -31,6 +32,11 @@ def _positions(graph) -> dict:
     return {"force": force, "timeline": timeline, "timeline_axis": {str(n): n for n in lectures}}
 
 
+def rel_label(label: str) -> str:
+    """関係ラベルを画面に出す形にする。「その他」は資料の言語によらず固定の名前なので、画面の言語で出す。"""
+    return t("rel_other") if label == OTHER_LABEL else label
+
+
 def concept_map(graph, asked: set[str], selected: list[str], sel_version: int, course_id: str,
                 height: int = 760) -> dict | None:
     """地図を描き、ブラウザ側の選択 {"ids", "via_edge", "version", "n"} を返す（まだ無ければ None）。"""
@@ -40,7 +46,7 @@ def concept_map(graph, asked: set[str], selected: list[str], sel_version: int, c
         "lectures": sorted(c["lectures"]), "asked": c["id"] in asked, "weight": round(weights[c["id"]], 4),
     } for c in graph["concepts"]]
     edges = [{
-        "id": f"e{i}", "s": r["from"], "t": r["to"], "label": r["label"],
+        "id": f"e{i}", "s": r["from"], "t": r["to"], "label": rel_label(r["label"]),
         "lecture": r["source"]["lecture"], "page": r["source"]["page"],
     } for i, r in enumerate(graph["relations"])]
     data = {

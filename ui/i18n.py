@@ -43,6 +43,8 @@ TEXTS = {
     "lecture_fmt": {"ja": "第{n}回", "en": "L{n}"},
     "count_fmt": {"ja": "{n} 個を選択中", "en": "{n} selected"},
 
+    "rel_other": {"ja": "その他", "en": "Other"},   # 関係ラベル「その他」の表示
+
     # 右側: 選択
     "sel_title": {"ja": "選択した範囲", "en": "Selection"},
     "sel_empty": {"ja": "地図の上で概念を囲むか、下の講義回ボタンを押すと、ここに並びます。",
