@@ -21,17 +21,19 @@ from ui.state import clear_course_state, load_graph, save_course_name
 
 NEW = "__new__"
 
-# 画面の余白を詰め、左の地図を広く取る
+# 画面の余白を詰め、左の地図を広く取る。
+# 上の余白は Streamlit の上部のバー（stHeader、高さ 60px。透明だが横幅いっぱいでクリックを受ける）より下に
+# 本文が来るように 3.6rem にする。これより詰めると、本文の上端のボタンや地図の上端が押せなくなる
 PAGE_CSS = """
 <style>
 .block-container { padding: 3.6rem 1.6rem 1rem 1.6rem; max-width: 100%; }
 header[data-testid="stHeader"] { background: transparent; }
 div[data-testid="stVerticalBlockBorderWrapper"] { border-color: rgba(255,255,255,0.07); }
 /* 地図の画面（ui/map_view.py）: 左の地図（qm-left）と右の欄（qm-right）の高さを窓の高さに合わせる（#43）。
-   上の余白（約 38px）と下の余白（約 16px）を引き、420〜900px に収める。外側の枠が flex で高さを固定するので、そこも上書きする */
+   上の余白（約 74px）と下の余白（約 16px）を引き、420〜900px に収める。外側の枠が flex で高さを固定するので、そこも上書きする */
 [data-testid="stLayoutWrapper"]:has(> .st-key-qm-left), [data-testid="stLayoutWrapper"]:has(> .st-key-qm-right),
 .st-key-qm-left, .st-key-qm-right {
-  height: clamp(420px, calc(100vh - 56px), 900px) !important; flex: 0 0 auto !important;
+  height: clamp(420px, calc(100vh - 92px), 900px) !important; flex: 0 0 auto !important;
 }
 .st-key-qm-left { overflow: hidden !important; }
 </style>

@@ -284,5 +284,7 @@ def test_import_is_a_separate_button_not_a_view_switch(page):
     page.wait_for_selector("text=入れた PDF はすべて使います", timeout=15000)
     assert exception_text(page) is None
     page.get_by_role("button", name="地図とクイズに戻る").click()
-    page.wait_for_function("() => window.__qmMapApp && window.__qmMapApp.view", timeout=30000)
+    # window.__qmMapApp は前の地図のものが残っているので、取り込み画面が消えて地図が描き直されるのを待つ
+    page.wait_for_selector("text=入れた PDF はすべて使います", state="detached", timeout=15000)
+    page.wait_for_function("() => window.__qmMapApp && window.__qmMapApp.el.isConnected", timeout=30000)
     assert "入れた PDF はすべて使います" not in main_text(page)
