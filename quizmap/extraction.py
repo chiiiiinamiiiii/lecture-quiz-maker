@@ -20,12 +20,12 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from quizmap.common import OTHER_LABEL, Lecture, call_json, lecture_as_prompt_text, normalize_text, write_json
-from quizmap.vocab import kind_examples
+from quizmap.vocab import kind_examples, language_name, language_of, language_rule
 
 # ------------------------------------------------------------------ 概念抽出
 
 CONCEPT_SYSTEM = """あなたは大学の授業資料から、学習者が理解すべき「概念」を漏れなく取り出す専門家です。
-出力は日本語。与えられた種類（kind）だけを使います。"""
+{language_rule}与えられた種類（kind）だけを使います。"""
 
 CONCEPT_USER = """授業「{course}」の第{lecture}回の資料です（ページ番号付き）。
 この回に出てくる概念をすべて取り出してください。
@@ -37,7 +37,7 @@ CONCEPT_USER = """授業「{course}」の第{lecture}回の資料です（ペー
 守ること:
 - 出てくる概念はすべて挙げる。1 度しか出てこない概念も挙げる。数の上限はない
 - 一方で、資料に書かれていない概念を足さない
-- label は資料中の表記に合わせた短い日本語（人名は姓名、立場は正式名称）
+- label は資料中の表記に合わせた短い{language}（人名は姓名、立場は正式名称）
 - id は label をローマ字にした snake_case の ASCII（例: kant, gimu_ron）。既出の概念は既出の id と label をそのまま使う
 - definition は資料の記述に基づいて 1〜2 文
 - pages はその概念が登場するこの回のページ番号（複数可）。必ず 1 つ以上入れる
@@ -167,6 +167,8 @@ def clean_id(raw: str, fallback: str) -> str:
 
 def extract_concepts(client, model: str, course: str, vocab: dict, lectures: list[Lecture], log=print):
     """回ごとに順番に呼ぶ。既出の概念一覧を渡して label/id を揃えさせる。"""
+    lang = language_of(vocab, (page for lec in lectures for page in lec.pages))
+    system = CONCEPT_SYSTEM.replace("{language_rule}", language_rule(lang))
     kinds_text = "\n".join(
         f"- {k['name']}: {k['definition']}（例: {'、'.join(kind_examples(k))}）" for k in vocab["kinds"]
     )
@@ -182,10 +184,10 @@ def extract_concepts(client, model: str, course: str, vocab: dict, lectures: lis
         else:
             known_block = ""
         data = call_json(
-            client, model=model, system=CONCEPT_SYSTEM, schema=CONCEPT_SCHEMA,
+            client, model=model, system=system, schema=CONCEPT_SCHEMA,
             user=CONCEPT_USER.format(
                 course=course, lecture=lec.number, kinds=kinds_text, other=OTHER_LABEL,
-                known_block=known_block, text=lecture_as_prompt_text(lec),
+                known_block=known_block, text=lecture_as_prompt_text(lec), language=language_name(lang),
             ),
         )
         new = 0

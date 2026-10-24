@@ -6,20 +6,62 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 
 from quizmap.common import OTHER_LABEL, call_json, lecture_as_prompt_text
 
 # 1 回の呼び出しに入れる文字数の上限。超えたら代表的な回を等間隔に選ぶ（§4「または代表的な数回分」）
 MAX_CORPUS_CHARS = 150_000
 
+# ------------------------------------------------------------------ 資料の言語（#26）
+# LLM が作る中身（語彙・概念・関係・定義・問題・採点）は資料の言語で書かせる。画面の言語（ui/i18n.py）とは別。
+# プロンプトの指示文は日本語のまま、出力の言語だけを差し込む。
+
+LANGUAGE_NAMES = {"ja": "日本語", "en": "英語（English）"}
+_JA_RE = re.compile(r"[\u3040-\u30ff\u4e00-\u9fff]")      # かな・漢字
+_LATIN_RE = re.compile(r"[A-Za-z]")
+# かな・漢字 ÷（かな・漢字 ＋ ラテン文字）がこれ以上なら日本語。
+# 2026-10 の実データ: 倫理学（日本語）0.88〜0.95、NLP（英語）0.003。英単語は 1 語で数文字になるので低めに置く
+JA_THRESHOLD = 0.3
+
+
+def detect_language(texts) -> str:
+    """資料の本文から言語を決める（ja / en）。文字が無ければ ja。"""
+    ja = latin = 0
+    for t in texts:
+        ja += len(_JA_RE.findall(t))
+        latin += len(_LATIN_RE.findall(t))
+    if ja + latin == 0:
+        return "ja"
+    return "ja" if ja / (ja + latin) >= JA_THRESHOLD else "en"
+
+
+def language_of(vocab: dict, texts=()) -> str:
+    """そのコースの言語。vocab.json の meta.language を使い、無ければ（#26 より前の vocab）本文から決める。"""
+    lang = (vocab.get("meta") or {}).get("language")
+    if lang in LANGUAGE_NAMES:
+        return lang
+    return detect_language(texts)
+
+
+def language_name(lang: str) -> str:
+    return LANGUAGE_NAMES.get(lang, LANGUAGE_NAMES["ja"])
+
+
+def language_rule(lang: str) -> str:
+    """システムプロンプトに差し込む、出力の言語の指示。"""
+    return (f"出力（名前・定義・説明・問題文など、あなたが書く中身）はすべて{language_name(lang)}で書きます。"
+            "資料の用語は、資料での表記のまま使います（訳さない）。")
+
+
 SYSTEM = """あなたは大学の授業資料を読み、その授業に固有の「概念の種類」と「概念どうしの関係ラベル」を設計する専門家です。
-出力は日本語で書きます。資料に実際に現れるものだけを挙げ、一般論で思いつくものを足してはいけません。"""
+{language_rule}資料に実際に現れるものだけを挙げ、一般論で思いつくものを足してはいけません。"""
 
 USER_TEMPLATE = """以下は「{course_hint}」という授業の資料です（{n_lectures}回分、ページ番号付き）。
 
 この資料に出てくる概念どうしの関係を分類するラベルを 6〜12 個、提案してください。
 各ラベルについて、
- (a) 名前（短い日本語。例: 提唱、対立、批判、前提）
+ (a) 名前（短い{language}。日本語の資料なら例えば 提唱、対立、批判、前提）
  (b) 定義（どういうときにこのラベルを付けるか。from が何で to が何かを必ず書くこと。例: from が手段、to が目的）
  (c) その関係をクイズにするときの問い方（例: 「AとBの違いを問う」「誰がAを提唱したかを問う」）
  (d) 資料中の実例（「A → B」のように概念名で。from → to の順）
@@ -157,11 +199,15 @@ def derive_vocab(client, model: str, lectures, course_hint: str, log=print) -> d
     if len(chosen) < len(lectures):
         log(f"資料が大きいので代表 {len(chosen)} 回を使う: {[l.number for l in chosen]}")
     corpus = "\n\n".join(lecture_as_prompt_text(lec) for lec in chosen)
+    lang = detect_language(page for lec in lectures for page in lec.pages)
+    log(f"資料の言語: {lang}（語彙・概念・問題はこの言語で書かせる）")
+    system = SYSTEM.replace("{language_rule}", language_rule(lang))
     log(f"{len(chosen)} 回分 {len(corpus):,} 文字を {model} に渡して語彙を導出中…")
     user = USER_TEMPLATE.format(
         course_hint=course_hint, n_lectures=len(chosen), other=OTHER_LABEL, corpus=corpus,
+        language=language_name(lang),
     )
-    vocab = call_json(client, model=model, system=SYSTEM, schema=SCHEMA, user=user, max_tokens=16000)
+    vocab = call_json(client, model=model, system=system, schema=SCHEMA, user=user, max_tokens=16000)
 
     # 関係の端になる種類が kinds に無ければ、不足を伝えて 1 回だけ作り直させる（人間の確認は挟まない）
     gaps = find_kind_gaps(vocab)
@@ -170,7 +216,7 @@ def derive_vocab(client, model: str, lectures, course_hint: str, log=print) -> d
         log("関係の端になる種類が足りない。1 回だけ作り直す: " + " / ".join(gaps))
         retried = True
         vocab = call_json(
-            client, model=model, system=SYSTEM, schema=SCHEMA, max_tokens=16000,
+            client, model=model, system=system, schema=SCHEMA, max_tokens=16000,
             user=RETRY_TEMPLATE.format(
                 base=user, previous=json.dumps(vocab, ensure_ascii=False, indent=1),
                 problems="\n".join(f"- {g}" for g in gaps),
@@ -197,6 +243,7 @@ def derive_vocab(client, model: str, lectures, course_hint: str, log=print) -> d
         "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
         "model": model,
         "lectures_used": [lec.number for lec in chosen],
+        "language": lang,
         "retried_for_kind_gaps": retried,
         "kind_gaps": gaps,
         "kind_warnings": warnings,
