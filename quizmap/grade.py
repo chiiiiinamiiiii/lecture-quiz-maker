@@ -12,8 +12,9 @@ import json
 from pathlib import Path
 
 from quizmap.common import call_json
+from quizmap.vocab import detect_language, language_rule
 
-JUDGE_SYSTEM = """あなたは大学の授業の記述問題を採点する採点者です。資料の記述と模範解答だけを基準にし、一般知識で甘くしたり厳しくしたりしないでください。出力は日本語です。"""
+JUDGE_SYSTEM = """あなたは大学の授業の記述問題を採点する採点者です。資料の記述と模範解答だけを基準にし、一般知識で甘くしたり厳しくしたりしないでください。{language_rule}"""
 
 JUDGE_SCHEMA = {
     "type": "object",
@@ -81,7 +82,9 @@ def grade(client, model: str, questions: list[dict], answers: dict[str, object],
             results[q["id"]] = {"score": 0.0, "correct": False, "feedback": "", "user_answer": text}
     calls = 0
     if short_items:
-        out = call_json(client, model=model, system=JUDGE_SYSTEM, schema=JUDGE_SCHEMA,
+        # 問題はコースの言語で作られているので、問題文と模範解答から言語を決める（#26）
+        lang = detect_language(t for it in short_items for t in (it["prompt"], it["answer_text"]))
+        out = call_json(client, model=model, system=JUDGE_SYSTEM.replace("{language_rule}", language_rule(lang)), schema=JUDGE_SCHEMA,
                         user=judge_user(short_items), max_tokens=4000)
         calls = 1
         for g in out["grades"]:
