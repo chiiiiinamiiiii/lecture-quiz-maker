@@ -4,7 +4,13 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from quizmap.common import list_models, make_client  # noqa: E402
+from quizmap.common import MissingAPIKeyError, list_models, make_client  # noqa: E402
 
-for m in list_models(make_client()):
+try:
+    client = make_client()
+except MissingAPIKeyError as e:
+    print(f"[error] {e}", file=sys.stderr)
+    sys.exit(1)
+
+for m in list_models(client):
     print(f"{m['name']:45s} in={m['inputTokenLimit']!s:>8} out={m['outputTokenLimit']!s:>6}  {m['displayName']}")

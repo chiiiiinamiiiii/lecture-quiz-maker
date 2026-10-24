@@ -37,7 +37,6 @@ def test_create_course_makes_folder_and_course_json(courses_dir):
     assert courses.list_courses()[0]["ready"] is False
 
 
-@pytest.mark.xfail(strict=True, reason="#3 同じ秒に作ると同じフォルダになり、前のコースを上書きする")
 def test_create_course_twice_in_same_second_keeps_both(courses_dir, frozen_clock):
     a = courses.create_course("A")
     write_json(a / "course.json", {**read_json(a / "course.json"),
@@ -46,6 +45,32 @@ def test_create_course_twice_in_same_second_keeps_both(courses_dir, frozen_clock
     assert a != b
     assert read_json(a / "course.json")["name"] == "A"
     assert len(read_json(a / "course.json")["files"]) == 1
+    assert read_json(b / "course.json")["name"] == "B"
+    assert {c["name"] for c in courses.list_courses()} == {"A", "B"}
+
+
+def test_create_course_does_not_reuse_existing_folder(courses_dir, frozen_clock):
+    """中身の無いフォルダが同じ id で残っていても、それを使わず別の id にする（#3）。"""
+    stale = courses_dir / "c20261024-120000-000000"
+    (stale / "uploads").mkdir(parents=True)
+    (stale / "uploads" / "残り.pdf").write_bytes(b"old")
+    d = courses.create_course("新しい")
+    assert d != stale
+    assert d.name.startswith("c20261024-120000-000000-")
+    assert list((d / "uploads").iterdir()) == []
+    assert not (stale / "course.json").exists()
+
+
+def test_create_course_many_in_same_instant_are_distinct(courses_dir, frozen_clock):
+    dirs = [courses.create_course(f"C{i}") for i in range(20)]
+    assert len(set(dirs)) == 20
+    assert sorted(c["name"] for c in courses.list_courses()) == sorted(f"C{i}" for i in range(20))
+
+
+def test_create_course_id_format(courses_dir):
+    import re
+    d = courses.create_course("c")
+    assert re.fullmatch(r"c\d{8}-\d{6}-\d{6}", d.name)
 
 
 # ------------------------------------------------------------------ save_upload
@@ -78,22 +103,65 @@ def test_save_upload_empty_name_falls_back(courses_dir):
     assert courses.save_upload(d, "", b"x").name == "upload.pdf"
 
 
-@pytest.mark.xfail(strict=True, reason="#4 ファイル名 '..' で uploads/.. を書こうとして IsADirectoryError")
-@pytest.mark.parametrize("filename", ["..", "a/.."])
+@pytest.mark.parametrize("filename", ["..", "a/..", ".", "...", " . ", "a\\..", "../.."])
 def test_save_upload_dotdot_name(courses_dir, filename):
     d = courses.create_course("c")
     p = courses.save_upload(d, filename, b"x")
     assert p.resolve().parent == (d / "uploads").resolve()
     assert p.is_file()
+    assert p.name == "upload.pdf"
 
 
-@pytest.mark.xfail(strict=True, reason="#5 記号だけ違う名前が同じ名前になり、前の PDF を上書きする")
+@pytest.mark.parametrize("filename, expected", [
+    ("../../evil.pdf", "evil.pdf"),
+    ("..\\..\\evil.pdf", "evil.pdf"),                       # Windows の区切り
+    ("C:\\Users\\me\\第3回.pdf", "第3回.pdf"),
+    (".hidden.pdf", "hidden.pdf"),                             # 隠しファイルにしない
+    ("..第2回.pdf", "第2回.pdf"),
+    ("a:b*c?.pdf", "a_b_c_.pdf"),
+    ("  第1回.pdf  ", "第1回.pdf"),
+    ("【配布用】第2回 倫理（前半）.pdf", "【配布用】第2回 倫理（前半）.pdf"),
+])
+def test_safe_upload_name(filename, expected):
+    assert courses.safe_upload_name(filename) == expected
+
+
 def test_save_upload_distinct_names_do_not_collide(courses_dir):
     d = courses.create_course("c")
     a = courses.save_upload(d, "a:b.pdf", b"A")
     b = courses.save_upload(d, "a?b.pdf", b"B")
-    assert a != b
-    assert a.read_bytes() == b"A" and b.read_bytes() == b"B"
+    c = courses.save_upload(d, "a*b.pdf", b"C")
+    assert (a.name, b.name, c.name) == ("a_b.pdf", "a_b (2).pdf", "a_b (3).pdf")
+    assert (a.read_bytes(), b.read_bytes(), c.read_bytes()) == (b"A", b"B", b"C")
+
+
+def test_save_upload_same_content_is_not_duplicated(courses_dir):
+    d = courses.create_course("c")
+    a = courses.save_upload(d, "第1回.pdf", b"same")
+    b = courses.save_upload(d, "第1回.pdf", b"same")
+    assert a == b
+    assert sorted(p.name for p in (d / "uploads").iterdir()) == ["第1回.pdf"]
+
+
+def test_save_upload_same_name_new_content_keeps_old(courses_dir):
+    d = courses.create_course("c")
+    a = courses.save_upload(d, "第1回.pdf", b"old")
+    b = courses.save_upload(d, "第1回.pdf", b"new")
+    assert a.read_bytes() == b"old"
+    assert b.name == "第1回 (2).pdf" and b.read_bytes() == b"new"
+
+
+@pytest.mark.parametrize("filename, lecture", [
+    ("第3回.pdf", 3), ("week3.pdf", 3), ("05_intro.pdf", 5), ("syllabus.pdf", None),
+])
+def test_numbered_name_keeps_lecture_number(courses_dir, filename, lecture):
+    """連番を付けた名前でも、ファイル名から読む講義回は変わらない（「_2」だと第2回と読まれる）。"""
+    from quizmap.common import lecture_number_of
+    d = courses.create_course("c")
+    courses.save_upload(d, filename, b"1")
+    p = courses.save_upload(d, filename, b"2")
+    assert p.name != filename
+    assert lecture_number_of(p) == lecture
 
 
 def test_save_upload_lecture_number_survives_sanitizing(courses_dir):

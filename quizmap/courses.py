@@ -20,6 +20,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import re
+import secrets
 import shutil
 import threading
 import traceback
@@ -52,9 +53,24 @@ def list_courses() -> list[dict]:
 
 
 def create_course(name: str) -> Path:
-    cid = dt.datetime.now().strftime("c%Y%m%d-%H%M%S")
-    d = COURSES_DIR / cid
-    (d / "uploads").mkdir(parents=True, exist_ok=True)
+    """新しいコースのフォルダを作る。id は c年月日-時分秒-マイクロ秒。
+
+    同じ id のフォルダが既にあれば作り直さず、末尾に短い乱数を足した別の id にする（#3）。
+    フォルダの作成は exist_ok=False なので、同時に呼ばれても同じフォルダを 2 人が使うことはない。
+    """
+    COURSES_DIR.mkdir(parents=True, exist_ok=True)
+    base = dt.datetime.now().strftime("c%Y%m%d-%H%M%S-%f")
+    cid = base
+    for _ in range(100):
+        d = COURSES_DIR / cid
+        try:
+            d.mkdir()
+            break
+        except FileExistsError:
+            cid = f"{base}-{secrets.token_hex(2)}"
+    else:
+        raise RuntimeError(f"コースのフォルダを作れなかった: {COURSES_DIR / base}")
+    (d / "uploads").mkdir()
     write_json(d / "course.json", {"name": name, "created_at": now(), "files": []})
     return d
 
@@ -80,11 +96,37 @@ def rename_course(d: Path, name: str) -> None:
 _SAFE = re.compile(r"[^\w\-. ()（）【】『』「」]+")
 
 
+def safe_upload_name(filename: str) -> str:
+    """アップロードのファイル名を uploads/ の中で使える名前にする。
+
+    パスの部分は捨て、許可しない文字は _ にする。「.」「..」や先頭の「.」（隠しファイル）は使わない（#4）。
+    """
+    name = _SAFE.sub("_", filename.replace("\\", "/").split("/")[-1])
+    name = name.strip().lstrip(".").strip()
+    return name or "upload.pdf"
+
+
 def save_upload(d: Path, filename: str, data: bytes) -> Path:
-    name = _SAFE.sub("_", Path(filename).name) or "upload.pdf"
-    path = d / "uploads" / name
-    path.write_bytes(data)
-    return path
+    """uploads/ に保存して、保存先を返す。
+
+    同じ名前のファイルが既にあれば、中身が同じならそれを使い（書かない）、違えば
+    「名前 (2).pdf」のように連番を付けて保存する。既存のファイルは上書きしない（#5）。
+    連番は「_2」ではなく「 (2)」にする。「_2」だとファイル名から第2回と読まれてしまう。
+    """
+    name = safe_upload_name(filename)
+    stem, suffix = Path(name).stem, Path(name).suffix
+    uploads = d / "uploads"
+    uploads.mkdir(parents=True, exist_ok=True)
+    for i in range(1, 1000):
+        path = uploads / (name if i == 1 else f"{stem} ({i}){suffix}")
+        try:
+            with path.open("xb") as f:          # 無ければ作る。あれば FileExistsError（上書きしない）
+                f.write(data)
+            return path
+        except FileExistsError:
+            if path.is_file() and path.read_bytes() == data:
+                return path
+    raise RuntimeError(f"同じ名前のファイルが多すぎる: {name}")
 
 
 def import_legacy(data_dir: Path) -> Path | None:

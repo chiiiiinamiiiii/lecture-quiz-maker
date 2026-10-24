@@ -162,21 +162,34 @@ def test_failure_in_vocab(courses_dir, fakes, monkeypatch):
     _assert_saved(d, job)
 
 
-@pytest.mark.xfail(strict=True, reason="#2 make_client の sys.exit が except Exception を素通りし、Job が running のまま残る")
 def test_failure_missing_api_key(courses_dir, fakes, monkeypatch):
     # 本物の make_client を使う。.env を読まないようにして、キーが無い状況を作る（API は呼ばない）
     monkeypatch.setattr(courses, "make_client", common.make_client)
     monkeypatch.setattr(common, "load_dotenv", lambda *a, **kw: None)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     d = _course()
-    job = courses.Job(course_dir=str(d))
-    try:
-        courses._run(job, d, False, "fake-model")
-    except BaseException:  # noqa: BLE001  裏のスレッドでは誰も受け取らない
-        pass
+    job = _run(d)                                         # 例外が外に漏れないこと（#2）
     assert job.status == "error"
-    assert "GEMINI_API_KEY" in job.error
-    assert read_json(d / "job.json")["status"] == "error"
+    assert job.error.startswith("MissingAPIKeyError: GEMINI_API_KEY がない")
+    assert fakes["derive"] == 0
+    _assert_saved(d, job)
+    assert courses.current_job(d).status == "error"
+
+
+def test_missing_api_key_does_not_block_next_ingest(courses_dir, fakes, monkeypatch, ticking_clock):
+    """キーが無くて失敗したあと、キーを入れれば（再起動せずに）次の取り込みを始められる（#2）。"""
+    monkeypatch.setattr(courses, "make_client", common.make_client)
+    monkeypatch.setattr(common, "load_dotenv", lambda *a, **kw: None)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    d = _course()
+    job = courses.start_ingest(d, model="fake-model")
+    _wait(job)
+    assert job.status == "error"
+    assert courses.running_job() is None
+    monkeypatch.setenv("GEMINI_API_KEY", "dummy-not-used")   # 差し替えた LLM しか呼ばないので API には行かない
+    job2 = courses.start_ingest(d, model="fake-model")
+    _wait(job2)
+    assert job2.status == "done"
 
 
 # ------------------------------------------------------------------ 使う資料ゼロ

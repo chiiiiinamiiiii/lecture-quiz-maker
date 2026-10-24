@@ -74,12 +74,17 @@ class LLMClient:
         return {"x-goog-api-key": self.api_key, "Content-Type": "application/json"}
 
 
+class MissingAPIKeyError(RuntimeError):
+    """GEMINI_API_KEY が設定されていない。CLI は文言を表示して終了コード 1、アプリは画面に理由を出す。"""
+
+
 def make_client() -> LLMClient:
+    """キーが無ければ MissingAPIKeyError。sys.exit はしない（裏のスレッドで呼ぶと Job が止まったまま残るため, #2）。"""
     load_dotenv()
     key = os.environ.get("GEMINI_API_KEY")
     if not key:
-        sys.exit(
-            "[error] GEMINI_API_KEY がない。Google AI Studio (https://aistudio.google.com/apikey) で\n"
+        raise MissingAPIKeyError(
+            "GEMINI_API_KEY がない。Google AI Studio (https://aistudio.google.com/apikey) で\n"
             "        個人アカウントのキーを作り、次のファイルに書くこと（.gitignore 済み）:\n"
             f"          {PROJECT_DIR / '.env'}  →  GEMINI_API_KEY=AIza..."
         )
