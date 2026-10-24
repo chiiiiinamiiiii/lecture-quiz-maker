@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from quizmap.common import DEFAULT_MODEL, load_lectures, make_client, write_json  # noqa: E402
+from quizmap.common import DEFAULT_MODEL, MissingAPIKeyError, load_lectures, make_client, write_json  # noqa: E402
 from quizmap.vocab import derive_vocab  # noqa: E402
 
 
@@ -43,4 +43,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except MissingAPIKeyError as e:
+        print(f"[error] {e}", file=sys.stderr)
+        sys.exit(1)

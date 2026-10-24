@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from quizmap.common import DEFAULT_MODEL, make_client, read_json, write_json  # noqa: E402
+from quizmap.common import DEFAULT_MODEL, MissingAPIKeyError, make_client, read_json, write_json  # noqa: E402
 from quizmap.quiz import generate_quiz  # noqa: E402
 
 DATA = Path(__file__).resolve().parent / "data"
@@ -51,4 +51,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except MissingAPIKeyError as e:
+        print(f"[error] {e}", file=sys.stderr)
+        sys.exit(1)
