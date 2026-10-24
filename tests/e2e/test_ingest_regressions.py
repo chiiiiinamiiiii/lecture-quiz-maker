@@ -12,7 +12,7 @@ def _course(data_dir):
 
 
 def _set_hand_edited(course):
-    """一覧に NAME を「講義回 4・使う」で置いた状態（手で直した状態）にする。"""
+    """一覧に NAME を「講義回 40・使う」で置いた状態にする（ほかの回と重ならない番号なので、そのまま残るはず）。"""
     info_path = course / "course.json"
     info = json.loads(info_path.read_text(encoding="utf-8"))
     (course / "uploads").mkdir(exist_ok=True)
@@ -20,7 +20,7 @@ def _set_hand_edited(course):
         p.unlink()
     (course / "uploads" / NAME).write_bytes(OLD)
     info["files"] = [f for f in info["files"] if not f["name"].startswith("readd_test_")]
-    info["files"].append({"name": NAME, "lecture": 4, "use": True})
+    info["files"].append({"name": NAME, "lecture": 40, "use": True})
     info_path.write_text(json.dumps(info, ensure_ascii=False), encoding="utf-8")
 
 
@@ -31,7 +31,7 @@ def _files(course):
 def _upload(page, tmp_path, data: bytes) -> str:
     """取り込み画面で NAME の PDF を追加し、出たトーストの文言を返す。"""
     page.get_by_text("資料の取り込み", exact=True).click()
-    page.wait_for_selector("text=講義回の割り当て", timeout=15000)
+    page.wait_for_selector("text=入れた PDF はすべて使います", timeout=15000)
     src = tmp_path / NAME
     src.write_bytes(data)
     page.locator("[data-testid='stFileUploader'] input[type='file']").first.set_input_files(str(src))
@@ -49,7 +49,7 @@ def test_readd_same_file_keeps_lecture_and_use(page, data_dir, tmp_path):
     _set_hand_edited(course)
     toast = _upload(page, tmp_path, OLD)
     files = _files(course)
-    assert files[NAME]["lecture"] == 4 and files[NAME]["use"] is True
+    assert files[NAME]["lecture"] == 40 and files[NAME]["use"] is True
     assert not any(n.startswith("readd_test_") and n != NAME for n in files)
     assert "そのまま" in toast
 
@@ -60,9 +60,13 @@ def test_readd_different_content_adds_new_entry_and_keeps_old(page, data_dir, tm
     _set_hand_edited(course)
     toast = _upload(page, tmp_path, b"%PDF-1.4 readd new")
     files = _files(course)
-    assert files[NAME]["lecture"] == 4 and files[NAME]["use"] is True
+    assert files[NAME]["lecture"] == 40 and files[NAME]["use"] is True
     assert (course / "uploads" / NAME).read_bytes() == OLD
     assert "readd_test_資料 (2).pdf" in files
+    # 講義回が読めない資料も使われ、続きの番号が振られる（講義回の割り当ての手順は無い）
+    new = files["readd_test_資料 (2).pdf"]
+    assert new["use"] is True and new["lecture"] == max(f["lecture"] for n, f in files.items() if n != "readd_test_資料 (2).pdf") + 1
+    assert all(f["use"] for f in files.values())
     assert "追加しました" in toast
 
 
@@ -73,14 +77,13 @@ def test_ingest_page_in_english(page, data_dir, tmp_path):
     page.get_by_text("English", exact=True).click()
     page.wait_for_timeout(3000)
     page.get_by_text("Import materials", exact=True).click()
-    page.wait_for_selector("text=Lecture numbers", timeout=15000)
+    page.wait_for_selector("text=Every uploaded PDF is used", timeout=15000)
     text = main_text(page)
     assert exception_text(page) is None
-    for s in ("Import materials:", "Add PDFs", "Lecture numbers"):
+    for s in ("Import materials:", "Add PDFs", "Every uploaded PDF is used"):
         assert s in text
-    for s in ("資料の取り込み：", "講義回の割り当て", "資料を追加する"):
+    for s in ("資料の取り込み：", "入れた PDF はすべて使います", "資料を追加する"):
         assert s not in text
-    # 表（st.data_editor）の見出しは canvas に描かれ DOM から読めないので、ここでは見ない
 
     src = tmp_path / NAME
     src.write_bytes(OLD)
@@ -89,4 +92,4 @@ def test_ingest_page_in_english(page, data_dir, tmp_path):
     page.wait_for_selector("[data-testid='stToast']", timeout=15000)
     assert "already in the list" in page.locator("[data-testid='stToast']").first.inner_text()
     files = _files(course)
-    assert files[NAME]["lecture"] == 4 and files[NAME]["use"] is True
+    assert files[NAME]["lecture"] == 40 and files[NAME]["use"] is True

@@ -305,3 +305,35 @@ def test_current_job_gives_error_when_json_stays_broken(courses_dir, monkeypatch
     assert got.status == "error"
     assert "job.json" in got.error
     assert got.course_dir == str(d)
+
+
+# ------------------------------------------------------------------ assign_lecture_numbers（講義回の自動の割り当て）
+
+def test_assign_uses_every_file_and_fills_missing_numbers():
+    files = [
+        {"name": "第2回.pdf", "lecture": 2, "use": True},
+        {"name": "第1回.pdf", "lecture": 1, "use": True},
+        {"name": "モモ.pdf", "lecture": None, "use": False},
+        {"name": "読書.pdf", "lecture": None, "use": True},
+    ]
+    out = courses.assign_lecture_numbers(files)
+    assert all(f["use"] for f in out)
+    assert {f["name"]: f["lecture"] for f in out} == {"第1回.pdf": 1, "第2回.pdf": 2, "モモ.pdf": 3, "読書.pdf": 4}
+
+
+def test_assign_moves_duplicates_and_prefers_the_shorter_name():
+    files = [
+        {"name": "第2回 補足.pdf", "lecture": 2, "use": True},
+        {"name": "第2回.pdf", "lecture": 2, "use": True},
+        {"name": "第5回.pdf", "lecture": 5, "use": True},
+    ]
+    out = {f["name"]: f["lecture"] for f in courses.assign_lecture_numbers(files)}
+    assert out == {"第2回.pdf": 2, "第5回.pdf": 5, "第2回 補足.pdf": 6}
+
+
+def test_assign_keeps_existing_unique_numbers_stable():
+    files = [{"name": "a.pdf", "lecture": 4, "use": True}, {"name": "b.pdf", "lecture": 1, "use": True}]
+    out = courses.assign_lecture_numbers(files)
+    assert {f["name"]: f["lecture"] for f in out} == {"a.pdf": 4, "b.pdf": 1}
+    assert courses.assign_lecture_numbers(out) == out
+    assert courses.assign_lecture_numbers([]) == []

@@ -126,7 +126,7 @@ def hover_tooltip(pg: Page, cid: str) -> dict:
 
 
 def create_course_until_ingest(pg: Page, data_dir: Path, pdf: Path) -> Path:
-    """新しいコースを作り、講義回の割り当てを確かめ、「取り込みを始める」が押せる所まで進む。API は呼ばない。"""
+    """新しいコースを作り、資料の一覧を確かめ、「取り込みを始める」が押せる所まで進む。API は呼ばない。"""
     main = pg.locator("[data-testid='stMain']")
     _wait_text(pg, "新しいコースを作る", 30, "新しいコースの画面")
     main.get_by_label("コース名").fill(COURSE_NAME)
@@ -137,13 +137,13 @@ def create_course_until_ingest(pg: Page, data_dir: Path, pdf: Path) -> Path:
     expect(create).to_be_enabled(timeout=10000)
     create.click()
 
-    _wait_text(pg, "講義回の割り当て", 30, "コースを作った直後")
+    _wait_text(pg, "入れた PDF はすべて使います", 30, "コースを作った直後")
     d = _course_dir(data_dir)
     info = json.loads((d / "course.json").read_text(encoding="utf-8"))
     assert info["name"] == COURSE_NAME
     assert [(f["lecture"], f["use"]) for f in info["files"]] == [(LECTURE, True)], info["files"]
     assert (d / "uploads" / info["files"][0]["name"]).read_bytes() == pdf.read_bytes()
-    _wait_text(pg, "1 回分を取り込みます", 15, "講義回の割り当て")
+    _wait_text(pg, "1 回分を取り込みます", 15, "資料の一覧")
     expect(main.get_by_role("button", name="取り込みを始める")).to_be_enabled(timeout=10000)
     return d
 

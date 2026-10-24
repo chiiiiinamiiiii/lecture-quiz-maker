@@ -307,6 +307,28 @@ def _run(job: Job, d: Path, rebuild_vocab: bool, model: str) -> None:
         job.save()
 
 
+def assign_lecture_numbers(files: list[dict]) -> list[dict]:
+    """入れた資料はすべて使う。講義回は、すでに決まっていて重ならないものはそのまま、
+    ファイル名から読めないもの・ほかと重なるものには、いま使っている最大の回の次から順に振る。
+    利用者が講義回を割り当てる手順は無い（入れたものを全部活用する）。"""
+    out = [dict(f, use=True) for f in files]
+    taken: set[int] = set()
+    pending = []
+    # 同じ回が重なったら、名前の短いほう（「第2回.pdf」と「第2回 補足.pdf」なら前者）がその回を取る
+    for f in sorted(out, key=lambda f: (f.get("lecture") is None, f.get("lecture") or 0, len(f["name"]), f["name"])):
+        n = f.get("lecture")
+        if isinstance(n, int) and n >= 1 and n not in taken:
+            taken.add(n)
+        else:
+            pending.append(f)
+    nxt = max(taken, default=0) + 1
+    for f in pending:
+        f["lecture"] = nxt
+        taken.add(nxt)
+        nxt += 1
+    return sorted(out, key=lambda f: (f["lecture"], f["name"]))
+
+
 def lecture_numbers_conflict(files: list[dict]) -> list[int]:
     seen, dup = set(), set()
     for f in files:

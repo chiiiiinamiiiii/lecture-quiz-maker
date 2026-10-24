@@ -165,7 +165,7 @@ def test_ingest_page_opens(page):
     page.get_by_text("資料の取り込み", exact=True).click()
     page.wait_for_timeout(2500)
     assert exception_text(page) is None
-    assert "講義回の割り当て" in main_text(page)
+    assert "入れた PDF はすべて使います" in main_text(page)
 
 
 # ------------------------------------------------------------------ #41: クリック・ダブルクリックで選択が消えない
