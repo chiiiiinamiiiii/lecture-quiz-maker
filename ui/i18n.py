@@ -46,6 +46,9 @@ TEXTS = {
     "by_lecture": {"ja": "講義回で選ぶ", "en": "By lecture"},
     "all": {"ja": "全部", "en": "All"},
     "lecture_fmt": {"ja": "第{n}回", "en": "L{n}"},
+    "external_rel": {"ja": "外部資料（Wikipedia）で補った関係", "en": "Relation added from an external source (Wikipedia)"},
+    "external_legend": {"ja": "外部資料で補った関係", "en": "From external source"},
+    "external_src": {"ja": "出典", "en": "Source"},
     "lecture_short": {"ja": "{n}", "en": "L{n}"},   # 「講義回」の配置の列の見出し（短い形。#44）
     "count_fmt": {"ja": "{n} 個を選択中", "en": "{n} selected"},
     "def_hidden": {"ja": "解答中は定義を隠しています", "en": "Definitions are hidden while you answer"},
@@ -132,8 +135,10 @@ TEXTS = {
     "list_sep": {"ja": "、", "en": ", "},
     "phase_read": {"ja": "PDF の読み込み", "en": "Reading PDFs"},
     "phase_vocab": {"ja": "語彙の導出", "en": "Deriving the vocabulary"},
+    "phase_index": {"ja": "索引づくり", "en": "Building the search index"},
     "phase_concepts": {"ja": "概念の抽出", "en": "Extracting concepts"},
     "phase_relations": {"ja": "関係の抽出", "en": "Extracting relations"},
+    "phase_completion": {"ja": "関係の補完", "en": "Completing relations"},
     "phase_slides": {"ja": "スライド画像の作成", "en": "Rendering slide images"},
 }
 
@@ -151,5 +156,6 @@ def map_texts() -> dict:
     """地図部品（JavaScript）に渡す文言。"""
     keys = ["tool_hand", "tool_lasso", "tool_rect", "zoom_in", "zoom_out", "fit", "clear", "layout_force",
             "layout_timeline", "density", "unasked", "asked", "selected", "hint_hand", "hint_select", "by_lecture", "all",
-            "lecture_fmt", "lecture_short", "count_fmt", "def_hidden"]
+            "lecture_fmt", "lecture_short", "count_fmt", "def_hidden",
+            "external_rel", "external_legend", "external_src"]
     return {k: TEXTS[k].get(lang()) or TEXTS[k]["ja"] for k in keys}

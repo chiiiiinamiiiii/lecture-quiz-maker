@@ -37,6 +37,7 @@ const COLORS = {
 };
 // LLM が資料から作った文字列（概念名・定義・関係の名前）を HTML に差し込む前に無害化する（#42）
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+const EXTERNAL_DASH = [4, 4];   // 外部資料で補った関係の辺の点線（画面の px）
 const rgba = (c, a) => `rgba(${c[0]},${c[1]},${c[2]},${a})`;
 
 function pointInPolygon(x, y, poly) {
@@ -166,7 +167,9 @@ class MapApp {
     this.root.querySelector(".qm-legend").innerHTML =
       `<span><i style="background:${rgba(COLORS.unasked, 1)}"></i>${T.unasked}</span>` +
       `<span><i style="background:${rgba(COLORS.asked, 1)}"></i>${T.asked}</span>` +
-      `<span><i class="ring"></i>${T.selected}</span>`;
+      `<span><i class="ring"></i>${T.selected}</span>` +
+      // 外部資料で補った関係（点線の辺）は、その地図にあるときだけ凡例に出す
+      (this.edges.some((e) => e.external) ? `<span class="ext"><i class="dash"></i>${esc(T.external_legend)}</span>` : "");
     const hint = this.root.querySelector(".qm-hint");
     const hintText = this.tool === "hand" ? T.hint_hand : T.hint_select;   // ツールごとに説明を替える（#67）
     hint.textContent = hintText;
@@ -401,7 +404,9 @@ class MapApp {
       if (focus) { const on = e.s === hov || e.t === hov; alpha = on ? 0.85 : 0.04; color = on ? COLORS.accent : COLORS.edge; width = on ? 1.4 : 1; }
       if (hovEdge && hovEdge.id === e.id) { alpha = 0.95; color = COLORS.accent; width = 2; }
       ctx.strokeStyle = rgba(color, alpha); ctx.lineWidth = width;
+      ctx.setLineDash(e.external ? EXTERNAL_DASH : []);       // 外部資料（Wikipedia）で補った関係は点線
       ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke();
+      ctx.setLineDash([]);
       if (this.layout === "force" && this.view.scale > 900 && !focus) {                        // 拡大したら辺の中点を見せる
         ctx.fillStyle = rgba(color, Math.min(0.6, alpha + 0.15));
         ctx.beginPath(); ctx.arc((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, 1.8, 0, Math.PI * 2); ctx.fill();
@@ -535,6 +540,8 @@ class MapApp {
     } else {
       const e = this.edges.find((x) => x.id === this.hover.id);
       html = `<b>${esc(this.byId.get(e.s).label)}</b> <span class="rel">${esc(e.label)}</span> <b>${esc(this.byId.get(e.t).label)}</b>` +
+        (e.external ? `<div class="ext">${esc(T.external_rel)}</div>` +
+          (e.article ? `<small class="ext-src">${esc(T.external_src)}: ${esc(e.article)}</small>` : "") : "") +
         `<small>${esc(T.lecture_fmt.replace("{n}", e.lecture))} p.${esc(e.page)}</small>`;
     }
     this.tooltip.innerHTML = html;
