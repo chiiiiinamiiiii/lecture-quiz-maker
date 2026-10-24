@@ -88,6 +88,7 @@ RELATION_USER = """授業「{course}」の第{lecture}回の資料です（ペ�
 - from と to は上の id から選ぶ。同じ id を両端にしない
 - label はラベルの定義に従って選ぶ。無理に当てはめず、合わなければ「{other}」にする
 - from と to はラベルの定義が決める向きに従う。逆向きの関係ならば from と to を入れ替える
+- from と to の概念の種類が、ラベルの【向き】に書かれた種類でなければ、そのラベルは使わない
 - A が B の定義そのもの、または A と B が同じものの言い換えである場合、それに合うラベルが無ければ「{other}」にする。ほかのラベルに押し込まない
 - page はその関係が書かれているこの回のページ番号
 - evidence には、その関係が書かれている箇所を page のページ本文からそのまま 40 字以内で抜き出す。抜き出せない関係は出さない
@@ -231,10 +232,35 @@ def _direction_text(rel: dict) -> str:
     return f"【向き: from は {'・'.join(f) or '指定なし'}、to は {'・'.join(t) or '指定なし'}】"
 
 
+def check_end_kinds(f: str, t: str, label: str, concepts: dict[str, dict],
+                    rel_by_label: dict[str, dict]) -> tuple[str, str, str, str | None]:
+    """関係の両端の概念の種類が、ラベルの from_kinds・to_kinds に合うか（Issue #49）。LLM は呼ばない。
+
+    合えばそのまま。合わなければ逆向きで合うかを見て、合えば from と to を入れ替える（"swapped"）。
+    それでも合わなければラベルを「その他」にする（"other"）。関係そのものは資料にあるかもしれないので落とさない。
+    from_kinds・to_kinds が空のラベル（旧形式の vocab）と「その他」は照合しない。
+    戻り値: (from, to, label, 直した内容 または None)
+    """
+    rel = rel_by_label.get(label)
+    if label == OTHER_LABEL or rel is None:
+        return f, t, label, None
+    fk, tk = set(rel.get("from_kinds") or []), set(rel.get("to_kinds") or [])
+    if not fk or not tk:
+        return f, t, label, None
+    kf, kt = concepts[f]["kind"], concepts[t]["kind"]
+    if kf in fk and kt in tk:
+        return f, t, label, None
+    if kt in fk and kf in tk:
+        return t, f, label, "swapped"
+    return f, t, OTHER_LABEL, "other"
+
+
 def extract_relations(client, model: str, course: str, vocab: dict, lectures: list[Lecture],
-                      concepts: dict[str, dict], workers: int, log=print) -> tuple[list[dict], dict]:
+                      concepts: dict[str, dict], workers: int, log=print) -> tuple[list[dict], dict, dict]:
     """概念 id を固定して、回ごとに関係を出させる（回は独立なので並列）。"""
     labels = {r["label"] for r in vocab["relations"]} | {OTHER_LABEL}
+    rel_by_label = {r["label"]: r for r in vocab["relations"]}
+    adjusted = collections.Counter()      # 落とさずに直した数（dropped とは別に数える）
     rel_text = "\n".join(
         f"- {r['label']}: {r['definition']}{_direction_text(r)}（例: {r['example']}）"
         for r in vocab["relations"] if r["label"] != OTHER_LABEL
@@ -266,6 +292,11 @@ def extract_relations(client, model: str, course: str, vocab: dict, lectures: li
                 if label not in labels:
                     dropped["vocab にないラベル→その他"] += 1
                     label = OTHER_LABEL
+                f, t, label, fix = check_end_kinds(f, t, label, concepts, rel_by_label)
+                if fix == "swapped":
+                    adjusted["向きを直した"] += 1
+                elif fix == "other":
+                    dropped["端の種類が合わない→その他"] += 1
                 if not 1 <= r["page"] <= lec.page_count:
                     dropped["ページ番号が範囲外"] += 1
                     continue
@@ -285,7 +316,10 @@ def extract_relations(client, model: str, course: str, vocab: dict, lectures: li
     dropped.update(merged)
     log("同じ概念対の整理: " + (", ".join(f"{k} {v}" for k, v in merged.items()) or "なし")
         + f" → 関係 {len(relations)}")
-    return relations, dict(dropped)
+    if adjusted or dropped.get("端の種類が合わない→その他"):
+        log(f"端の種類の照合: 向きを直した {adjusted['向きを直した']}、"
+            f"合わないので「その他」にした {dropped.get('端の種類が合わない→その他', 0)}")
+    return relations, dict(dropped), dict(adjusted)
 
 
 def resolve_pair_conflicts(candidates: list[dict]) -> tuple[list[dict], collections.Counter]:
@@ -375,7 +409,7 @@ def run_extraction(client, model: str, vocab: dict, lectures: list[Lecture], out
     step("concepts")
     concepts, unmatched_kind = extract_concepts(client, model, course, vocab, lectures, log=log)
     step("relations")
-    relations, dropped = extract_relations(client, model, course, vocab, lectures, concepts, workers, log=log)
+    relations, dropped, adjusted = extract_relations(client, model, course, vocab, lectures, concepts, workers, log=log)
     if slides:
         step("slides")
         n_imgs = render_slides(lectures, out_dir / "slides", dpi)
@@ -401,6 +435,7 @@ def run_extraction(client, model: str, vocab: dict, lectures: list[Lecture], out
         "relations_by_label": dict(label_counts.most_common()),
         "concepts_by_kind": dict(kind_counts.most_common()),
         "dropped": dropped,
+        "adjusted": adjusted,
         "model": model,
         "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
     }
