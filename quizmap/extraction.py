@@ -20,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from quizmap.common import OTHER_LABEL, Lecture, call_json, lecture_as_prompt_text, write_json
+from quizmap.vocab import kind_examples
 
 # ------------------------------------------------------------------ 概念抽出
 
@@ -125,7 +126,9 @@ def clean_id(raw: str, fallback: str) -> str:
 
 def extract_concepts(client, model: str, course: str, vocab: dict, lectures: list[Lecture], log=print):
     """回ごとに順番に呼ぶ。既出の概念一覧を渡して label/id を揃えさせる。"""
-    kinds_text = "\n".join(f"- {k['name']}: {k['definition']}（例: {k['example']}）" for k in vocab["kinds"])
+    kinds_text = "\n".join(
+        f"- {k['name']}: {k['definition']}（例: {'、'.join(kind_examples(k))}）" for k in vocab["kinds"]
+    )
     kind_names = {k["name"] for k in vocab["kinds"]}
     concepts: dict[str, dict] = {}          # id -> concept
     by_label: dict[str, str] = {}           # label -> id
