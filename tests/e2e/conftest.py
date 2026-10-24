@@ -61,10 +61,8 @@ def _free_port() -> int:
 
 @pytest.fixture(scope="session")
 def data_dir(tmp_path_factory) -> Path:
-    src = _fixture_course()
     d = tmp_path_factory.mktemp("quizmap-data")
-    dst = d / "courses" / src.name
-    shutil.copytree(src, dst, ignore=lambda _dir, names: [n for n in names if n in SKIP_FILES])
+    copy_fixture_course(d)
     return d
 
 
@@ -74,8 +72,8 @@ def graph(data_dir) -> dict:
     return json.loads((course / "graph.json").read_text(encoding="utf-8"))
 
 
-@pytest.fixture(scope="session")
-def app_url(data_dir):
+def start_app(data_dir: Path):
+    """data_dir を指してアプリを空いているポートで起動し、URL を返すジェネレーター（終わると止める）。"""
     port = _free_port()
     env = dict(os.environ, QUIZMAP_DATA_DIR=str(data_dir),
                QUIZMAP_ENV_FILE=os.environ.get("QUIZMAP_ENV_FILE", str(PROJECT / ".env")))
@@ -100,6 +98,30 @@ def app_url(data_dir):
     proc.wait(timeout=10)
 
 
+def copy_fixture_course(dst_root: Path) -> Path:
+    """取り込み済みのコースを dst_root/courses/ にコピーし、コピー先のフォルダを返す。"""
+    src = _fixture_course()
+    dst = dst_root / "courses" / src.name
+    shutil.copytree(src, dst, ignore=lambda _dir, names: [n for n in names if n in SKIP_FILES])
+    return dst
+
+
+def open_page(browser, url: str) -> Page:
+    ctx = browser.new_context(viewport={"width": 1600, "height": 1000})
+    pg = ctx.new_page()
+    pg.errors = []
+    pg.on("pageerror", lambda e: pg.errors.append(str(e)[:300]))
+    pg.goto(url, wait_until="networkidle")
+    pg.wait_for_function("() => window.__qmMapApp && window.__qmMapApp.view", timeout=60000)
+    pg.wait_for_timeout(1500)
+    return pg
+
+
+@pytest.fixture(scope="session")
+def app_url(data_dir):
+    yield from start_app(data_dir)
+
+
 @pytest.fixture(scope="session")
 def browser():
     with sync_playwright() as p:
@@ -110,15 +132,9 @@ def browser():
 
 @pytest.fixture
 def page(browser, app_url) -> Page:
-    ctx = browser.new_context(viewport={"width": 1600, "height": 1000})
-    pg = ctx.new_page()
-    pg.errors = []
-    pg.on("pageerror", lambda e: pg.errors.append(str(e)[:300]))
-    pg.goto(app_url, wait_until="networkidle")
-    pg.wait_for_function("() => window.__qmMapApp && window.__qmMapApp.view", timeout=60000)
-    pg.wait_for_timeout(1500)
+    pg = open_page(browser, app_url)
     yield pg
-    ctx.close()
+    pg.context.close()
 
 
 # ------------------------------------------------------------------ 操作と観測の部品（地図は ui/static/map.js）
