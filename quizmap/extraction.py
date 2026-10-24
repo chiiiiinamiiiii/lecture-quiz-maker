@@ -444,13 +444,17 @@ COMPLETION_USER = """授業「{course}」の概念の対について、関係が
 {pairs}
 
 各対について 1 件ずつ答える。資料の根拠と Wikipedia の根拠は、それぞれ別に探して、両方の欄に書く。
-- from・to・label: 二つの概念の関係を、上のラベルの定義で表す。from と to は対の 2 つの id で、ラベルの定義が決める向きに従う（逆向きなら入れ替える）。
+- from・to・label: 二つの概念の関係を、上のラベルの定義で表す。from と to は対の 2 つの id で、ラベルの定義が決める向きに従う。
+  from と to は、そのラベルの例（「A → B」の A が from、B が to）と同じ向きで書く。逆向きの関係なら入れ替える。
   ほかの id は使わず、新しい概念も作らない。関係が無い、またはどのラベルにも当てはまらなければ label を空にする
+- 一方が他方の定義の言い換え（「A とは B のこと」）であるだけの対は、ほかのラベルに押し込まない。それを表すラベルが無ければ label を空にする
+- 自信が無ければ label を空にする（関係を足さない側に倒す）
 - 資料の根拠: 対に付けた資料のページに、二つの概念を結びつける記述があれば slide_found を true にし、lecture と page にそのページを、
-  slide_evidence にその箇所をページ本文からそのまま 40 字以内で抜き出す
+  slide_evidence にその箇所をページ本文からそのまま 40 字以内で抜き出す。引用には二つの概念の名前を両方入れる
 - Wikipedia の根拠: 資料に明示が無くても、対に付けた Wikipedia の記事の本文に二つの概念を結びつける記述があれば、external_found を true にする。
   wiki にその記事の番号を、wiki_evidence にその箇所を記事の本文からそのまま 80 字以内で抜き出す。
-  引用には、記事の題名でないほうの概念の名前が入っていること。資料の根拠があるときも、Wikipedia の根拠があれば書く
+  引用には二つの概念の名前を両方入れる。資料の根拠があるときも、Wikipedia の根拠があれば書く
+- 引用が、対の概念ではない別の概念についての記述なら、根拠にしない
 - 判断の基準: 根拠にしてよいのは、資料のページか記事の本文にそのまま書かれた記述だけ（引用は必須）。あなた自身の知識だけで関係を決めない。
   同じページや同じ記事に二つの名前が出てくるだけでは根拠にしない。二つの概念の間柄を述べた記述（一方を主語に、他方を目的語や補語にした文など）が要る
 - 使わない欄は、文字列なら空、数なら 0、真偽なら false にする
@@ -583,6 +587,30 @@ def check_external_evidence(evidence: str, end_labels: list[str], article: dict)
     return None
 
 
+_NAME_SPLIT_RE = re.compile(r"[・･=＝\s]+")
+
+
+def _name_variants(concept: dict, person_kinds: set[str]) -> list[str]:
+    """evidence の中で概念を見つけるための名前。括弧の前（_label_head）。人物の種類なら「・」などで区切った各部分も
+    （「イマヌエル・カント」は「カント」でもよい。区切りの無い名前は全体だけ）。2 字未満の部分は使わない。"""
+    names = [_label_head(concept["label"])]
+    if concept.get("kind") in person_kinds:
+        head = normalize_text(concept["label"]).split("(")[0]
+        names += [_squash(x) for x in _NAME_SPLIT_RE.split(head) if len(_squash(x)) >= 2]
+    return [n for n in dict.fromkeys(names) if n]
+
+
+def check_ends_in_evidence(evidence: str, ends: list[dict], person_kinds: set[str]) -> str | None:
+    """補完の関係の evidence に、両端の概念名が両方あるか（#92）。無ければ落とす理由を返す。
+
+    別の概念についての記述（片方の名前しか無い）を根拠にした関係を足さないため。迷うものは落とす側に倒す。
+    """
+    ev = _squash(evidence)
+    if all(any(n in ev for n in _name_variants(c, person_kinds)) for c in ends):
+        return None
+    return "evidence に両端が無い"
+
+
 def complete_relations(client, model, vocab, graph, pages, index, wiki, log=print,
                        max_pairs: int = COMPLETION_MAX_PAIRS) -> dict:
     """関係の補完（docs/rag-design.md）。graph に関係を足した新しい graph を返す（ファイルは書かない）。
@@ -606,6 +634,7 @@ def complete_relations(client, model, vocab, graph, pages, index, wiki, log=prin
     page_text = {(p["lecture"], p["page"]): p["text"] for p in pages}
     labels = {r["label"] for r in vocab["relations"]} - {OTHER_LABEL}
     rel_by_label = {r["label"]: r for r in vocab["relations"]}
+    person_kinds = {k["name"] for k in vocab["kinds"] if k.get("person") is True}
 
     pairs, record = completion_candidates(concepts, relations, page_text, index, client, max_pairs=max_pairs)
     log(f"関係の補完: 候補の対 {record['candidates']}（判定する {record['judged']}）、"
@@ -702,12 +731,14 @@ def complete_relations(client, model, vocab, graph, pages, index, wiki, log=prin
             if fix == "swapped":
                 adjusted["向きを直した"] += 1
             ends = [concepts[f]["label"], concepts[t]["label"]]
+            end_concepts = [concepts[f], concepts[t]]
             rel = {"from": f, "to": t, "label": label}
             reasons = []
             if j["slide_found"]:
                 page = (j["lecture"], j["page"])
                 reason = "対に付けていないページ" if page not in p["pages"] else \
-                    check_evidence(j["slide_evidence"], ends, page_text[page])
+                    check_evidence(j["slide_evidence"], ends, page_text[page]) or \
+                    check_ends_in_evidence(j["slide_evidence"], end_concepts, person_kinds)
                 if reason:
                     reasons.append(reason)
                 else:
@@ -716,7 +747,8 @@ def complete_relations(client, model, vocab, graph, pages, index, wiki, log=prin
             if "origin" not in rel and j["external_found"]:
                 cid = wiki_ids[j["wiki"] - 1] if 1 <= j["wiki"] <= len(wiki_ids) else None
                 reason = ("記事の番号が無い" if cid is None else "対に付けていない記事" if cid not in (f, t)
-                          else check_external_evidence(j["wiki_evidence"], ends, articles[cid]))
+                          else check_external_evidence(j["wiki_evidence"], ends, articles[cid])
+                          or check_ends_in_evidence(j["wiki_evidence"], end_concepts, person_kinds))
                 if reason:
                     reasons.append(reason)
                 else:

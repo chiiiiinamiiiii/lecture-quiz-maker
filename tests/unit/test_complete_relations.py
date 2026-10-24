@@ -330,3 +330,43 @@ def test_prompt_asks_for_wikipedia_evidence_separately(llm):
     assert "資料に明示が無くても" in user and "external_found" in user and "wiki_evidence" in user
     props = extraction.COMPLETION_SCHEMA["properties"]["judgements"]["items"]["properties"]
     assert "origin" not in props and {"slide_found", "external_found"} <= set(props)
+
+
+def test_evidence_must_name_both_ends(llm):
+    """evidence が本文にあっても、片方の概念名しか無ければ足さない（#92）。"""
+    pages = [dict(PAGES[0], text="甲野は乙説を唱えた。その説は広まった。丙も出てくる。"), *PAGES[1:]]
+
+    def answer(user):
+        return [J(pair_no(user, "kouno", "otsu"), "slide", "kouno", "otsu", "提唱", 1, 1, evidence="その説は広まった")]
+    llm["answer"] = answer
+    g = extraction.complete_relations(None, "m", VOCAB, graph(), pages, index=None, wiki=None, log=lambda s: None)
+    c = g["stats"]["completion"]
+    assert c["added_slide"] == 0 and c["dropped"]["evidence に両端が無い"] == 1
+
+
+def test_external_evidence_must_name_both_ends(llm):
+    wiki = FakeWiki({"甲野": {"title": "甲野", "url": "U", "extract": "甲野は哲学者。乙説の提唱者として知られる。彼は旅を好んだ。"}})
+
+    def answer(user):
+        return [J(pair_no(user, "kouno", "otsu"), "external", "kouno", "otsu", "提唱", wiki=1, evidence="彼は旅を好んだ")]
+    llm["answer"] = answer
+    g = extraction.complete_relations(None, "m", VOCAB, graph(), PAGES, index=None, wiki=wiki, log=lambda s: None)
+    assert g["stats"]["completion"]["dropped"]["evidence に両端が無い"] == 1
+
+
+def test_person_name_part_counts():
+    kant = {"label": "イマヌエル・カント", "kind": "人物"}
+    duty = {"label": "義務(デューティ)", "kind": "概念"}
+    assert extraction.check_ends_in_evidence("カントは義務を重んじた", [kant, duty], {"人物"}) is None
+    # 人物の旗が無ければ、名前の一部では通さない
+    assert extraction.check_ends_in_evidence("カントは義務を重んじた", [kant, duty], set()) == "evidence に両端が無い"
+    # 人物以外は括弧の前の全体が要る
+    assert extraction.check_ends_in_evidence("カントは義を重んじた", [kant, duty], {"人物"}) == "evidence に両端が無い"
+
+
+def test_prompt_has_direction_and_definition_rules(llm):
+    extraction.complete_relations(None, "m", VOCAB, graph(), PAGES, index=None, wiki=None, log=lambda s: None)
+    user = llm["users"][0]
+    assert "例（「A → B」の A が from、B が to）と同じ向き" in user
+    assert "定義の言い換え" in user and "（例: A → B）" in user
+    assert "引用には二つの概念の名前を両方入れる" in user
