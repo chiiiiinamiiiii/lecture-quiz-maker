@@ -110,3 +110,18 @@ def test_fit_keeps_nodes_clear_of_bars(page, size, layout):
 def test_initial_view_keeps_nodes_clear_of_bars(page):
     """開いた直後（全体表示のボタンを押す前）も同じ。"""
     assert _fit_violations(page) == []
+
+
+@pytest.mark.parametrize("size", SIZES, ids=lambda s: f"{s[0]}x{s[1]}")
+def test_content_is_not_under_streamlit_header(page, size):
+    """Streamlit の上部のバー（透明だが横幅いっぱいでクリックを受ける）の下に、地図や右の欄が入らない。
+    上の余白を詰めすぎると、本文の上端のボタンや地図の上端が押せなくなる（取り込み画面の「地図とクイズに戻る」で起きた）。"""
+    page.set_viewport_size({"width": size[0], "height": size[1]})
+    page.wait_for_timeout(1500)
+    header = page.locator("header[data-testid='stHeader']").bounding_box()
+    hb = header["y"] + header["height"]
+    m = _rects(page)["map"]
+    right = page.locator(".st-key-qm-right").bounding_box()
+    assert m["t"] >= hb and right["y"] >= hb
+    x, y = m["l"] + 40, m["t"] + 3                     # 地図の上端のすぐ内側が、上部のバーでなく地図に当たる
+    assert page.evaluate(f"() => !document.elementFromPoint({x}, {y}).closest('header')")

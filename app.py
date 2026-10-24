@@ -21,17 +21,19 @@ from ui.state import clear_course_state, load_graph, save_course_name
 
 NEW = "__new__"
 
-# 画面の余白を詰め、左の地図を広く取る
+# 画面の余白を詰め、左の地図を広く取る。
+# 上の余白は Streamlit の上部のバー（stHeader、高さ 60px。透明だが横幅いっぱいでクリックを受ける）より下に
+# 本文が来るように 3.6rem にする。これより詰めると、本文の上端のボタンや地図の上端が押せなくなる
 PAGE_CSS = """
 <style>
-.block-container { padding: 1.4rem 1.6rem 1rem 1.6rem; max-width: 100%; }
+.block-container { padding: 3.6rem 1.6rem 1rem 1.6rem; max-width: 100%; }
 header[data-testid="stHeader"] { background: transparent; }
 div[data-testid="stVerticalBlockBorderWrapper"] { border-color: rgba(255,255,255,0.07); }
 /* 地図の画面（ui/map_view.py）: 左の地図（qm-left）と右の欄（qm-right）の高さを窓の高さに合わせる（#43）。
-   上の余白（約 38px）と下の余白（約 16px）を引き、420〜900px に収める。外側の枠が flex で高さを固定するので、そこも上書きする */
+   上の余白（約 74px）と下の余白（約 16px）を引き、420〜900px に収める。外側の枠が flex で高さを固定するので、そこも上書きする */
 [data-testid="stLayoutWrapper"]:has(> .st-key-qm-left), [data-testid="stLayoutWrapper"]:has(> .st-key-qm-right),
 .st-key-qm-left, .st-key-qm-right {
-  height: clamp(420px, calc(100vh - 56px), 900px) !important; flex: 0 0 auto !important;
+  height: clamp(420px, calc(100vh - 92px), 900px) !important; flex: 0 0 auto !important;
 }
 .st-key-qm-left { overflow: hidden !important; }
 </style>
@@ -123,11 +125,8 @@ def main() -> None:
     st.session_state["course_dir"] = str(course["dir"])
     job = current_job(course["dir"])
     ingesting = bool(job and job.status == "running")
+    ingest_key = f"show_ingest-{sel}"
     with st.sidebar:
-        options = ["map", "ingest"]
-        page = st.segmented_control(t("page"), options=options, key=f"page-{sel}", default="map",
-                                    format_func=lambda p: t("page_map") if p == "map" else t("page_ingest"),
-                                    disabled=not course["ready"] or ingesting) or "map"
         if course["ready"]:
             graph, _, asked = load_graph()
             st.caption(t("stats", c=len(graph["concepts"]), r=len(graph["relations"]), a=len(asked)))
@@ -135,11 +134,20 @@ def main() -> None:
             if name.strip() and name.strip() != course["name"]:
                 save_course_name(name.strip())
                 st.rerun()
+            # 資料の取り込みは「地図とクイズ」と並ぶ画面ではなく、資料を足す・取り込み直すときに開く別の操作
+            st.divider()
+            if not st.session_state.get(ingest_key) and not ingesting:
+                if st.button(t("open_ingest"), icon=":material/upload_file:", use_container_width=True):
+                    st.session_state[ingest_key] = True
+                    st.rerun()
 
-    if not course["ready"] or ingesting or page == "ingest":
+    if not course["ready"] or ingesting or st.session_state.get(ingest_key):
+        if course["ready"] and not ingesting:
+            if st.button(t("back_to_map"), icon=":material/arrow_back:"):
+                st.session_state[ingest_key] = False
+                st.rerun()
         render_ingest_page(course["dir"])
     else:
         render_map_page()
-
 
 main()
