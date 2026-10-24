@@ -241,6 +241,19 @@ def _direction_text(rel: dict) -> str:
     return f"【向き: from は {'・'.join(f) or '指定なし'}、to は {'・'.join(t) or '指定なし'}】"
 
 
+def remove_cited_works(concepts: dict[str, dict], vocab: dict) -> tuple[dict[str, dict], list[str]]:
+    """cited_work が true の種類（資料が出典・参考として挙げた文献・作品）の概念を落とす（#50）。
+
+    種類の名前ではなく vocab の旗で決めるので、分野に依らない。関係の抽出の前に落とすので、
+    その概念を端にする関係は作られない（関係ごと落ちる）。cited_work の無い古い vocab.json では何も落とさない。
+    戻り値: (残った概念, 落とした種類の名前)
+    """
+    cited = {k["name"] for k in vocab["kinds"] if k.get("cited_work") is True}
+    if not cited:
+        return concepts, []
+    return {cid: c for cid, c in concepts.items() if c["kind"] not in cited}, sorted(cited)
+
+
 def extract_relations(client, model: str, course: str, vocab: dict, lectures: list[Lecture],
                       concepts: dict[str, dict], workers: int, log=print) -> tuple[list[dict], dict]:
     """概念 id を固定して、回ごとに関係を出させる（回は独立なので並列）。"""
@@ -384,6 +397,11 @@ def run_extraction(client, model: str, vocab: dict, lectures: list[Lecture], out
 
     step("concepts")
     concepts, unmatched_kind = extract_concepts(client, model, course, vocab, lectures, log=log)
+    n_before = len(concepts)
+    concepts, cited_kinds = remove_cited_works(concepts, vocab)
+    n_cited = n_before - len(concepts)
+    if cited_kinds:
+        log(f"出典・参考の文献・作品の種類（{'・'.join(cited_kinds)}）の概念 {n_cited} 件を落とした（関係の抽出の前）")
     step("relations")
     relations, dropped = extract_relations(client, model, course, vocab, lectures, concepts, workers, log=log)
     if slides:
@@ -407,6 +425,8 @@ def run_extraction(client, model: str, vocab: dict, lectures: list[Lecture], out
         "other_kind_count": n_other_kind,
         "other_kind_rate": round(other_kind_rate, 4),
         "unmatched_kind_count": len(unmatched_kind),
+        "removed_cited_work_concepts": n_cited,
+        "cited_work_kinds": cited_kinds,
         "unmatched_kind_examples": unmatched_kind[:20],
         "relations_by_label": dict(label_counts.most_common()),
         "concepts_by_kind": dict(kind_counts.most_common()),

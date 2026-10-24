@@ -38,7 +38,8 @@ USER_TEMPLATE = """以下は「{course_hint}」という授業の資料です（
 同様に、概念の「種類」も 4〜8 個提案してください。各種類について、名前・定義・資料中の実例（3 つ以上）を書いてください。
 - 各種類について、その種類に属する概念が人名・書名・作品名などの固有名であれば proper_noun を true、用語・考え方・事柄などであれば false にする
 - 種類は授業全体を通して使える分類の軸に限る。特定の回や特定の人物・話題でしか使わない種類は作らない
-- 書名・報告書名・論文名を集めた種類は作らない。授業の内容を分類する軸ではないため（本は、その内容の概念や著者の人物として扱う）
+- 各種類について、その種類に属する概念が、資料が出典・参考・引用元として挙げた文献・作品（本・論文・報告書・記事・作品など）であれば cited_work を true、そうでなければ false にする。
+  文献・作品と、授業の内容の概念・人物を同じ種類に混ぜない
 - 種類の名前を、その種類に属する概念の名前と同じにしない（例: 「X」という概念を入れるための「X」という種類は作らない）
 - 各種類について、異なる単元（異なる人物・話題）から実例を 3 つ以上挙げられること。挙げられないものは種類ではなく概念として扱う
 
@@ -61,8 +62,9 @@ SCHEMA = {
                     "definition": {"type": "string"},
                     "examples": {"type": "array", "items": {"type": "string"}},
                     "proper_noun": {"type": "boolean"},
+                    "cited_work": {"type": "boolean"},
                 },
-                "required": ["name", "definition", "examples", "proper_noun"],
+                "required": ["name", "definition", "examples", "proper_noun", "cited_work"],
                 "additionalProperties": False,
             },
         },
