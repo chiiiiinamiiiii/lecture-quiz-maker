@@ -171,6 +171,32 @@ Each sample is 30 relations drawn from that run's graph with seed 20261024. The 
 | Largest connected group (mean) | 8.0 | 1.8 |
 
 Selecting by lasso gives about 10 times more relations inside the range, and those relations are the material for relation questions. We have not yet compared questions generated from the two kinds of range. That comparison needs API calls.
+
+#### 5. RAG (slide index + Wikipedia)
+
+Measured twice on Ethics imports with RAG on (flash-lite): round 1 with main `13b85b7`, round 2 after the fixes for #91–#93 (main `b89a958`). Each round is a new import, so the graphs differ. To keep run-to-run variation out, each step is compared before and after on the same data: the graph before and after relation completion, and the same 30 questions before and after the uniqueness check.
+
+| Relation completion | Round 1 | Round 2 |
+|---|---|---|
+| New concepts | 0 | 0 |
+| Relations added (from slides / from Wikipedia) | 7 (7 / 0) | 2 (1 / 1) |
+| Added relations: correct / ambiguous / wrong | 0 / 3 / 4 | 1 / 1 / 0 |
+| Concepts with no relation (before → after) | 22 → 17 | 13 → 11 |
+
+| Uniqueness check (6 ranges × 5 questions, without → with) | Round 1 | Round 2 |
+|---|---|---|
+| Questions | 30 → 25 | 30 → 29 |
+| Removed questions that were actually bad | 0 / 5 | 1 / 1 (borderline) |
+| Bad questions kept | 2 | 1 |
+| A distractor is actually correct (MCQ) | 1 / 24 → 1 / 20 | 1 / 24 → 1 / 24 |
+| Not answerable from the slides | 0 → 0 | 0 → 0 |
+| Usable / usable after a fix / not usable | 23 / 5 / 2 → 19 / 4 / 2 | 22 / 7 / 1 → 22 / 6 / 1 |
+| Wikipedia lookups that found an unrelated article | 34 / 105 | 0 / 54 |
+
+- Every wrong judgement in both rounds came from generation, not retrieval. The pages needed were always in the material.
+- Round 1's check removed only good questions, because the model's quotes did not match the page text verbatim. After the fix (#91) a failed quote match is recorded instead of removing the question, and round 2 removed no good question. The check still rarely catches a bad question: the one bad question in round 2 was kept even though the model's own reasons named the other options as examples from the slides.
+- The only Wikipedia-backed relation (Kant → maxim) is correct, and the slides support it too; it was marked as external only because the model quoted a page without Kant's name.
+- Of 15 sampled "Other" relations in round 2, 6 could have taken a vocabulary label. Half of these were blocked because a concept had kind "Other": five book titles escaped the book filter that way.
 <!-- EVAL:END -->
 
 ## Known limitations
@@ -178,6 +204,10 @@ Selecting by lasso gives about 10 times more relations inside the range, and tho
 - **Run-to-run variation.** Extraction runs once per import, and the derived vocabulary changes between runs (one ethics run had *opposes*, the next had *paraphrase* instead). The numbers in the evaluation are single runs; see the evaluation for the size of the variation.
 - **Few concept-to-concept relations.** With the cheapest model, most relations connect a person to an idea. Relations between ideas, which are the best material for relation questions, stay at about 20–30 for the ethics course. Prompting for them did not help (issue #51). A stronger model is compared in the evaluation.
 - **Removing cited books can remove ideas with the same name.** *Social Contract* or *Escape from Freedom* were extracted only as book titles and were removed with them (issue #69). The removed titles are logged so this can be checked.
+- **Many relations are labelled "Other".** In the two full imports with RAG, 49% and 69% of relations were "Other" before completion. The share depends on the vocabulary each run derives. A code rule now widens the kinds a person-subject label may point to (issue #74), but in the second run the vocabulary did not need it, so its effect is not yet measured.
+- **Some books escape the book filter.** A book whose kind is "Other" is not removed before relation extraction (issue #99).
+- **The answer check rarely catches a bad question.** After the fixes it no longer removes good questions, but it kept one question whose wrong options were also correct, and it judged the same question differently in two ranges.
+- **English material gives few concepts.** Four NLP lectures gave only 13 concepts, and later lectures added almost none (issue #25).
 - **Repeated slides.** Later lectures sometimes repeat earlier slides, which inflates occurrence counts.
 
 ## Repository layout
@@ -186,7 +216,7 @@ Selecting by lasso gives about 10 times more relations inside the range, and tho
 |---|---|
 | `app.py` | Entry point: course and view switching |
 | `ui/` | Screens (`map_view.py`, `quiz_view.py`, `ingest_view.py`), the map component (`static/map.js`, `map.css`), UI strings (`i18n.py`) |
-| `quizmap/` | PDF text, LLM calls (`common.py`), vocabulary (`vocab.py`), extraction (`extraction.py`), quiz (`quiz.py`), grading (`grade.py`), courses and background import (`courses.py`) |
+| `quizmap/` | PDF text, LLM calls (`common.py`), vocabulary (`vocab.py`), extraction (`extraction.py`), quiz (`quiz.py`), grading (`grade.py`), courses and background import (`courses.py`), retrieval index and Wikipedia (`rag.py`) |
 | `tests/` | Unit tests and browser tests (Playwright) |
 | `quiz-map-spec.md` | Specification (Japanese) |
 | `derive_vocab.py`, `extract.py`, `generate_quiz.py` | Command-line versions of the same steps |
