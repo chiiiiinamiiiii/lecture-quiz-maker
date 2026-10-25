@@ -158,13 +158,14 @@ def import_legacy(data_dir: Path) -> Path | None:
 # ------------------------------------------------------------------ 取り込み処理
 
 PHASES = [  # (名前, 表示, 進捗の幅)。index と completion は RAG（docs/rag-design.md）。off なら飛ばす
+    # 索引づくりは概念・関係の抽出と同時に別スレッドで走る（#107）。ここの index は「索引の完了を待つ」段階
     ("read", "PDF の読み込み", 0.05),
     ("vocab", "語彙の導出（§4）", 0.08),
-    ("index", "索引づくり", 0.07),
-    ("concepts", "概念の抽出（§5）", 0.35),
-    ("relations", "関係の抽出（§5）", 0.25),
+    ("concepts", "概念の抽出（§5）", 0.38),
+    ("relations", "関係の抽出（§5）", 0.27),
+    ("index", "索引づくり", 0.05),
     ("completion", "関係の補完", 0.12),
-    ("slides", "スライド画像の作成", 0.08),
+    ("slides", "スライド画像の作成", 0.05),
 ]
 PHASE_LABEL = {k: label for k, label, _ in PHASES}
 
@@ -202,14 +203,27 @@ class Job:
     done_relations: int = 0
 
     def save(self) -> None:
-        write_json(Path(self.course_dir) / "job.json", asdict(self))
+        with _job_lock:                    # 索引づくりのスレッドと抽出のスレッドが同時に書く（#107）
+            write_json(Path(self.course_dir) / "job.json", asdict(self))
 
     def set_phase(self, phase: str) -> None:
+        self.end_phase()
         self.phase = phase
         self.progress = max(self.progress, _phase_span(phase)[0])
+        self.__dict__["_phase_t0"] = time.monotonic()      # job.json には書かない（dataclass の欄ではない）
         self.add(f"── {PHASE_LABEL.get(phase, phase)}")
 
+    def end_phase(self) -> None:
+        """いまの段階の所要時間をログに出す（#107）。"""
+        t0 = self.__dict__.pop("_phase_t0", None)
+        if t0 is not None:
+            self.add(f"   {PHASE_LABEL.get(self.phase, self.phase)}: {time.monotonic() - t0:.0f} 秒")
+
     def add(self, msg: str) -> None:
+        with _job_lock:
+            self._add(msg)
+
+    def _add(self, msg: str) -> None:
         self.log.append(msg)
         # 回ごとの完了で進捗を細かく進める
         n = max(1, self.n_lectures)
@@ -225,6 +239,7 @@ class Job:
 
 
 _jobs: dict[str, Job] = {}
+_job_lock = threading.RLock()
 _lock = threading.Lock()
 
 
@@ -291,6 +306,7 @@ def _run(job: Job, d: Path, rebuild_vocab: bool, model: str) -> None:
     from quizmap import extraction
     from quizmap.vocab import derive_vocab
 
+    t_start = time.monotonic()
     try:
         info = course_info(d)
         pairs = [(d / "uploads" / f["name"], int(f["lecture"])) for f in info["files"] if f.get("use")]
@@ -319,17 +335,29 @@ def _run(job: Job, d: Path, rebuild_vocab: bool, model: str) -> None:
             job.add("RAG は使わない（QUIZMAP_RAG=off）")
             extraction.run_extraction(client, model, vocab, lectures, d, log=job.add, step=job.set_phase)
         rename_course(d, info["name"])
+        job.end_phase()
         job.progress = 1.0
         job.status = "done"
-        job.add("完了")
+        job.add(f"完了（全体 {time.monotonic() - t_start:.0f} 秒）")
     except Exception as e:  # noqa: BLE001  画面に理由を出す
+        job.end_phase()
         job.status = "error"
-        job.error = f"{type(e).__name__}: {e}"
+        job.error = error_text(e)
         job.add("失敗: " + job.error)
         job.log.append(traceback.format_exc(limit=3))
     finally:
         job.finished_at = now()
         job.save()
+
+
+def error_text(e: Exception) -> str:
+    """画面に出す失敗の理由。1 日あたりの無料枠を使い切ったときは、何をすればよいかを書く（#107）。"""
+    from quizmap.common import DailyQuotaError
+
+    if isinstance(e, DailyQuotaError):
+        return ("Gemini の無料枠の 1 日あたりの上限に達しました。明日（太平洋時間の 0 時以降）にもう一度"
+                f"実行するか、別の API キーを使ってください。（{e}）")
+    return f"{type(e).__name__}: {e}"
 
 
 def _pages_of(lectures) -> list[dict]:
@@ -339,26 +367,42 @@ def _pages_of(lectures) -> list[dict]:
 
 
 def _extract_with_rag(job: Job, d: Path, client, model: str, vocab: dict, lectures) -> None:
-    """索引づくり → 抽出 → 関係の補完 → スライド画像（docs/rag-design.md）。
+    """（索引づくり ∥ 抽出）→ 関係の補完 → スライド画像（docs/rag-design.md）。
 
+    索引づくりは埋め込みの枠、抽出は生成の枠を使い、互いに待たないので、別スレッドで同時に走らせる（#107）。
+    関係の補完は両方が終わってから。
     索引づくりと関係の補完が失敗しても、取り込みは止めずに補完なしの地図を残す（記録には残す）。
+    1 日あたりの埋め込みの枠を使い切った 429 は、待たずにすぐ索引なしで進む。
     """
     from quizmap import extraction, rag
     from quizmap.vocab import language_of
 
     pages = _pages_of(lectures)
-    job.set_phase("index")
-    index = None
-    try:
-        index = rag.SlideIndex.build(client, pages, progress=_index_progress(job))
-        index.save(d)
-        job.add(f"索引: {len(pages)} ページ")
-    except Exception as e:  # noqa: BLE001  補完なしで続ける
-        job.add(f"索引を作れなかった（関係の補完は飛ばす）: {type(e).__name__}: {e}")
+    built: dict = {"index": None}
+
+    def build_index() -> None:
+        t0 = time.monotonic()
+        try:
+            index = rag.SlideIndex.build(client, pages, progress=_index_progress(job))
+            index.save(d)
+            built["index"] = index
+            job.add(f"索引: {len(pages)} ページ（{time.monotonic() - t0:.0f} 秒、抽出と同時）")
+        except Exception as e:  # noqa: BLE001  補完なしで続ける
+            job.add(f"索引を作れなかった（関係の補完は飛ばす）: {error_text(e)}")
+
+    job.add("索引づくりを、概念・関係の抽出と同時に始める")
+    indexer = threading.Thread(target=build_index, name="quizmap-index", daemon=True)
+    indexer.start()
 
     graph = extraction.run_extraction(client, model, vocab, lectures, d, slides=False,
                                       log=job.add, step=job.set_phase)
     write_json(d / "graph_before_completion.json", graph)     # 補完の前後を比べるため（出力評価）
+
+    job.set_phase("index")
+    if indexer.is_alive():
+        job.add("索引づくりの完了を待つ")
+    indexer.join()
+    index = built["index"]
 
     job.set_phase("completion")
     if index is None:
@@ -369,7 +413,7 @@ def _extract_with_rag(job: Job, d: Path, client, model: str, vocab: dict, lectur
             graph = extraction.complete_relations(client, model, vocab, graph, pages, index, wiki, log=job.add)
             write_json(d / "graph.json", graph)
         except Exception as e:  # noqa: BLE001  抽出だけの地図を残す
-            job.add(f"関係の補完に失敗した（抽出だけの地図を使う）: {type(e).__name__}: {e}")
+            job.add(f"関係の補完に失敗した（抽出だけの地図を使う）: {error_text(e)}")
 
     job.set_phase("slides")
     n_imgs = extraction.render_slides(lectures, d / "slides", SLIDE_DPI)
@@ -424,7 +468,7 @@ def _run_rag_rebuild(job: Job, d: Path, model: str) -> None:
         job.add("完了")
     except Exception as e:  # noqa: BLE001  画面に理由を出す。graph.json はそのまま残る
         job.status = "error"
-        job.error = f"{type(e).__name__}: {e}"
+        job.error = error_text(e)
         job.add("失敗: " + job.error)
         job.log.append(traceback.format_exc(limit=3))
     finally:
@@ -433,11 +477,16 @@ def _run_rag_rebuild(job: Job, d: Path, model: str) -> None:
 
 
 def _index_progress(job: Job):
-    """索引づくりの進み具合を、バッチごとに job の progress とログに出す。"""
+    """索引づくりの進み具合を、バッチごとに job のログに出す（「索引: 40 / 285 ページ」）。
+
+    索引づくりは抽出と同時に走るので、進捗の割合は抽出が進める。索引の段階（抽出の後）にいるときだけ、
+    その段階の幅の中で進捗も進める。
+    """
     start, width = _phase_span("index")
 
     def progress(done: int, total: int) -> None:
-        job.progress = max(job.progress, start + width * (done / total if total else 1.0))
+        if job.phase == "index":
+            job.progress = max(job.progress, start + width * (done / total if total else 1.0))
         job.add(f"索引: {done} / {total} ページ")
 
     return progress

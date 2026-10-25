@@ -132,7 +132,7 @@ def embed(client: LLMClient, texts: list[str], task: str = "RETRIEVAL_DOCUMENT",
     429 のときはそのバッチを半分に割って送り直す。1 件でも 429 なら、待って EMBED_429_RETRIES 回まで送り直す。
     progress(済んだ件数, 全件数) をバッチが済むたびに呼ぶ（索引づくりの進み具合を画面に出すため）。
     """
-    from quizmap.common import LLMError
+    from quizmap.common import DailyQuotaError, LLMError
 
     out: list[list[float] | None] = [None] * len(texts)
     todo = [(i, t[:EMBED_MAX_CHARS]) for i, t in enumerate(texts) if t and t.strip()]
@@ -152,8 +152,8 @@ def embed(client: LLMClient, texts: list[str], task: str = "RETRIEVAL_DOCUMENT",
                 data = _post_with_retry(client, url, body, retry_on_429=False)
                 break
             except LLMError as e:
-                if e.status != 429:
-                    raise
+                if e.status != 429 or isinstance(e, DailyQuotaError):
+                    raise                                 # 日ごとの枠は待っても通らない（#107）
                 wait = _wait_after_429(str(e), attempt)
                 if len(chunk) > 1:
                     half = len(chunk) // 2
