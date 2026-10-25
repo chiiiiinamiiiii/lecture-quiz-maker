@@ -456,15 +456,53 @@ def check_end_kinds(f: str, t: str, label: str, concepts: dict[str, dict],
 
 
 DROPPED_RELATIONS_MAX = 1000   # stats に残す、落とした関係の数の上限
+# かたまりは文字数で作る（#107。スライドは 1 ページの文字が少ないことが多い）。0 以下ならページ数（CONCEPT_PAGES）で作る
+CHUNK_CHARS = int(os.environ.get("QUIZMAP_CHUNK_CHARS", "4000"))       # 1 回に渡す文字数の目安（空白を除く）
+CHUNK_MAX_PAGES = int(os.environ.get("QUIZMAP_CHUNK_MAX_PAGES", "8"))  # 1 回に渡すページ数の上限（重ねるページを除く）
 CHUNK_OVERLAP = int(os.environ.get("QUIZMAP_CHUNK_OVERLAP", "1"))      # 前のかたまりと重ねるページ数
 EXTRACT_WORKERS = int(os.environ.get("QUIZMAP_EXTRACT_WORKERS", "4"))  # かたまりを並列に呼ぶ本数
 _MERGE_DROP = _SPACE_ONLY | set("・･=＝")
 
 
-def extraction_chunks(n_pages: int, size: int = CONCEPT_PAGES, overlap: int = CHUNK_OVERLAP) -> list[tuple[int, int]]:
-    """抽出のページの分け方（#101・#107）。page_chunks の各かたまりの前に、前のかたまりの最後の overlap ページを
+def page_chars(text: str) -> int:
+    """かたまりの大きさを測る、ページの文字数（空白を除く）。"""
+    return len(_squash(text))
+
+
+def char_chunks(page_texts: list[str], chars: int = CHUNK_CHARS,
+                max_pages: int = CHUNK_MAX_PAGES) -> list[tuple[int, int]]:
+    """ページを文字数でまとめる（#107）。目安の chars 字に達するか max_pages ページになるまで、順にページを足す。
+
+    1 ページで chars を超えるページは 1 つのかたまりにする。最後のかたまりが目安の半分に満たず、前と合わせても
+    max_pages を超えなければ、前のかたまりに合わせる。戻り値は (最初のページ, 最後のページ) の列（1 始まり）。
+    """
+    n = len(page_texts)
+    if n == 0:
+        return []
+    max_pages = max_pages if max_pages > 0 else n
+    sizes = [page_chars(t) for t in page_texts]
+    chunks: list[list[int]] = []          # [最初, 最後, 文字数]
+    for p in range(1, n + 1):
+        if not chunks or chunks[-1][2] >= chars or chunks[-1][1] - chunks[-1][0] + 1 >= max_pages:
+            chunks.append([p, p, 0])
+        chunks[-1][1] = p
+        chunks[-1][2] += sizes[p - 1]
+    if len(chunks) > 1:
+        a, b = chunks[-2], chunks[-1]
+        if b[2] < chars / 2 and b[1] - a[0] + 1 <= max_pages:
+            chunks[-2:] = [[a[0], b[1], a[2] + b[2]]]
+    return [(a, b) for a, b, _ in chunks]
+
+
+def extraction_chunks(n_pages: int, size: int = CONCEPT_PAGES, overlap: int = CHUNK_OVERLAP,
+                      page_texts: list[str] | None = None, chars: int = 0,
+                      max_pages: int = CHUNK_MAX_PAGES) -> list[tuple[int, int]]:
+    """抽出のページの分け方（#101・#107）。chars が正で page_texts があれば char_chunks（文字数）で、
+    そうでなければ page_chunks（size ページ前後ずつ）で分ける。各かたまりの前に、前のかたまりの最後の overlap ページを
     重ねる（境目をまたいで書かれた関係を失わないため。重なりで同じ概念・関係が 2 度出ても、統合と同じ対の整理でまとまる）。"""
-    return [(max(1, a - overlap) if i else a, b) for i, (a, b) in enumerate(page_chunks(n_pages, size))]
+    base = char_chunks(page_texts, chars, max_pages) if chars > 0 and page_texts is not None \
+        else page_chunks(n_pages, size)
+    return [(max(1, a - overlap) if i else a, b) for i, (a, b) in enumerate(base)]
 
 
 _MERGE_QUOTES = set("「」\"“”")
@@ -487,6 +525,7 @@ def _display_label(counts: collections.Counter, first: list[str]) -> str:
 
 def extract_graph(client, model: str, course: str, vocab: dict, lectures: list[Lecture], log=print,
                   step=lambda name: None, pages_per_call: int = CONCEPT_PAGES, overlap: int = CHUNK_OVERLAP,
+                  chunk_chars: int = CHUNK_CHARS, max_pages: int = CHUNK_MAX_PAGES,
                   workers: int = EXTRACT_WORKERS, end_kind_mismatch: str = END_KIND_MISMATCH_DEFAULT):
     """概念と関係を、かたまり（数ページ）ごとに 1 回の呼び出しでまとめて取る（#107）。かたまりは並列に呼ぶ。
 
@@ -516,7 +555,8 @@ def extract_graph(client, model: str, course: str, vocab: dict, lectures: list[L
     rel_by_label = {r["label"]: r for r in vocab["relations"]}
 
     jobs = [(lec, first, last) for lec in lectures
-            for first, last in extraction_chunks(lec.page_count, pages_per_call, overlap)]
+            for first, last in extraction_chunks(lec.page_count, pages_per_call, overlap,
+                                                 page_texts=lec.pages, chars=chunk_chars, max_pages=max_pages)]
     n_jobs_of = collections.Counter(lec.number for lec, _, _ in jobs)
 
     def one(job):
@@ -586,6 +626,7 @@ def extract_graph(client, model: str, course: str, vocab: dict, lectures: list[L
                 m["dup_of_pending"] = True
     lec_by_no = {lec.number: lec for lec in lectures}
     info = {"chunks": len(jobs), "calls": len(jobs), "pages_per_call": pages_per_call, "overlap": overlap,
+            "chunk_chars": chunk_chars, "max_pages": max_pages,
             "workers": workers, "surface_ask_calls": 0, "surface_asked": 0, "surface_ask_resolved": 0}
 
     def ask(lecture_no: int):
@@ -819,7 +860,8 @@ def extract_graph(client, model: str, course: str, vocab: dict, lectures: list[L
     info["calls"] = len(jobs) + info["surface_ask_calls"]
     info["dropped_relations"] = dropped_list
     info["loose_evidence"] = loose_evidence
-    log(f"抽出の呼び出し {info['calls']} 回（かたまり {len(jobs)} 個、{pages_per_call} ページ前後ずつ・{overlap} ページ重ねる・"
+    size_text = f"{chunk_chars} 字前後・{max_pages} ページまで" if chunk_chars > 0 else f"{pages_per_call} ページ前後"
+    log(f"抽出の呼び出し {info['calls']} 回（かたまり {len(jobs)} 個、{size_text}ずつ・{overlap} ページ重ねる・"
         f"並列 {workers}、表記の聞き直し {info['surface_ask_calls']} 回）")
     return concepts, relations, unmatched_kind, info, dict(dropped), dict(adjusted)
 
@@ -1440,6 +1482,8 @@ def run_extraction(client, model: str, vocab: dict, lectures: list[Lecture], out
         "extract_chunks": concept_info["chunks"],
         "extract_calls": concept_info["calls"],
         "extract_pages_per_call": concept_info["pages_per_call"],
+        "extract_chunk_chars": concept_info["chunk_chars"],
+        "extract_max_pages": concept_info["max_pages"],
         "extract_overlap": concept_info["overlap"],
         "extract_workers": concept_info["workers"],
         "merged_mentions": concept_info["merged_mentions"],

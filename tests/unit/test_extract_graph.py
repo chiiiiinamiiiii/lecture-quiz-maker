@@ -74,7 +74,8 @@ def run(monkeypatch, lectures, answers, size=2, overlap=0, surfaces=None, worker
     monkeypatch.setattr(extraction, "call_json", fake)
     logs = []
     concepts, relations, unmatched, info, dropped, adjusted = extraction.extract_graph(
-        None, "m", "テスト", vocab, lectures, log=logs.append, pages_per_call=size, overlap=overlap, workers=workers)
+        None, "m", "テスト", vocab, lectures, log=logs.append, pages_per_call=size, overlap=overlap, workers=workers,
+        chunk_chars=0)                                          # 既存のテストはページ数で分ける
     return concepts, relations, info, dropped, fake, logs
 
 
@@ -352,3 +353,36 @@ def test_shortened_fix_without_other_concept_is_kept(monkeypatch):
                                      surfaces={1: [{"index": 0, "surface": "徳", "page": 2}]})
     assert labels(concepts) == ["徳"]
     assert info["surface_collisions_relocated"] == info["surface_collisions_without"] == 0
+
+
+# ---------------------------------------------------------------- 文字数でかたまりを作る（#107）
+
+@pytest.mark.parametrize("sizes, chars, max_pages, want", [
+    ([100] * 10, 300, 8, [(1, 3), (4, 6), (7, 10)]),           # 最後の 1 ページ（100 < 150）は前に合わせる
+    ([100] * 9, 300, 8, [(1, 3), (4, 6), (7, 9)]),
+    ([10] * 20, 1000, 8, [(1, 8), (9, 16), (17, 20)]),          # 文字が少なければページ数の上限で切る
+    ([500, 10, 10, 500, 10], 400, 8, [(1, 1), (2, 5)]),         # 1 ページで目安を超えるページは単独。小さい最後は前へ
+    ([100, 100, 100, 20], 300, 3, [(1, 3), (4, 4)]),            # 合わせると上限を超えるなら合わせない
+    ([50], 300, 8, [(1, 1)]),
+    ([], 300, 8, []),
+])
+def test_char_chunks(sizes, chars, max_pages, want):
+    texts = ["あ" * n for n in sizes]
+    assert extraction.char_chunks(texts, chars, max_pages) == want
+
+
+def test_char_chunks_ignore_spaces_and_overlap_is_kept():
+    texts = ["あ " * 100, "い\n" * 100, "う" * 100, "え" * 100]
+    assert extraction.char_chunks(texts, 200, 8) == [(1, 2), (3, 4)]
+    assert extraction.extraction_chunks(4, 4, 1, page_texts=texts, chars=200) == [(1, 2), (2, 4)]
+    assert extraction.extraction_chunks(4, 2, 0, page_texts=texts, chars=0) == [(1, 2), (3, 4)]   # 0 ならページ数
+
+
+def test_extract_graph_chunks_by_chars(monkeypatch):
+    lectures = [lec(1, "甲" * 50, "乙" * 50, "丙" * 50, "丁" * 50, "戊" * 50)]
+    fake = FakeLLM({})
+    monkeypatch.setattr(extraction, "call_json", fake)
+    *_, info, _, _ = extraction.extract_graph(None, "m", "テスト", VOCAB, lectures, log=lambda s: None,
+                                              overlap=1, chunk_chars=100, max_pages=8)
+    assert sorted(fake.chunks) == [(1, 1, 2), (1, 2, 4), (1, 4, 5)]
+    assert info["chunks"] == 3 and info["chunk_chars"] == 100 and info["max_pages"] == 8
