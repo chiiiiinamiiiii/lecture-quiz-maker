@@ -97,7 +97,13 @@ def test_merge_key_ignores_nfkc_spaces_and_middle_dots():
     assert extraction.merge_key("イマヌエル・カント") == extraction.merge_key("イマヌエル カント") \
         == extraction.merge_key("イマヌエル＝カント")
     assert extraction.merge_key("ＡＢＣ 理論") == extraction.merge_key("ABC理論")
-    assert extraction.merge_key("理(ロゴス)") != extraction.merge_key("理")
+    # #114: 末尾の括弧書き（訳語・原語）とかぎ括弧の有無は無視する。括弧の中の語と『』は別のまま
+    assert extraction.merge_key("理(ロゴス)") == extraction.merge_key("理") == extraction.merge_key("理（ロゴス）")
+    assert extraction.merge_key("自律(autonomy)") == extraction.merge_key("自律")
+    assert extraction.merge_key("「円環的な時間」") == extraction.merge_key("円環的な時間")
+    assert extraction.merge_key("理(ロゴス)") != extraction.merge_key("ロゴス")
+    assert extraction.merge_key("理(ロゴス)を伴う活動") != extraction.merge_key("理を伴う活動")
+    assert extraction.merge_key("『国家』") != extraction.merge_key("国家")
 
 
 def test_one_call_per_chunk_and_chunks_run_in_parallel(monkeypatch):
@@ -222,3 +228,84 @@ def test_run_extraction_drops_relations_to_cited_works(monkeypatch, tmp_path):
     assert s["extract_chunks"] == 1 and s["extract_calls"] == 1
     assert s["isolated_concepts"] == 0 and s["removed_cited_work_concepts"] == 1
     assert g["concepts_without_surface"] == []
+
+
+# ---------------------------------------------------------------- #114
+
+def test_variants_with_gloss_or_quotes_merge_and_show_most_listed_label(monkeypatch):
+    """「幸福(エウダイモニアー)」と「幸福」、「「円環的な時間」」と「円環的な時間」を 1 つにまとめる（#114）。"""
+    lectures = [lec(1, "甲野は幸福(エウダイモニアー)を唱えた。「円環的な時間」", "幸福とは何か。円環的な時間。",
+                    "幸福について。")]
+    answers = {
+        (1, 1, 1): ([c("kouno", "甲野", "人物", 1), c("eudaimonia", "幸福(エウダイモニアー)", "学説", 1),
+                     c("enkan", "「円環的な時間」", "学説", 1)],
+                    [rel("甲野", "幸福(エウダイモニアー)", 1, "甲野は幸福(エウダイモニアー)を唱えた")]),
+        (1, 2, 2): ([c("koufuku", "幸福", "学説", 2), c("enkan2", "円環的な時間", "学説", 2)], []),
+        (1, 3, 3): ([c("koufuku", "幸福", "学説", 3)], []),
+    }
+    concepts, relations, info, dropped, _, _ = run(monkeypatch, lectures, answers, size=1)
+    assert labels(concepts) == ["円環的な時間", "幸福", "甲野"]       # 多く挙がった表記、同じなら短いほう
+    happy = next(c for c in concepts.values() if c["label"] == "幸福")
+    assert happy["id"] == "eudaimonia"                                  # id は最初に出た挙げ方から
+    assert [s["page"] for s in happy["sources"]] == [1, 2, 3]
+    assert relations == [{"from": "kouno", "to": "eudaimonia", "label": "提唱", "source": {"lecture": 1, "page": 1}}]
+    assert info["merged_variants"] == 2
+    assert sorted(map(sorted, info["merged_variant_examples"])) == [["「円環的な時間」", "円環的な時間"],
+                                                                   ["幸福", "幸福(エウダイモニアー)"]]
+
+
+def test_relation_end_resolves_by_any_merged_surface(monkeypatch):
+    """ほかのかたまりで挙がった概念は、地図に出す表記でなくても、まとめた表記のどれかが本文にあればつなぐ。"""
+    lectures = [lec(1, "円環的な時間。円環的な時間。", "甲野は「円環的な時間」を唱えた。")]
+    answers = {
+        (1, 1, 1): ([c("enkan", "円環的な時間", "学説", 1)], []),
+        (1, 2, 2): ([c("kouno", "甲野", "人物", 2)], [rel("甲野", "「円環的な時間」", 2, "甲野は「円環的な時間」を唱えた")]),
+    }
+    concepts, relations, *_ = run(monkeypatch, lectures, answers, size=1)
+    assert [(r["from"], r["to"]) for r in relations] == [("kouno", "enkan")]
+
+
+@pytest.mark.parametrize("page, evidence, want", [
+    ("甲野は乙説を唱えた", "甲野は乙説を唱えた", "exact"),
+    ("u 甲野(こうの)は「乙説(otsu)」を唱えた", "甲野は乙説を唱えた", "loose"),   # 箇条書きの記号・括弧書き・かぎ括弧
+    ("2026/9/7 甲野は\n乙説を唱えた", "2026/9/7甲野は乙説を唱えた", "exact"),
+    ("2026/9/7 見出し u 甲野は乙説を唱えた", "見出し甲野は乙説を唱えた", "loose"),  # 日付と記号を飛ばす
+    ("甲野は乙説を唱えた。丙は丁説を退けた", "甲野は丁説を退けた", None),           # 離れた箇所をつながない
+    ("甲野は乙説を唱えた", "甲野は乙説を強く唱えた", None),                         # 文字を足さない
+    ("義務の分類u格率を普遍化する", "義務の分類格率を普遍化する", "loose"),       # 全角文字にはさまれた u
+    ("Kant uses autonomy", "Kantusesautonomy", "exact"),
+    ("you u know", "youknow", None),
+])
+def test_evidence_in(page, evidence, want):
+    assert extraction.evidence_in(evidence, page) == want
+
+
+def test_loose_evidence_keeps_relation_and_is_counted(monkeypatch):
+    lectures = [lec(1, "u 甲野(こうの)は「乙説」を唱えた")]
+    answers = {(1, 1, 1): ([c("kouno", "甲野", "人物", 1), c("otsu", "乙説", "学説", 1)],
+                           [rel("甲野", "乙説", 1, "甲野は乙説を唱えた")])}
+    concepts, relations, info, dropped, _, _ = run(monkeypatch, lectures, answers, size=1)
+    assert [(r["from"], r["to"]) for r in relations] == [("kouno", "otsu")]
+    assert info["loose_evidence"] == 1 and "evidence が本文に無い" not in dropped
+
+
+def test_dropped_relations_are_recorded_without_evidence(monkeypatch):
+    lectures = [lec(1, "甲野は乙説を唱えた")]
+    answers = {(1, 1, 1): ([c("kouno", "甲野", "人物", 1), c("otsu", "乙説", "学説", 1)],
+                           [rel("甲野", "乙説", 1, "本文に無い文"), rel("甲野", "無い説", 1, "甲野は乙説を唱えた")])}
+    _, relations, info, dropped, _, _ = run(monkeypatch, lectures, answers, size=1)
+    assert relations == []
+    assert info["dropped_relations"] == [
+        {"reason": "evidence が本文に無い", "from": "甲野", "to": "乙説", "label": "提唱", "lecture": 1, "page": 1},
+        {"reason": "存在しない概念", "from": "甲野", "to": "無い説", "label": "提唱", "lecture": 1, "page": 1},
+    ]
+    assert dropped == {"evidence が本文に無い": 1, "存在しない概念": 1}
+
+
+def test_prompt_asks_to_relate_listed_concepts_and_copy_evidence_verbatim(monkeypatch):
+    _, _, _, _, fake, _ = run(monkeypatch, [lec(1, "甲野")], {}, size=1)
+    user = extraction.EXTRACT_USER
+    assert "どの関係にも入っていない概念を見直し" in user
+    assert "項目のそれぞれを、まとめる側の概念と結ぶ" in user
+    assert "括弧書き（原語・訳語・読み）、かぎ括弧、記号も省かない" in user
+    assert "離れた箇所をつながない" in user
