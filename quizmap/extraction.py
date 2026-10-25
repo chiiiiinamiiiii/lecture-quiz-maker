@@ -20,7 +20,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from quizmap.common import OTHER_LABEL, Lecture, call_json, lecture_as_prompt_text, normalize_text, write_json
+from quizmap.common import OTHER_LABEL, Lecture, call_json, normalize_text, write_json
 from quizmap.vocab import kind_examples, language_name, language_of, language_rule
 
 # ------------------------------------------------------------------ 概念抽出
@@ -83,10 +83,10 @@ CONCEPT_SCHEMA = {
 RELATION_SYSTEM = """あなたは大学の授業資料から、概念どうしの「関係」を取り出す専門家です。
 関係の両端には与えられた概念 id だけを使い、関係ラベルには与えられたラベルだけを使います。"""
 
-RELATION_USER = """授業「{course}」の第{lecture}回の資料です（ページ番号付き）。
-資料に書かれている概念どうしの関係をすべて取り出してください。
+RELATION_USER = """授業「{course}」の第{lecture}回の資料のうち、p.{first}〜p.{last} のページです（ページ番号付き）。
+このページに書かれている概念どうしの関係をすべて取り出してください。
 
-使ってよい概念（id: label）。これ以外の id は使わない:
+使ってよい概念（id: label。このページに出てくる概念）。これ以外の id は使わない:
 {concepts}
 
 関係ラベル（これ以外は使わない。どれにも当てはまらなければ「{other}」）:
@@ -99,7 +99,7 @@ RELATION_USER = """授業「{course}」の第{lecture}回の資料です（ペ�
 - from と to はラベルの定義が決める向きに従う。逆向きの関係ならば from と to を入れ替える
 - from と to の概念の種類が、ラベルの【向き】に書かれた種類でなければ、そのラベルは使わない
 - A が B の定義そのもの、または A と B が同じものの言い換えである場合、それに合うラベルが無ければ「{other}」にする。ほかのラベルに押し込まない
-- page はその関係が書かれているこの回のページ番号
+- page はその関係が書かれているページの番号（p.{first}〜p.{last} から）
 - evidence には、その関係が書かれている箇所を page のページ本文からそのまま 40 字以内で抜き出す。抜き出せない関係は出さない
 - 同じページに二つの概念が出てくるだけでは関係にしない。二つの概念を結びつける記述があるときだけ挙げる
 - 1 度しか書かれていない関係も挙げる。数の上限はない
@@ -595,10 +595,38 @@ def check_end_kinds(f: str, t: str, label: str, concepts: dict[str, dict],
     return f, t, OTHER_LABEL, "other"
 
 
+RELATION_PAGES = int(os.environ.get("QUIZMAP_RELATION_PAGES", str(CONCEPT_PAGES)))  # 0 以下で回ごと
+RELATION_OVERLAP = int(os.environ.get("QUIZMAP_RELATION_OVERLAP", "1"))  # 前のかたまりと重ねるページ数
+
+
+def relation_chunks(n_pages: int, size: int = RELATION_PAGES, overlap: int = RELATION_OVERLAP) -> list[tuple[int, int]]:
+    """関係の抽出のページの分け方（#101）。page_chunks の各かたまりの前に、前のかたまりの最後の overlap ページを
+    重ねる（かたまりの境目をまたいで書かれた関係を失わないため。重なりで同じ関係が出ても、同じ対の整理でまとまる）。"""
+    return [(max(1, a - overlap) if i else a, b) for i, (a, b) in enumerate(page_chunks(n_pages, size))]
+
+
+def concepts_on_pages(concepts: dict[str, dict], lecture: int, first: int, last: int,
+                      page_texts: dict[int, str] | None = None, person_kinds: set[str] = frozenset()) -> list[dict]:
+    """sources にこの回の first〜last のページを持つ概念。page_texts を渡すと、名前（2 字以上。人物は名前の部分も可）が
+    そのページの本文に書かれている概念も含める（概念の抽出で挙げられなかったページにも、名前が出ていれば関係を取れるように）。"""
+    texts = [_squash(t) for t in (page_texts or {}).values()]
+
+    def named(c: dict) -> bool:
+        return any(len(n) >= 2 and any(n in t for t in texts) for n in _name_variants(c, person_kinds))
+
+    return [c for c in concepts.values()
+            if any(s["lecture"] == lecture and first <= s["page"] <= last for s in c["sources"])
+            or (texts and named(c))]
+
+
 def extract_relations(client, model: str, course: str, vocab: dict, lectures: list[Lecture],
                       concepts: dict[str, dict], workers: int, log=print,
-                      end_kind_mismatch: str = END_KIND_MISMATCH_DEFAULT) -> tuple[list[dict], dict, dict]:
-    """概念 id を固定して、回ごとに関係を出させる（回は独立なので並列）。
+                      end_kind_mismatch: str = END_KIND_MISMATCH_DEFAULT,
+                      pages_per_call: int = RELATION_PAGES, overlap: int = RELATION_OVERLAP,
+                      info: dict | None = None) -> tuple[list[dict], dict, dict]:
+    """概念 id を固定して、数ページずつ関係を出させる（#101。かたまりは独立なので並列）。
+    渡す概念は、そのかたまりのページに出てくるものだけ（sources にあるか、名前が本文にある）。概念が 2 つ未満のかたまりは呼ばない。
+    info を渡すと、呼び出し回数などを書き込む。
 
     end_kind_mismatch: 両端の種類がラベルの from_kinds・to_kinds に合わない関係の扱い。
       "other" = ラベルを「その他」にして残す / "drop" = 落とす（#49）
@@ -612,21 +640,38 @@ def extract_relations(client, model: str, course: str, vocab: dict, lectures: li
         f"- {r['label']}: {r['definition']}{_direction_text(r)}（例: {r['example']}）"
         for r in vocab["relations"] if r["label"] != OTHER_LABEL
     )
-    concept_text = "\n".join(f"- {c['id']}: {c['label']}" for c in concepts.values())
+    person_kinds = {k["name"] for k in vocab["kinds"] if k.get("person") is True}
+    jobs, skipped = [], 0
+    for lec in lectures:
+        for first, last in relation_chunks(lec.page_count, pages_per_call, overlap):
+            here = concepts_on_pages(concepts, lec.number, first, last,
+                                     {p: lec.pages[p - 1] for p in range(first, last + 1)}, person_kinds)
+            if len(here) < 2:
+                skipped += 1
+                continue
+            jobs.append((lec, first, last, here))
+    last_job = {lec.number: i for i, (lec, *_rest) in enumerate(jobs)}
+    for lec in lectures:
+        if lec.number not in last_job:          # 進み具合（回ごとの行）を数えるので、呼ばなかった回も 1 行出す
+            log(f"関係 第{lec.number}回: 候補 0（概念が 2 つ以上あるかたまりが無い）")
 
-    def one(lec: Lecture):
-        return lec, call_json(
+    def one(job):
+        lec, first, last, here = job
+        return job, call_json(
             client, model=model, system=RELATION_SYSTEM, schema=RELATION_SCHEMA,
             user=RELATION_USER.format(
-                course=course, lecture=lec.number, concepts=concept_text,
-                relations=rel_text, other=OTHER_LABEL, text=lecture_as_prompt_text(lec),
+                course=course, lecture=lec.number, first=first, last=last,
+                concepts="\n".join(f"- {c['id']}: {c['label']}" for c in here),
+                relations=rel_text, other=OTHER_LABEL,
+                text=_chunk_as_prompt_text(lec, list(range(first, last + 1))),
             ),
         )
 
     candidates: list[dict] = []
     dropped = collections.Counter()
+    n_lec = collections.Counter()
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        for lec, data in ex.map(one, lectures):        # ex.map は回の順を保つ
+        for i, ((lec, first, last, here), data) in enumerate(ex.map(one, jobs)):   # ex.map は順を保つ
             kept = 0
             for r in data["relations"]:
                 f, t, label = r["from"].strip(), r["to"].strip(), r["label"].strip()
@@ -647,7 +692,7 @@ def extract_relations(client, model: str, course: str, vocab: dict, lectures: li
                     continue
                 elif fix == "other":
                     dropped["端の種類が合わない→その他"] += 1
-                if not 1 <= r["page"] <= lec.page_count:
+                if not first <= r["page"] <= last:
                     dropped["ページ番号が範囲外"] += 1
                     continue
                 page = r["page"]
@@ -661,7 +706,15 @@ def extract_relations(client, model: str, course: str, vocab: dict, lectures: li
                                    "source": {"lecture": lec.number, "page": page},
                                    "_rank": evidence_rank(r.get("evidence", ""), ends, lec.pages[page - 1])})
                 kept += 1
-            log(f"関係 第{lec.number}回: {len(data['relations'])} 件 → 候補 {kept}")
+            log(f"関係の抽出 第{lec.number}回 p.{first}-{last}（概念 {len(here)}）: {len(data['relations'])} 件 → 候補 {kept}")
+            n_lec[lec.number] += kept
+            if last_job[lec.number] == i:
+                log(f"関係 第{lec.number}回: 候補 {n_lec[lec.number]}")
+    log(f"関係の抽出の呼び出し {len(jobs)} 回（{pages_per_call} ページ前後ずつ、{overlap} ページ重ねる。"
+        f"概念が 2 つ未満で呼ばなかったかたまり {skipped}）")
+    if info is not None:
+        info.update({"calls": len(jobs), "pages_per_call": pages_per_call, "overlap": overlap,
+                     "skipped_chunks": skipped})
     relations, merged = resolve_pair_conflicts(candidates)
     dropped.update(merged)
     log("同じ概念対の整理: " + (", ".join(f"{k} {v}" for k, v in merged.items()) or "なし")
@@ -1164,8 +1217,9 @@ def run_extraction(client, model: str, vocab: dict, lectures: list[Lecture], out
         log(f"出典・参考の文献・作品の種類（{'・'.join(cited_kinds)}）の概念 {n_cited} 件を落とした（関係の抽出の前）: "
             + " / ".join(removed_labels))
     step("relations")
+    relation_info: dict = {}
     relations, dropped, adjusted = extract_relations(client, model, course, vocab, lectures, concepts, workers, log=log,
-                                                     end_kind_mismatch=end_kind_mismatch)
+                                                     end_kind_mismatch=end_kind_mismatch, info=relation_info)
     if slides:
         step("slides")
         n_imgs = render_slides(lectures, out_dir / "slides", dpi)
@@ -1207,6 +1261,10 @@ def run_extraction(client, model: str, vocab: dict, lectures: list[Lecture], out
         "without_surface_examples": concept_info["without_surface"][:SURFACE_EXAMPLES],
         "mentions_without_name": concept_info["mentions_without_name"],
         "isolated_concepts": n_isolated,
+        "relation_calls": relation_info.get("calls"),
+        "relation_pages_per_call": relation_info.get("pages_per_call"),
+        "relation_overlap": relation_info.get("overlap"),
+        "relation_skipped_chunks": relation_info.get("skipped_chunks"),
         "relations_by_label": dict(label_counts.most_common()),
         "concepts_by_kind": dict(kind_counts.most_common()),
         "dropped": dropped,
