@@ -874,11 +874,11 @@ def _pages_of(c: dict) -> set[tuple[int, int]]:
 def completion_candidates(concepts: dict[str, dict], relations: list[dict], page_text: dict[tuple[int, int], str],
                           index, client, max_pairs: int = COMPLETION_MAX_PAIRS,
                           search_k: int = COMPLETION_SEARCH_K) -> tuple[list[dict], dict]:
-    """関係を補う候補の対を選ぶ。LLM は呼ばない（索引の検索は埋め込みを 1 回呼ぶ）。
+    """関係を補う候補の対を選ぶ。LLM も埋め込みも呼ばない（client は使わない。呼ぶ側との互換のために残す）。
 
     1. 同じページに一緒に出てくるのに関係の無い対
-    2. どの関係にもつながらない概念は、索引で近いページを探し（search_many で全部を 1 回の埋め込みにまとめる）、そのページに出てくる概念と対にする
-       （索引が無ければ 1 だけ）
+    2. どの関係にもつながらない概念は、その概念が出てくるページの索引ベクトルの平均で近いページを探し（#107。
+       埋め込みは呼ばない）、そのページに出てくる概念と対にする（索引が無ければ 1 だけ）
     どの関係にもつながらない概念を含む対を先に、次に一緒に出るページの多い対を先にし、max_pairs 本で切る。
     戻り値: (候補 [{"a", "b", "pages": [(lecture, page)], "page_info": [{"lecture", "page", "score", "via"}],
               "isolated": bool}], 数の記録)。via は "shared"（両方が出るページ）か "search"（索引で見つけたページ）
@@ -913,15 +913,11 @@ def completion_candidates(concepts: dict[str, dict], relations: list[dict], page
 
     searches = 0
     if index is not None and isolated:
-        # 全部の概念名を search_many の 1 回の埋め込みでまとめて引く（#84）。exclude は全問い合わせで共通なので、
-        # 概念ごとの「自分のページ」は渡さず、その分だけ多めに取ってからここで除く
         own = {cid: _pages_of(concepts[cid]) for cid in isolated}
-        k = search_k + max(len(v) for v in own.values())
-        results = index.search_many(client, [concepts[cid]["label"] for cid in isolated], k=k)
-        searches = len(isolated)
+        results = search_by_own_pages(index, [own[cid] for cid in isolated], k=search_k)
+        searches = sum(1 for found in results if found is not None)
         for cid, found in zip(isolated, results):
-            hits = [h for h in found if (h["lecture"], h["page"]) not in own[cid]][:search_k]
-            for h in hits:
+            for h in found or []:
                 page = (h["lecture"], h["page"])
                 for other in on_page.get(page, []):
                     add(cid, other, page, shared=False, score=h.get("score"))
@@ -934,6 +930,42 @@ def completion_candidates(concepts: dict[str, dict], relations: list[dict], page
         p.pop("shared")
     return chosen, {"candidates": len(pairs), "judged": len(chosen), "isolated_before": len(isolated),
                     "searches": searches}
+
+
+def search_by_own_pages(index, page_sets: list[set[tuple[int, int]]], k: int) -> list[list[dict] | None]:
+    """ページの組ごとに、その組のページの索引ベクトルの平均に近いページを k 件（#107）。埋め込みは呼ばない。
+
+    index は SlideIndex（pages と、長さ 1 に正規化した vectors を持つ）。組のページと本文が空のページは返さない。
+    結果は page_sets と同じ順の [{"lecture", "page", "text", "score"}]（score はコサイン類似度、降順）。
+    組のページがどれも索引に無ければ None（検索しなかった）。
+    """
+    import numpy as np
+
+    pos = {(p["lecture"], p["page"]): i for i, p in enumerate(index.pages)}
+    vectors = np.asarray(index.vectors, dtype=np.float32)
+    usable = [bool(p["text"].strip()) for p in index.pages]
+    out: list[list[dict] | None] = []
+    for pages in page_sets:
+        rows = [pos[p] for p in sorted(pages) if p in pos]
+        if not rows or k <= 0:
+            out.append(None if not rows else [])
+            continue
+        q = vectors[rows].mean(axis=0)
+        n = np.linalg.norm(q)
+        if not n:
+            out.append([])
+            continue
+        scores = vectors @ (q / n)
+        hits = []
+        for i in np.argsort(-scores, kind="stable"):
+            p = index.pages[i]
+            if (p["lecture"], p["page"]) in pages or not usable[i]:
+                continue
+            hits.append({**p, "score": round(float(scores[i]), 4)})
+            if len(hits) >= k:
+                break
+        out.append(hits)
+    return out
 
 
 def _wiki_text(article: dict) -> str:
@@ -1013,8 +1045,10 @@ def complete_relations(client, model, vocab, graph, pages, index, wiki, log=prin
 
     articles: dict[str, dict | None] = {}
     if wiki is not None:
-        for cid in sorted({x for p in pairs for x in (p["a"], p["b"])}):
-            articles[cid] = wiki.lookup(concepts[cid]["label"])
+        # 同時に数本で引く（#107。本数と User-Agent は rag.Wiki.lookup_many が決める）
+        ids = sorted({x for p in pairs for x in (p["a"], p["b"])})
+        found = wiki.lookup_many([concepts[cid]["label"] for cid in ids])
+        articles = {cid: found.get(concepts[cid]["label"]) for cid in ids}
     record["wiki_found"] = sum(1 for a in articles.values() if a)
     record["wiki_lookups"] = len(articles)
 
