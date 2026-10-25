@@ -26,6 +26,7 @@ import os
 import re
 import secrets
 import shutil
+import sys
 import threading
 import time
 import traceback
@@ -344,20 +345,43 @@ def _run(job: Job, d: Path, rebuild_vocab: bool, model: str) -> None:
         job.status = "error"
         job.error = error_text(e)
         job.add("失敗: " + job.error)
-        job.log.append(traceback.format_exc(limit=3))
+        _log_traceback(job, e)
     finally:
         job.finished_at = now()
         job.save()
 
 
+def quota_reset_jst() -> str:
+    """Gemini の 1 日の無料枠が戻る時刻（太平洋時間の 0 時）を、日本時間で「16 時」のように返す。"""
+    try:
+        from zoneinfo import ZoneInfo
+
+        la = dt.datetime.now(ZoneInfo("America/Los_Angeles"))
+        midnight = (la + dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return f"{midnight.astimezone(ZoneInfo('Asia/Tokyo')).hour} 時"
+    except Exception:  # noqa: BLE001  時刻の表が無い環境
+        return "16〜17 時"
+
+
 def error_text(e: Exception) -> str:
-    """画面に出す失敗の理由。1 日あたりの無料枠を使い切ったときは、何をすればよいかを書く（#107）。"""
+    """画面に出す失敗の理由（1〜2 行）。traceback や API の生の本文は画面に出さず、サーバーのログに出す。
+
+    1 日あたりの無料枠を使い切ったときは、いつ何をすればよいかを書く（#107）。
+    """
     from quizmap.common import DailyQuotaError
 
     if isinstance(e, DailyQuotaError):
-        return ("Gemini の無料枠の 1 日あたりの上限に達しました。明日（太平洋時間の 0 時以降）にもう一度"
-                f"実行するか、別の API キーを使ってください。（{e}）")
-    return f"{type(e).__name__}: {e}"
+        kind = "埋め込み" if "embed" in str(e).lower() else "生成"
+        return (f"Gemini の無料枠（{kind}）の 1 日の上限に達しました。日本時間 {quota_reset_jst()}以降に、"
+                "もう一度実行してください（済んだ分は残っています）。")
+    text = f"{type(e).__name__}: {e}"
+    return text if len(text) <= 300 else text[:300] + "…"
+
+
+def _log_traceback(job: Job, e: Exception) -> None:
+    """traceback はサーバーのログ（標準エラー）にだけ出す。画面（job.log）には出さない。"""
+    print(f"[error] {job.course_dir}: {type(e).__name__}: {e}", file=sys.stderr)
+    traceback.print_exc(file=sys.stderr)
 
 
 def _pages_of(lectures) -> list[dict]:
@@ -389,6 +413,7 @@ def _extract_with_rag(job: Job, d: Path, client, model: str, vocab: dict, lectur
             job.add(f"索引: {len(pages)} ページ（{time.monotonic() - t0:.0f} 秒、抽出と同時）")
         except Exception as e:  # noqa: BLE001  補完なしで続ける
             job.add(f"索引を作れなかった（関係の補完は飛ばす）: {error_text(e)}")
+            _log_traceback(job, e)
 
     job.add("索引づくりを、概念・関係の抽出と同時に始める")
     indexer = threading.Thread(target=build_index, name="quizmap-index", daemon=True)
@@ -414,6 +439,7 @@ def _extract_with_rag(job: Job, d: Path, client, model: str, vocab: dict, lectur
             write_json(d / "graph.json", graph)
         except Exception as e:  # noqa: BLE001  抽出だけの地図を残す
             job.add(f"関係の補完に失敗した（抽出だけの地図を使う）: {error_text(e)}")
+            _log_traceback(job, e)
 
     job.set_phase("slides")
     n_imgs = extraction.render_slides(lectures, d / "slides", SLIDE_DPI)
@@ -470,7 +496,7 @@ def _run_rag_rebuild(job: Job, d: Path, model: str) -> None:
         job.status = "error"
         job.error = error_text(e)
         job.add("失敗: " + job.error)
-        job.log.append(traceback.format_exc(limit=3))
+        _log_traceback(job, e)
     finally:
         job.finished_at = now()
         job.save()

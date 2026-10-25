@@ -484,7 +484,7 @@ def test_embed_daily_quota_skips_index_without_waiting(real_rag, rag_fakes, monk
     assert job.status == "done"
     assert len(sent) == 1, job.log                                    # 1 回で諦める
     msg = next(m for m in job.log if "索引を作れなかった" in m)
-    assert "1 日あたりの上限" in msg
+    assert "（埋め込み）の 1 日の上限" in msg and "日本時間" in msg
     assert rag_fakes["order"] == ["extract", "render"]
 
 
@@ -498,5 +498,7 @@ def test_generate_daily_quota_fails_ingest_with_reason(rag_fakes, monkeypatch):
     d = _course()
     job = _run(d)
     assert job.status == "error"
-    assert "1 日あたりの上限" in job.error and "明日" in job.error
+    assert "（生成）の 1 日の上限" in job.error and "日本時間" in job.error
+    assert "Quota exceeded" not in job.error                       # API の生の本文は画面に出さない
+    assert not any("Traceback" in m for m in job.log)               # traceback はサーバーのログだけ
     assert read_json(d / "job.json")["error"] == job.error
