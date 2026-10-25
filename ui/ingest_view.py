@@ -8,8 +8,8 @@ import streamlit as st
 
 from quizmap.common import lecture_number_of
 from quizmap.courses import (
-    PHASE_LABEL, assign_lecture_numbers, course_info, create_course, current_job, running_job,
-    save_course_info, save_upload, start_ingest,
+    PHASE_LABEL, assign_lecture_numbers, course_info, create_course, current_job, rag_enabled, running_job,
+    save_course_info, save_upload, start_ingest, start_rag_rebuild,
 )
 from ui.i18n import TEXTS, t
 from ui.state import clear_course_state
@@ -38,6 +38,11 @@ def _add_files(d: Path, uploaded) -> tuple[int, int]:
     info["files"] = assign_lecture_numbers(list(known.values()))
     save_course_info(d, info)
     return added, kept
+
+
+def needs_rag_index(d: Path) -> bool:
+    """取り込み済みで、検索の索引（rag_index.json）がまだ無いコースか。QUIZMAP_RAG=off なら常に False。"""
+    return rag_enabled() and (d / "graph.json").exists() and not (d / "rag_index.json").exists()
 
 
 def render_new_course() -> None:
@@ -116,6 +121,17 @@ def render_ingest_page(d: Path) -> None:
             st.error(str(e))
             return
         st.rerun()
+
+    # RAG より前のコースや、索引づくりが途中で止まったコースに、あとから索引と関係の補完を作る
+    if needs_rag_index(d):
+        st.caption(t("rag_rebuild_help"))
+        if st.button(t("rag_rebuild_btn"), disabled=bool(busy)):
+            try:
+                start_rag_rebuild(d)
+            except ValueError as e:
+                st.error(str(e))
+                return
+            st.rerun()
 
     if job and job.status == "error":
         st.error(t("last_failed", e=job.error))
