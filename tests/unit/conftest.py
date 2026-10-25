@@ -55,3 +55,13 @@ def fake_embed_clock(monkeypatch):
     monkeypatch.setattr(rag, "_sleep", sleep)
     monkeypatch.setattr(rag, "_sent", __import__("collections").deque())
     return clock
+
+
+@pytest.fixture(autouse=True)
+def reset_call_pacing(monkeypatch):
+    """common の呼び出し間隔の状態（429 で延びた倍率など）を、テストごとに初めに戻す。"""
+    from quizmap import common
+
+    monkeypatch.setattr(common, "_backoff", 1.0)
+    monkeypatch.setattr(common, "_last_call_at", {})
+    monkeypatch.setattr(common, "_last_429_at", -1e9)

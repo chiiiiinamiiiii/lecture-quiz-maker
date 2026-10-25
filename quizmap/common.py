@@ -32,8 +32,12 @@ ENV_FILE = Path(os.environ.get("QUIZMAP_ENV_FILE", PROJECT_DIR / ".env"))
 # 2026-10-19 に /models と料金表で確認: 最安の gemini-2.5-flash-lite は新規ユーザーに提供終了（404）、
 # 次に安い gemini-3.1-flash-lite（$0.25 / $1.50 per 1M tokens、無料枠あり）を既定にした
 DEFAULT_MODEL = os.environ.get("QUIZMAP_MODEL", "gemini-3.1-flash-lite")
-# 無料枠のレート制限対策。呼び出し間隔の下限（秒）。環境変数で調整できる
-MIN_CALL_INTERVAL = float(os.environ.get("QUIZMAP_MIN_INTERVAL", "6"))
+# 無料枠のレート制限対策。生成の呼び出し間隔の下限（秒）。環境変数で調整できる。
+# 429 が来たら間隔を 1.5 倍ずつ延ばし（上限 MAX_CALL_INTERVAL）、しばらく 429 が無ければ戻す（#107）
+MIN_CALL_INTERVAL = float(os.environ.get("QUIZMAP_MIN_INTERVAL", "4"))
+MAX_CALL_INTERVAL = float(os.environ.get("QUIZMAP_MAX_INTERVAL", "12"))
+INTERVAL_BACKOFF = 1.5
+INTERVAL_RECOVER_AFTER = 60.0   # 秒。この間 429 が無ければ、間隔を 1 段戻す
 MAX_RETRIES = 6
 OTHER_LABEL = "その他"  # 仕様 §3: 当てはまらない関係のためのラベル。常に 1 つ用意する
 
@@ -232,7 +236,9 @@ def write_json(path: Path, data) -> None:
 # ---------------------------------------------------------------- llm helper
 
 _rate_lock = threading.Lock()
-_last_call_at = 0.0
+_last_call_at: dict[str, float] = {}     # 枠ごと（generate / embed）の直前の呼び出しの時刻
+_backoff = 1.0                           # 生成の呼び出し間隔の倍率（429 で延ばし、静かなら戻す）
+_last_429_at = -1e9
 
 
 class LLMError(RuntimeError):
@@ -241,15 +247,71 @@ class LLMError(RuntimeError):
         self.status = status
 
 
-def _wait_for_slot() -> None:
-    """呼び出しの間に待機を入れる（スレッド間で共有。無料枠の RPM 対策）。"""
-    global _last_call_at
+class DailyQuotaError(LLMError):
+    """1 日あたりの無料枠を使い切った 429。待っても今日は通らないので、再試行しない（#107）。"""
+
+
+_DAILY_RE = re.compile(r"per\s*day|perday|per_day|daily", re.I)
+
+
+def is_daily_quota(message: str) -> bool:
+    """429 の本文（と quota の名前）が、1 日あたりの枠のものか。"""
+    return bool(_DAILY_RE.search(message or ""))
+
+
+def _bucket(url: str) -> str:
+    """呼び出しの枠。埋め込みと生成は別の枠なので、互いに待たない（埋め込みの量は rag._pace が守る）。"""
+    return "embed" if "EmbedContents" in url else "generate"
+
+
+def current_interval() -> float:
+    """いまの生成の呼び出し間隔（秒）。"""
+    return min(max(MIN_CALL_INTERVAL, MIN_CALL_INTERVAL * _backoff), max(MIN_CALL_INTERVAL, MAX_CALL_INTERVAL))
+
+
+def _note_429() -> None:
+    global _backoff, _last_429_at
     with _rate_lock:
-        now = time.monotonic()
-        wait = _last_call_at + MIN_CALL_INTERVAL - now
+        cap = MAX_CALL_INTERVAL / MIN_CALL_INTERVAL if MIN_CALL_INTERVAL > 0 else 1.0
+        _backoff = min(max(1.0, cap), _backoff * INTERVAL_BACKOFF)
+        _last_429_at = time.monotonic()
+
+
+def _note_success() -> None:
+    global _backoff, _last_429_at
+    with _rate_lock:
+        if _backoff > 1.0 and time.monotonic() - _last_429_at >= INTERVAL_RECOVER_AFTER:
+            _backoff = max(1.0, _backoff / INTERVAL_BACKOFF)
+            _last_429_at = time.monotonic()        # 次の 1 段も、また静かな時間を待ってから戻す
+
+
+def _wait_for_slot(bucket: str = "generate") -> None:
+    """呼び出しの間に待機を入れる（スレッド間で共有。無料枠の RPM 対策）。生成の枠だけ。"""
+    if bucket != "generate":
+        return
+    with _rate_lock:
+        t = time.monotonic()
+        wait = _last_call_at.get(bucket, -1e9) + current_interval() - t
         if wait > 0:
             time.sleep(wait)
-        _last_call_at = time.monotonic()
+        _last_call_at[bucket] = time.monotonic()
+
+
+def _error_message(resp) -> str:
+    """エラーの本文。quota の名前（details の quotaId・quotaMetric）も足す（日ごとの枠を見分けるため）。"""
+    try:
+        data = resp.json()
+    except ValueError:
+        return resp.text
+    err = data.get("error") if isinstance(data, dict) else None
+    if not isinstance(err, dict):
+        return resp.text
+    message = err.get("message", resp.text)
+    names = []
+    for d in err.get("details") or []:
+        for v in (d.get("violations") or []) if isinstance(d, dict) else []:
+            names += [v.get(k) for k in ("quotaId", "quotaMetric") if v.get(k)]
+    return message + (f" [quota: {', '.join(names)}]" if names else "")
 
 
 def _retry_delay(message: str, attempt: int) -> float:
@@ -266,11 +328,14 @@ def _post_with_retry(client: LLMClient, url: str, body: dict, retry_on_429: bool
 
     retry_on_429=False なら、429 は待たずにすぐ LLMError(429) を投げる（呼ぶ側が量を減らして送り直すため。
     rag.embed がバッチを割るのに使う）。5xx と通信エラーはこれまでどおり再試行する。
+    1 日あたりの枠の 429 は、どちらでも待たずに DailyQuotaError を投げる（#107）。
+    生成の 429 では呼び出し間隔を延ばす（current_interval）。
     """
     import requests
 
+    bucket = _bucket(url)
     for attempt in range(MAX_RETRIES + 1):
-        _wait_for_slot()
+        _wait_for_slot(bucket)
         try:
             resp = requests.post(url, headers=client._headers(), json=body, timeout=client.timeout)
         except requests.RequestException as e:
@@ -282,18 +347,23 @@ def _post_with_retry(client: LLMClient, url: str, body: dict, retry_on_429: bool
             time.sleep(delay)
             continue
         if resp.status_code == 200:
+            if bucket == "generate":
+                _note_success()
             return resp.json()
-        try:
-            message = resp.json().get("error", {}).get("message", resp.text)
-        except ValueError:
-            message = resp.text
-        if resp.status_code == 429 and not retry_on_429:
-            raise LLMError(429, message)
+        message = _error_message(resp)
+        if resp.status_code == 429:
+            if is_daily_quota(message):
+                raise DailyQuotaError(429, message)
+            if bucket == "generate":
+                _note_429()
+            if not retry_on_429:
+                raise LLMError(429, message)
         if resp.status_code == 429 or resp.status_code >= 500:
             if attempt == MAX_RETRIES:
                 raise LLMError(resp.status_code, message)
             delay = _retry_delay(message, attempt)
-            print(f"  [retry] HTTP {resp.status_code}: {delay:.0f} 秒待って再試行 ({attempt + 1}/{MAX_RETRIES})",
+            print(f"  [retry] HTTP {resp.status_code}: {delay:.0f} 秒待って再試行 ({attempt + 1}/{MAX_RETRIES})"
+                  + (f"、呼び出し間隔 {current_interval():.1f} 秒" if bucket == "generate" else ""),
                   file=sys.stderr)
             time.sleep(delay)
             continue

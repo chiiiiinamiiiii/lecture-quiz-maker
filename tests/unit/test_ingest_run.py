@@ -87,7 +87,7 @@ def test_success(courses_dir, fakes):
     assert job.error == ""
     assert job.n_lectures == 2
     assert job.done_concepts == 2 and job.done_relations == 2
-    assert job.log[-1] == "完了"
+    assert job.log[-1].startswith("完了（全体 ")
     assert fakes["lectures"] == [1, 2]                      # use=False は渡さない
     assert fakes["derive"] == 1
     assert fakes["vocab_course"] == "倫理学の世界"          # 授業名は利用者が入れたもの（§16.3）

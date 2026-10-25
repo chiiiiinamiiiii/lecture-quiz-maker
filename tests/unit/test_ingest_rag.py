@@ -19,7 +19,7 @@ import types
 import pytest
 
 import quizmap.rag as _REAL_RAG
-from quizmap import courses, extraction, vocab
+from quizmap import common, courses, extraction, vocab
 from quizmap.common import Lecture, read_json, write_json
 
 _REAL_EMBED = _REAL_RAG.embed
@@ -137,6 +137,13 @@ def _run(d):
     return job
 
 
+def _sorted_order(order):
+    """索引づくり（build, save）は抽出と同時に走るので、抽出との前後は決まらない。比べやすい形にそろえる。"""
+    rank = {"build": 0, "save": 1, "extract": 2}
+    head = sorted([x for x in order if x in rank], key=rank.get)
+    return head + [x for x in order if x not in rank]
+
+
 def _phases(job):
     out = []
     for ph, _ in job._trace:
@@ -151,21 +158,18 @@ def test_phases_in_order_and_progress_never_decreases(rag_fakes):
     d = _course()
     job = _run(d)
     assert job.status == "done", job.error
-    assert _phases(job) == ["read", "vocab", "index", "concepts", "relations", "completion", "slides"]
-    assert rag_fakes["order"] == ["build", "save", "extract", "complete", "render"]
+    assert _phases(job) == ["read", "vocab", "concepts", "relations", "index", "completion", "slides"]
+    assert _sorted_order(rag_fakes["order"]) == ["build", "save", "extract", "complete", "render"]
     progress = [p for _, p in job._trace]
     assert progress == sorted(progress)
     assert job.progress == 1.0
     assert "索引: 2 / 4 ページ" in job.log and "索引: 4 / 4 ページ" in job.log
-    start, width = courses._phase_span("index")
-    index_progress = [p for ph, p in job._trace if ph == "index"]
-    assert index_progress[-1] == pytest.approx(start + width)    # 索引づくりの中で進む
-    assert len(set(index_progress)) >= 3
+    assert any(m.startswith("索引: 4 ページ") for m in job.log)
 
 
 def test_phase_widths_sum_to_one_and_every_phase_has_label():
     assert sum(w for _, _, w in courses.PHASES) == pytest.approx(1.0)
-    assert [k for k, _, _ in courses.PHASES] == ["read", "vocab", "index", "concepts", "relations",
+    assert [k for k, _, _ in courses.PHASES] == ["read", "vocab", "concepts", "relations", "index",
                                                   "completion", "slides"]
     assert all(courses.PHASE_LABEL[k] for k, _, _ in courses.PHASES)
 
@@ -202,7 +206,7 @@ def test_index_failure_skips_completion_but_ingest_finishes(rag_fakes):
     d = _course()
     job = _run(d)
     assert job.status == "done"
-    assert rag_fakes["order"] == ["build", "extract", "render"]
+    assert _sorted_order(rag_fakes["order"]) == ["build", "extract", "render"]
     assert not (d / "rag_index.json").exists()
     assert any("索引を作れなかった" in m for m in job.log)
     assert len(read_json(d / "graph.json")["relations"]) == 1
@@ -214,7 +218,7 @@ def test_completion_failure_keeps_extracted_graph(rag_fakes):
     d = _course()
     job = _run(d)
     assert job.status == "done"
-    assert rag_fakes["order"] == ["build", "save", "extract", "complete", "render"]
+    assert _sorted_order(rag_fakes["order"]) == ["build", "save", "extract", "complete", "render"]
     assert any("関係の補完に失敗した" in m for m in job.log)
     assert len(read_json(d / "graph.json")["relations"]) == 1
 
@@ -336,12 +340,15 @@ def test_real_rag_index_429_forever_ingest_continues(real_rag, rag_fakes, monkey
             return {"error": {"message": "Quota exceeded for metric: embed_content_free_tier_tokens"}}
 
     monkeypatch.setattr(real_rag, "embed", _REAL_EMBED)        # 埋め込みは本物（HTTP だけ偽物）
+    monkeypatch.setattr(courses, "make_client", lambda: common.LLMClient(api_key="k", base_url="https://x.invalid"))
+    sent = []
     monkeypatch.setattr(common, "MIN_CALL_INTERVAL", 0.0)
-    monkeypatch.setattr(requests, "post", lambda *a, **k: R())
+    monkeypatch.setattr(requests, "post", lambda *a, **k: sent.append(1) or R())
     d = _course()
     job = _run(d)
     assert job.status == "done"
-    assert any("索引を作れなかった" in m for m in job.log)
+    assert sent, "埋め込みを送ったはず"
+    assert any("索引を作れなかった" in m and "429" in m for m in job.log)
     assert not (d / "rag_index.json").exists()
     assert rag_fakes["order"] == ["extract", "render"]           # 補完は飛ばす
 
@@ -412,3 +419,84 @@ def test_start_rag_rebuild_runs_in_background(rag_fakes):
         _t.sleep(0.01)
     assert job.status == "done", job.log
     assert courses.current_job(d) is job
+
+
+# ------------------------------------------------------------------ 速さ（#107）
+
+def test_index_runs_while_extracting(rag_fakes, monkeypatch):
+    """索引づくりは、抽出と同時に走る（抽出の途中で索引づくりが始まっている）。"""
+    import threading
+
+    started = threading.Event()
+    seen = {}
+    orig_extract = extraction.run_extraction
+    orig_build = sys.modules["quizmap.rag"].SlideIndex.build.__func__
+    FakeIndex = sys.modules["quizmap.rag"].SlideIndex
+
+    def build(cls, client, pages, progress=None):
+        started.set()
+        return orig_build(cls, client, pages, progress=progress)
+
+    def run_extraction(*a, **kw):
+        seen["index_started_during_extraction"] = started.wait(2.0)
+        return orig_extract(*a, **kw)
+
+    monkeypatch.setattr(FakeIndex, "build", classmethod(build))
+    monkeypatch.setattr(extraction, "run_extraction", run_extraction)
+    d = _course()
+    job = _run(d)
+    assert job.status == "done"
+    assert seen["index_started_during_extraction"] is True
+    assert any("同時に始める" in m for m in job.log)
+
+
+def test_phase_durations_are_logged(rag_fakes):
+    d = _course()
+    job = _run(d)
+    for label in ("PDF の読み込み", "語彙の導出（§4）", "概念の抽出（§5）", "関係の抽出（§5）", "索引づくり",
+                  "関係の補完", "スライド画像の作成"):
+        assert any(m.startswith(f"   {label}: ") and m.endswith(" 秒") for m in job.log), label
+    assert job.log[-1].startswith("完了（全体 ")
+    assert "_phase_t0" not in read_json(d / "job.json")              # job.json の形は変えない
+
+
+def test_embed_daily_quota_skips_index_without_waiting(real_rag, rag_fakes, monkeypatch):
+    import requests
+    from quizmap import common
+
+    monkeypatch.setattr(real_rag, "embed", _REAL_EMBED)
+    monkeypatch.setattr(common, "MIN_CALL_INTERVAL", 0.0)
+    monkeypatch.setattr(courses, "make_client", lambda: common.LLMClient(api_key="k", base_url="https://x.invalid"))
+    sent = []
+
+    class R:
+        status_code = 429
+        text = "quota"
+
+        def json(self):
+            return {"error": {"message": "Quota exceeded for metric: embed_content_free_tier_requests, limit: 1000",
+                              "details": [{"violations": [
+                                  {"quotaId": "EmbedContentRequestsPerDayPerProjectPerModel-FreeTier"}]}]}}
+
+    monkeypatch.setattr(requests, "post", lambda *a, **k: sent.append(1) or R())
+    d = _course()
+    job = _run(d)
+    assert job.status == "done"
+    assert len(sent) == 1, job.log                                    # 1 回で諦める
+    msg = next(m for m in job.log if "索引を作れなかった" in m)
+    assert "1 日あたりの上限" in msg
+    assert rag_fakes["order"] == ["extract", "render"]
+
+
+def test_generate_daily_quota_fails_ingest_with_reason(rag_fakes, monkeypatch):
+    from quizmap.common import DailyQuotaError
+
+    def run_extraction(*a, **kw):
+        raise DailyQuotaError(429, "Quota exceeded [quota: GenerateRequestsPerDayPerProjectPerModel-FreeTier]")
+
+    monkeypatch.setattr(extraction, "run_extraction", run_extraction)
+    d = _course()
+    job = _run(d)
+    assert job.status == "error"
+    assert "1 日あたりの上限" in job.error and "明日" in job.error
+    assert read_json(d / "job.json")["error"] == job.error
