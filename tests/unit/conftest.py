@@ -54,6 +54,7 @@ def fake_embed_clock(monkeypatch):
     monkeypatch.setattr(rag, "_now", lambda: clock["t"])
     monkeypatch.setattr(rag, "_sleep", sleep)
     monkeypatch.setattr(rag, "_sent", __import__("collections").deque())
+    monkeypatch.setattr(rag, "_limits", {"items": rag.EMBED_ITEMS_PER_MIN, "tokens": rag.EMBED_TOKENS_PER_MIN})
     return clock
 
 
