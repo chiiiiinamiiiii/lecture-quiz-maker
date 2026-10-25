@@ -38,7 +38,7 @@ Open http://localhost:8501, choose “+ New course”, upload PDFs, and press �
 
 Tests (no API calls): `.venv/bin/pip install -r requirements-dev.txt && .venv/bin/playwright install chromium`, then `.venv/bin/python -m pytest tests -q`.
 
-End-to-end test with the real API: `RUN_API_TESTS=1 .venv/bin/python -m pytest tests/e2e/test_full_flow_api.py -q`. A browser uploads a PDF, imports it with RAG on, selects a lecture range on the map, generates 3 questions, answers, grades, and checks that the explanations, `results.json` and the asked-concept colors appear. On the final code (2026-10-24) it passed in 120 s with 14 API calls. Short-answer grading was not exercised in that run because no short-answer question came up; it was measured separately in the evaluation.
+End-to-end test with the real API: `RUN_API_TESTS=1 .venv/bin/python -m pytest tests/e2e/test_full_flow_api.py -q`. A browser uploads a PDF, imports it with RAG on, selects a lecture range on the map, generates 3 questions, answers, grades, and checks that the explanations, `results.json` and the asked-concept colors appear. On the final code (2026-10-25) it passed in 75 s with 13 API calls. Short-answer grading was not exercised in that run because no short-answer question came up; it was measured separately in the evaluation.
 
 ## Where the LLM is used
 
