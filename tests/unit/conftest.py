@@ -65,3 +65,13 @@ def reset_call_pacing(monkeypatch):
     monkeypatch.setattr(common, "_backoff", 1.0)
     monkeypatch.setattr(common, "_last_call_at", {})
     monkeypatch.setattr(common, "_last_429_at", -1e9)
+
+
+@pytest.fixture(autouse=True)
+def embed_cache_dir(monkeypatch, tmp_path):
+    """埋め込みのキャッシュをテストごとの一時フォルダに（本物の data/ に書かない。前のテストの分を使わない）。"""
+    from quizmap import rag
+
+    d = tmp_path / "embed_cache"
+    monkeypatch.setattr(rag, "EMBED_CACHE_DIR", d)
+    return d

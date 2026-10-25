@@ -1,6 +1,7 @@
 """RAG の部品（docs/rag-design.md）。スライドの索引と Wikipedia の引き当て。
 
-- embed(): Gemini の batchEmbedContents で文を埋め込む。バッチは件数と文字数の両方で小さくし、
+- embed(): Gemini の batchEmbedContents で文を埋め込む。一度埋め込んだ文は DATA_DIR/embed_cache/ に残し、
+  コースをまたいで使い回す（同じ資料の取り込み直しでは API を呼ばない）。バッチは件数と文字数の両方で小さくし、
   1 分あたりの件数・トークン数の上限を超えないよう間を空ける。429 ならバッチを半分に割って送り直す
 - SlideIndex: pages.json の全ページを埋め込み、コサイン類似度で引く。course_dir/rag_index.json に保存する
   （ベクトルは長さ 1 に正規化してから float16 にし、base64 で 1 本の文字列にする。185 ページで約 1.5 MB）
@@ -12,6 +13,7 @@ Wikipedia は関係の確認と選択肢の検証にだけ使う。答えの根�
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import re
 import sys
@@ -24,7 +26,7 @@ from urllib.parse import quote
 
 import numpy as np
 
-from quizmap.common import LLMClient, _post_with_retry, read_json, write_json
+from quizmap.common import DATA_DIR, LLMClient, _post_with_retry, read_json, write_json
 
 EMBED_MODEL = os.environ.get("QUIZMAP_EMBED_MODEL", "gemini-embedding-001")
 EMBED_MAX_CHARS = 6000         # gemini-embedding-001 の入力上限（2048 トークン）を超えないよう切る
@@ -36,6 +38,8 @@ EMBED_BATCH_TOKENS = int(os.environ.get("QUIZMAP_EMBED_BATCH_TOKENS", "20000")) 
 # 無料枠: embed_content_free_tier_tokens は 1 分あたり 30,000 トークン。見積もりの誤差を見て少し下で止める
 EMBED_ITEMS_PER_MIN = int(os.environ.get("QUIZMAP_EMBED_ITEMS_PER_MIN", "80"))   # 1 分あたりの件数（無料枠 100 より下）
 EMBED_TOKENS_PER_MIN = int(os.environ.get("QUIZMAP_EMBED_TOKENS_PER_MIN", "25000"))  # 1 分あたりのトークン数（見積もり）
+# 埋め込みのキャッシュ（コースをまたいで共有）。キーは モデル・task・本文（EMBED_MAX_CHARS で切った後）の sha256
+EMBED_CACHE_DIR = Path(os.environ.get("QUIZMAP_EMBED_CACHE_DIR", DATA_DIR / "embed_cache"))
 EMBED_429_RETRIES = 4          # 1 件まで割っても 429 のとき、待って送り直す回数
 EMBED_429_MIN_WAIT = 10.0      # 429 の後、割ったバッチを送る前に待つ最小の秒数
 INDEX_FILE = "rag_index.json"
@@ -122,6 +126,34 @@ def _pace(n_items: int, n_tokens: int) -> None:
             _sleep(max(0.5, 60.0 - (t - _sent[0][0])))      # いちばん古い記録が 1 分を過ぎるまで
 
 
+def _cache_path(task: str, text: str) -> Path:
+    h = hashlib.sha256(f"{EMBED_MODEL}\n{task}\n{text}".encode("utf-8")).hexdigest()
+    return EMBED_CACHE_DIR / EMBED_MODEL / task / h[:2] / f"{h}.f32"
+
+
+def cache_get(task: str, text: str) -> list[float] | None:
+    """キャッシュにあるベクトル（無い・壊れていれば None）。"""
+    try:
+        raw = _cache_path(task, text).read_bytes()
+    except OSError:
+        return None
+    if not raw or len(raw) % 4:
+        return None
+    return np.frombuffer(raw, dtype="<f4").astype(float).tolist()
+
+
+def cache_put(task: str, text: str, vector: list[float]) -> None:
+    """キャッシュに書く。置き換えで書くので、途中で止まっても壊れたファイルは残らない。書けなくても止めない。"""
+    path = _cache_path(task, text)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_bytes(np.asarray(vector, dtype="<f4").tobytes())
+        os.replace(tmp, path)
+    except OSError as e:
+        print(f"[warn] 埋め込みのキャッシュに書けなかった: {e}", file=sys.stderr)
+
+
 def embed(client: LLMClient, texts: list[str], task: str = "RETRIEVAL_DOCUMENT",
           progress=None) -> list[list[float]]:
     """texts を埋め込み、入力と同じ順でベクトルを返す。task は RETRIEVAL_DOCUMENT / RETRIEVAL_QUERY など。
@@ -131,6 +163,8 @@ def embed(client: LLMClient, texts: list[str], task: str = "RETRIEVAL_DOCUMENT",
     送る前に _pace で、直前 60 秒に送った件数・トークン数が 1 分あたりの上限を超えないところまで待つ。
     429 のときはそのバッチを半分に割って送り直す。1 件でも 429 なら、待って EMBED_429_RETRIES 回まで送り直す。
     progress(済んだ件数, 全件数) をバッチが済むたびに呼ぶ（索引づくりの進み具合を画面に出すため）。
+    キャッシュにある文は送らない。バッチが通るたびにキャッシュに書くので、途中で失敗しても、
+    次に呼んだときは残りの文だけを送る。
     """
     from quizmap.common import DailyQuotaError, LLMError
 
@@ -138,7 +172,18 @@ def embed(client: LLMClient, texts: list[str], task: str = "RETRIEVAL_DOCUMENT",
     todo = [(i, t[:EMBED_MAX_CHARS]) for i, t in enumerate(texts) if t and t.strip()]
     url = f"{client.base_url}/models/{EMBED_MODEL}:batchEmbedContents"
     dim = 0
-    done = 0
+    total = len(todo)
+    missing = []
+    for i, t in todo:
+        v = cache_get(task, t)
+        if v is None:
+            missing.append((i, t))
+        else:
+            out[i] = v
+            dim = len(v)
+    done = total - len(missing)
+    if done and progress:
+        progress(done, total)
 
     def send(chunk: list[tuple[int, str]]) -> None:
         nonlocal dim, done
@@ -171,14 +216,15 @@ def embed(client: LLMClient, texts: list[str], task: str = "RETRIEVAL_DOCUMENT",
         embs = data.get("embeddings") or []
         if len(embs) != len(chunk):
             raise RuntimeError(f"埋め込みの数が合わない: {len(chunk)} 件送って {len(embs)} 件返った")
-        for (i, _), e in zip(chunk, embs):
+        for (i, t), e in zip(chunk, embs):
             out[i] = e["values"]
             dim = len(e["values"])
+            cache_put(task, t, e["values"])
         done += len(chunk)
         if progress:
-            progress(done, len(todo))
+            progress(done, total)
 
-    for chunk in split_batches(todo):
+    for chunk in split_batches(missing):
         send(chunk)
     return [v if v is not None else [0.0] * dim for v in out]
 
