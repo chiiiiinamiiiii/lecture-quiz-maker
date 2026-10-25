@@ -418,3 +418,24 @@ def test_judgements_are_called_in_parallel_and_checked_in_pair_order(monkeypatch
     assert [r["from"] for r in g["relations"] if r.get("added_by")] == ["kouno"]
     steps = [s for s in logs if s.startswith("関係の補完 ") and "追加" in s and "〜" in s]
     assert [int(s.split()[1].split("〜")[0]) for s in steps] == list(range(1, c["judged"] + 1))
+
+
+def test_candidates_pick_one_pair_per_isolated_concept_first():
+    """つながらない概念 1 個につき 1 対ずつ順に選ぶ（#114）。同じ概念が枠を取り尽くさない。"""
+    # i1 は 5 つの概念と何度も同じページに出る。i2・i3 は 1 回だけ
+    pages = {(1, n): "x" for n in range(1, 8)}
+    cs = {"i1": concept("i1", "孤1", "学説", *[(1, n) for n in range(1, 6)]),
+          "i2": concept("i2", "孤2", "学説", (1, 6)),
+          "i3": concept("i3", "孤3", "学説", (1, 7))}
+    for n in range(1, 6):
+        cs[f"a{n}"] = concept(f"a{n}", f"甲{n}", "人物", *[(1, m) for m in range(1, 6)])
+    cs["b"] = concept("b", "乙", "人物", (1, 6), (1, 7))
+    rels = [{"from": f"a{n}", "to": "b", "label": OTHER_LABEL, "source": {"lecture": 1, "page": 1}} for n in range(1, 6)]
+    chosen, rec = extraction.completion_candidates(cs, rels, pages, None, None, max_pairs=3)
+    got = {frozenset((p["a"], p["b"])) for p in chosen}
+    assert frozenset(("i2", "b")) in got and frozenset(("i3", "b")) in got
+    assert sum(1 for p in chosen if "i1" in (p["a"], p["b"])) == 1
+    # 枠が多ければ、一巡した後で 2 対目、その後につながる概念どうしの対
+    chosen, _ = extraction.completion_candidates(cs, rels, pages, None, None, max_pairs=6)
+    assert sum(1 for p in chosen if "i1" in (p["a"], p["b"])) == 4
+    assert len({id(p) for p in chosen}) == 6
