@@ -45,16 +45,24 @@ def graph():
     }
 
 
-class FakeIndex:
-    def __init__(self, hits):
-        self.hits, self.queries = hits, []
+def page_index(vectors: dict[tuple[int, int], list[float]], pages=None):
+    """本物の SlideIndex をページのベクトルから作る。埋め込みを呼ぶと失敗させる（補完の検索は埋め込まない、#107）。"""
+    import numpy as np
 
-    def search(self, client, query, k=5, exclude=frozenset()):
-        raise AssertionError("complete_relations は search を 1 件ずつ呼ばず search_many を使う（#84）")
+    from quizmap import rag
 
-    def search_many(self, client, queries, k=5, exclude=frozenset()):
-        self.queries.append((list(queries), k, set(exclude)))
-        return [[h for h in self.hits.get(q, []) if (h["lecture"], h["page"]) not in exclude][:k] for q in queries]
+    pages = pages or PAGES
+    m = np.array([vectors[(p["lecture"], p["page"])] for p in pages], dtype=np.float32)
+    index = rag.SlideIndex(pages, rag._normalize(m))
+
+    def no_query(*a, **k):
+        raise AssertionError("補完の検索で問い合わせ文を埋め込まない（#107）")
+    index.search = index.search_many = index._query_vector = no_query
+    return index
+
+
+# 丁説（tei）は第1回 p2 にだけ出る。第2回 p1 のベクトルが p2 に近く、第1回 p1 は遠い
+VEC = {(1, 1): [1.0, 0.0], (1, 2): [0.0, 1.0], (2, 1): [0.3, 1.0]}
 
 
 class FakeWiki:
@@ -62,8 +70,11 @@ class FakeWiki:
         self.articles, self.terms = articles, []
 
     def lookup(self, term):
-        self.terms.append(term)
-        return self.articles.get(term)
+        raise AssertionError("complete_relations は lookup を 1 件ずつ呼ばず lookup_many を使う（#107）")
+
+    def lookup_many(self, terms, workers=None):
+        self.terms += list(terms)
+        return {t: self.articles.get(t) for t in terms}
 
 
 @pytest.fixture
@@ -162,7 +173,7 @@ def test_direction_is_fixed_by_end_kinds_and_other_label_is_not_added(llm):
 
 def test_isolated_concept_uses_index_and_external_needs_wiki_text(llm):
     # 丁説（tei）はどの関係にもつながらず、ほかの概念と同じページにも出ない。索引で第2回 p1 が見つかり、丙と対になる
-    index = FakeIndex({"丁説": [{"lecture": 2, "page": 1, "text": "", "score": 0.9}]})
+    index = page_index(VEC)
     g0 = graph()
     g0["concepts"][2]["sources"].append({"lecture": 2, "page": 1})
     wiki = FakeWiki({"丁説": {"title": "丁説", "url": "https://ja.wikipedia.org/wiki/丁説",
@@ -180,7 +191,7 @@ def test_isolated_concept_uses_index_and_external_needs_wiki_text(llm):
                     "evidence_url": "https://ja.wikipedia.org/wiki/丁説", "evidence_title": "丁説",
                     "added_by": "completion"}]
     c = g["stats"]["completion"]
-    assert c["searches"] >= 1 and len(index.queries) == 1 and "丁説" in index.queries[0][0]
+    assert c["searches"] >= 1
     assert c["isolated_after"] < c["isolated_before"]
 
 
@@ -219,7 +230,7 @@ def test_input_graph_is_not_modified(llm):
 
 
 def test_pair_records_for_evaluation(llm):
-    index = FakeIndex({"丁説": [{"lecture": 2, "page": 1, "text": "", "score": 0.9}]})
+    index = page_index(VEC)
     g0 = graph()
     g0["concepts"][2]["sources"].append({"lecture": 2, "page": 1})
     wiki = FakeWiki({"甲野": {"title": "甲野", "url": "U甲野", "extract": "甲野は哲学者。"}})
@@ -238,48 +249,50 @@ def test_pair_records_for_evaluation(llm):
     assert recs[("hei", "kouno")]["result"] == "none"
     bad = recs[("hei", "tei")]
     assert bad["result"] == "rejected" and bad["reason"] == "evidence が本文に無い"
-    assert bad["pages"] == [{"lecture": 2, "page": 1, "score": 0.9, "via": "search"}]
+    # 近い順。第2回 p1 が先、遠い第1回 p1 も k 件の内なら候補のページに入る
+    assert [(x["lecture"], x["page"], x["via"]) for x in bad["pages"]] == [(2, 1, "search"), (1, 1, "search")]
+    assert 0.9 < bad["pages"][0]["score"] < 1.0
     assert bad["judgement"]["slide_evidence"] == "無い文"
 
 
-def test_isolated_concepts_use_one_embedding_call(llm, monkeypatch):
-    """つながらない概念が N 個でも、索引の検索の埋め込みは 1 回（#84）。本物の SlideIndex で埋め込みだけ差し替える。"""
-    import numpy as np
-
+def test_isolated_concepts_search_by_page_vectors_without_embedding(llm, monkeypatch):
+    """つながらない概念が N 個でも、補完の検索は埋め込みを呼ばない。自分のページのベクトルの平均で引く（#107）。"""
     from quizmap import rag
 
-    calls = []
-
-    def fake_embed(client, texts, task="RETRIEVAL_DOCUMENT"):
-        calls.append((list(texts), task))
-        return [[1.0, float(i % 3)] for i, _ in enumerate(texts)]
+    def fake_embed(*a, **k):
+        raise AssertionError("埋め込みを呼んだ")
 
     monkeypatch.setattr(rag, "embed", fake_embed)
     pages = [{"lecture": 1, "page": n, "text": f"ページ{n}"} for n in range(1, 8)]
-    index = rag.SlideIndex(pages, np.array([[1.0, float(n % 3)] for n in range(7)], dtype=np.float32))
+    index = page_index({(1, n): [1.0, float(n % 3)] for n in range(1, 8)}, pages)
     g0 = {"course": "テスト", "relations": [], "stats": {},
           "concepts": [concept(f"c{n}", f"概念{n}", "人物", (1, n)) for n in range(1, 8)]}
     g = extraction.complete_relations(None, "m", VOCAB, g0, pages, index=index, wiki=None, log=lambda s: None)
-    assert len(calls) == 1 and calls[0][1] == "RETRIEVAL_QUERY"
-    assert sorted(calls[0][0]) == [f"概念{n}" for n in range(1, 8)]
     c = g["stats"]["completion"]
     assert c["isolated_before"] == 7 and c["searches"] == 7
-    # 自分のページは候補のページにしない（exclude を概念ごとに渡せないので、取った後に除いている）
     for rec in c["pairs"]:
         for p in rec["pages"]:
             assert p["via"] == "search"
 
 
-def test_own_pages_excluded_after_search_many(llm):
-    hits = [{"lecture": 1, "page": 2, "text": "", "score": 0.99}, {"lecture": 2, "page": 1, "text": "", "score": 0.5}]
-    index = FakeIndex({"丁説": hits})
+def test_search_by_own_pages_uses_mean_and_excludes_own_and_empty_pages():
+    pages = PAGES + [{"lecture": 3, "page": 1, "text": " "}]
+    index = page_index({**VEC, (3, 1): [0.0, 1.0]}, pages)
+    # 第1回 p1 と p2 の平均は [1,1] の向き。自分のページと本文が空の第3回 p1 は返さない
+    [hits, own_two, missing] = extraction.search_by_own_pages(index, [{(1, 2)}, {(1, 1), (1, 2)}, {(9, 9)}], k=3)
+    assert [(h["lecture"], h["page"]) for h in hits] == [(2, 1), (1, 1)]
+    assert [(h["lecture"], h["page"]) for h in own_two] == [(2, 1)]
+    assert missing is None
+    assert hits[0]["score"] > hits[1]["score"]
+
+
+def test_own_pages_are_not_search_pages(llm):
     g0 = graph()
     g0["concepts"][2]["sources"].append({"lecture": 2, "page": 1})
-    g = extraction.complete_relations(None, "m", VOCAB, g0, PAGES, index=index, wiki=None, log=lambda s: None)
-    queries, k, exclude = index.queries[0]
-    assert exclude == set() and k == extraction.COMPLETION_SEARCH_K + 1
+    g = extraction.complete_relations(None, "m", VOCAB, g0, PAGES, index=page_index(VEC), wiki=None, log=lambda s: None)
     rec = {(r["a"], r["b"]): r for r in g["stats"]["completion"]["pairs"]}[("hei", "tei")]
-    assert rec["pages"] == [{"lecture": 2, "page": 1, "score": 0.5, "via": "search"}]
+    assert (1, 2) not in {(x["lecture"], x["page"]) for x in rec["pages"]}     # 丁説の自分のページ
+    assert (rec["pages"][0]["lecture"], rec["pages"][0]["page"]) == (2, 1)
 
 
 WIKI_KOUNO = {"甲野": {"title": "甲野", "url": "U甲野", "extract": "甲野は哲学者で、乙説を唱えたことで知られる。"}}
