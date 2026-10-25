@@ -45,9 +45,9 @@ CONCEPT_USER = """授業「{course}」の第{lecture}回の資料のうち、p.{
 - 授業の中で筋や内容が論じられている作品（劇・小説・報告書など）は、出典として挙がっているだけの本と区別する。
   作品そのものを【出典の文献】ではない種類で挙げ、内容を表す概念（その作品の中の対立や原則など）も挙げる
 - 一方で、資料に書かれていない概念を足さない
-- label はページ本文にそのまま書かれている表記にする（言い換えたり要約したりした名前にしない）。
-  資料中の表記に合わせた短い{language}（人名は姓名、立場は正式名称）
-- id は label をローマ字にした snake_case の ASCII（例: kant, gimu_ron）。既出の概念は既出の id と label をそのまま使う
+- label は、そのページの本文に書かれている表記を、そのまま写す（言い換え・要約・表記の統一・送り仮名の変更をしない）。
+  短い{language}の語句にする（文にしない）
+- id は label をローマ字にした snake_case の ASCII（例: kant, gimu_ron）。既出の概念は既出の id をそのまま使う
 - definition は資料の記述に基づいて 1〜2 文
 - pages はその概念の名前が書かれているページの番号（p.{first}〜p.{last} から。複数可）。必ず 1 つ以上入れる
 
@@ -176,7 +176,51 @@ def clean_id(raw: str, fallback: str) -> str:
 
 
 CONCEPT_PAGES = int(os.environ.get("QUIZMAP_CONCEPT_PAGES", "4"))   # 概念の抽出の 1 回に渡すページ数の目安（0 以下で回ごと）
-LABEL_MISSING_EXAMPLES = 20
+SURFACE_EXAMPLES = 20
+
+# 地図に出す名前は、資料の本文に書かれている表記そのもの（利用者の決まり、#101）。
+# LLM の label が本文に無ければ、まずコードで本文の中の一番近い表記を探し、それでも無ければ回ごとに 1 回だけ
+# LLM に本文から写させて、本文にあることをコードで確かめる。それでも見つからない概念は地図の点にしないが、
+# graph の concepts_without_surface に残す（消さない）。
+
+SURFACE_SYSTEM = """あなたは大学の授業資料の表記を確かめる専門家です。資料の本文に書かれている文字列だけを、そのまま写します。"""
+
+SURFACE_USER = """授業「{course}」の第{lecture}回の資料です（ページ番号付き）。
+次の概念は、この名前のままでは資料の本文に見つかりませんでした。
+それぞれ、この概念を指す語句を、下のページの本文からそのまま写してください。
+
+{items}
+
+守ること:
+- 本文に書かれている文字列を 1 字も変えずに写す（言い換え・要約・表記の統一・送り仮名の変更をしない）
+- 文ではなく、概念の名前になる短い語句を写す
+- 本文にこの概念を指す語句が無ければ surface を空にする（作らない）
+- page はその語句が書かれているページ番号
+
+=== 資料 ===
+{text}
+"""
+
+SURFACE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "answers": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer"},
+                    "surface": {"type": "string"},
+                    "page": {"type": "integer"},
+                },
+                "required": ["index", "surface", "page"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["answers"],
+    "additionalProperties": False,
+}
 
 
 def page_chunks(n_pages: int, size: int = CONCEPT_PAGES) -> list[tuple[int, int]]:
@@ -198,27 +242,141 @@ def page_chunks(n_pages: int, size: int = CONCEPT_PAGES) -> list[tuple[int, int]
     return chunks
 
 
-def pages_with_name(concept: dict, page_texts: dict[int, str], person_kinds: set[str]) -> list[int]:
-    """概念の名前（括弧の前。人物の種類なら「・」「=」で区切った 2 字以上の部分も可、#95 と同じ）が
-    本文に書かれているページ（#101。地図の単語は資料に載っているものだけ）。NFKC・空白を除いて比べる。"""
-    names = _name_variants(concept, person_kinds)
-    return [p for p, text in page_texts.items() if any(n in _squash(text) for n in names)]
+# 表記ゆれとして無視する文字（中黒・イコール・空白・括弧・かぎ括弧・ハイフン）
+_LOOSE_DROP = set("・･=＝-‐‑–—()（）[]［］{}「」『』〈〉《》【】\"'“”‘’") | {" ", "\t", "　", "\n"}
+_PART_FIXES = ("名前の一部", "括弧の前", "部分一致")   # label の一部だけを本文から取る直し方
+_SPACE_ONLY = {" ", "\t", "　", "\n"}
+_HIRA_RE = re.compile(r"[ぁ-ゖ]")
+_KANJI_RE = re.compile(r"[㐀-鿿々]")
+_OKURI_INSERT = "(?:(?![をはがにでともへや])[ぁ-ゖ])?"   # 漢字の後に入ってよい平仮名 1 字（助詞は除く）
 
 
-def _chunk_as_prompt_text(lec: Lecture, first: int, last: int) -> str:
+def _folded(text: str, drop: set[str]) -> tuple[str, list[int]]:
+    """NFKC にし、drop の文字を除いた文字列と、その各文字が元の text の何文字目かの対応。"""
+    out, idx = [], []
+    for i, ch in enumerate(text):
+        for c in normalize_text(ch) if ch.strip() else ch:
+            if c not in drop:
+                out.append(c)
+                idx.append(i)
+    return "".join(out), idx
+
+
+def _span(text: str, idx: list[int], start: int, end: int) -> str:
+    """畳んだ文字列の [start, end) に当たる、元の text の部分（前後の空白を除く）。"""
+    return normalize_text(text[idx[start]: idx[end - 1] + 1]).strip()
+
+
+def _okurigana_re(loose_label: str) -> re.Pattern | None:
+    """送り仮名の違いを許す正規表現（例: 取り扱い ↔ 取扱い、功利性原理 ↔ 功利性の原理）。漢字を含み、
+    漢字と平仮名が混ざるか漢字が 2 字以上の名前だけ。漢字・片仮名などは必ず一致させ、平仮名は省いてもよく、
+    漢字の後に平仮名 1 字が入ってもよい。"""
+    n_kanji = len(_KANJI_RE.findall(loose_label))
+    if not n_kanji or (n_kanji < 2 and not _HIRA_RE.search(loose_label)):
+        return None
+    parts = []
+    for i, ch in enumerate(loose_label):
+        last = i == len(loose_label) - 1
+        if _HIRA_RE.fullmatch(ch):
+            parts.append(re.escape(ch) + "?")
+        else:
+            # 語の終わりには足さない。助詞（を・は・が など）は別の語をつなぐので入れない（「の」は許す）
+            parts.append(re.escape(ch) + (_OKURI_INSERT if _KANJI_RE.fullmatch(ch) and not last else ""))
+    return re.compile("".join(parts))
+
+
+def _person_parts(label: str) -> list[str]:
+    head = normalize_text(label).split("(")[0]
+    return sorted({_squash(x) for x in _NAME_SPLIT_RE.split(head) if len(_squash(x)) >= 2}, key=len, reverse=True)
+
+
+def find_surface(label: str, kind: str, page_texts: dict[int, str], person_kinds: set[str],
+                 prefer: list[int] = ()) -> tuple[str, str, int] | None:
+    """label の、本文での表記を探す（#101）。見つかれば (本文の表記, 直し方, ページ)、無ければ None。
+
+    直し方の順: そのまま → 表記ゆれ（中黒・空白・括弧など）→ 送り仮名 → 名前の一部（人物の種類）→ 括弧の前 →
+    部分一致（label の 2/3 以上の長さで本文に含まれる最長の部分）。同じ直し方なら prefer のページを先に見る。
+    """
+    pages = sorted(page_texts, key=lambda p: (p not in prefer, p))
+    loose_label, _ = _folded(label, _LOOSE_DROP)
+    if not loose_label:
+        return None
+    head = normalize_text(label).split("(")[0]
+    loose_head, _ = _folded(head, _LOOSE_DROP)
+    okuri = _okurigana_re(loose_label)
+    folded = {p: _folded(page_texts[p], _LOOSE_DROP) for p in pages}
+
+    exact = _squash(label)
+    for p in pages:
+        s, idx = _folded(page_texts[p], _SPACE_ONLY)
+        i = s.find(exact) if exact else -1
+        if i >= 0:
+            return _span(page_texts[p], idx, i, i + len(exact)), "そのまま", p
+    for p in pages:
+        s, idx = folded[p]
+        i = s.find(loose_label)
+        if i >= 0:
+            return _span(page_texts[p], idx, i, i + len(loose_label)), "表記ゆれ", p
+    if okuri:
+        for p in pages:
+            s, idx = folded[p]
+            m = okuri.search(s)
+            if m:
+                return _span(page_texts[p], idx, m.start(), m.end()), "送り仮名", p
+    if kind in person_kinds:
+        for part in _person_parts(label):
+            if part == loose_label:
+                continue
+            for p in pages:
+                s, idx = folded[p]
+                i = s.find(part)
+                if i >= 0:
+                    return _span(page_texts[p], idx, i, i + len(part)), "名前の一部", p
+    if loose_head and loose_head != loose_label:
+        for p in pages:
+            s, idx = folded[p]
+            i = s.find(loose_head)
+            if i >= 0:
+                return _span(page_texts[p], idx, i, i + len(loose_head)), "括弧の前", p
+    n = len(loose_label)
+    min_len = max(2, -(-2 * n // 3))
+    for length in range(n - 1, min_len - 1, -1):
+        for start in range(0, n - length + 1):
+            sub = loose_label[start:start + length]
+            for p in pages:
+                s, idx = folded[p]
+                i = s.find(sub)
+                if i >= 0:
+                    return _span(page_texts[p], idx, i, i + length), "部分一致", p
+    return None
+
+
+def pages_with_text(surface: str, page_texts: dict[int, str]) -> list[int]:
+    """表記（空白を除いて比べる）が本文に書かれているページ。"""
+    s = _squash(surface)
+    return [p for p in sorted(page_texts) if s and s in _squash(page_texts[p])]
+
+
+def _same_name(a: str, b: str) -> bool:
+    """既出の id で返ってきた概念が、既出の概念と同じ名前とみなせるか（片方がもう片方を含む）。"""
+    la, lb = _folded(a, _LOOSE_DROP)[0], _folded(b, _LOOSE_DROP)[0]
+    return bool(la and lb) and (la in lb or lb in la)
+
+
+def _chunk_as_prompt_text(lec: Lecture, pages: list[int]) -> str:
     parts = [f"=== 第{lec.number}回 ==="]
-    for i in range(first, last + 1):
+    for i in pages:
         parts.append(f"[第{lec.number}回 p.{i}] {lec.pages[i - 1]}")
     return "\n".join(parts)
 
 
 def extract_concepts(client, model: str, course: str, vocab: dict, lectures: list[Lecture], log=print,
                      pages_per_call: int = CONCEPT_PAGES):
-    """回ごとに、数ページずつ順番に呼ぶ（#101）。既出の概念一覧を渡して label/id を揃えさせる。
+    """回ごとに、数ページずつ順番に呼ぶ（#101）。既出の概念一覧を渡して id を揃えさせる。
 
-    名前（label）が出典のページの本文に無い概念は、地図に載せない（#101）。挙げたページに名前が無くても、
-    同じ呼び出しに渡した別のページに名前があれば、そのページを出典にする。
-    戻り値: (概念, vocab の種類に当てはまらなかった概念, 記録)
+    地図に出す名前（label）は本文の表記そのものにする（#101）。本文に無い label は find_surface で直し、
+    それでも無いものは回ごとに 1 回 LLM に本文から写させる。それでも無いものは concepts_without_surface に残す。
+    戻り値: (概念, vocab の種類に当てはまらなかった概念, 記録)。記録の "without_surface" が地図に載せない概念。
     """
     lang = language_of(vocab, (page for lec in lectures for page in lec.pages))
     system = CONCEPT_SYSTEM.replace("{language_rule}", language_rule(lang))
@@ -229,31 +387,61 @@ def extract_concepts(client, model: str, course: str, vocab: dict, lectures: lis
     kind_names = {k["name"] for k in vocab["kinds"]}
     person_kinds = {k["name"] for k in vocab["kinds"] if k.get("person") is True}
     concepts: dict[str, dict] = {}          # id -> concept
-    by_label: dict[str, str] = {}           # label -> id
+    by_label: dict[str, str] = {}           # 本文の表記（空白を除いたもの）-> id
     unmatched_kind: list[dict] = []         # vocab のどの kind にも当てはまらなかった概念
-    missing: dict[str, dict] = {}           # 名前が本文に無かった label -> 例
-    info = {"calls": 0, "pages_per_call": pages_per_call, "label_missing_mentions": 0,
-            "pages_corrected": 0, "new_by_lecture": {}, "listed_by_lecture": {}}
+    without_surface: list[dict] = []        # 本文の表記が見つからなかった概念（地図に載せない）
+    fixes: list[dict] = []                  # 元の label → 本文の表記
+    info = {"calls": 0, "pages_per_call": pages_per_call, "mentions_without_name": 0,
+            "surface_ask_calls": 0, "surface_asked": 0, "surface_ask_resolved": 0,
+            "new_by_lecture": {}, "listed_by_lecture": {}}
+
+    def add_source(cid: str, lecture: int, pages: list[int]) -> None:
+        entry = concepts[cid]
+        for p in pages:
+            src = {"lecture": lecture, "page": p}
+            if src not in entry["sources"]:
+                entry["sources"].append(src)
+        if lecture not in entry["lectures"]:
+            entry["lectures"].append(lecture)
+
+    def new_concept(raw_id: str, label: str, kind: str, definition: str) -> str:
+        cid = clean_id(raw_id, f"c{len(concepts) + 1:03d}")
+        while cid in concepts:            # 別の名前なのに id が衝突した
+            cid += "_"
+        concepts[cid] = {"id": cid, "label": label, "kind": kind, "definition": definition,
+                         "sources": [], "lectures": []}
+        by_label[_squash(label)] = cid
+        return cid
+
+    def known_by(label: str, raw_id: str) -> str | None:
+        cid = by_label.get(_squash(label))
+        if cid is None:
+            rid = clean_id(raw_id, "")
+            if rid in concepts and _same_name(label, concepts[rid]["label"]):
+                cid = rid
+        return cid
 
     for lec in lectures:
         new = listed = 0
+        pending: dict[str, dict] = {}       # 本文の表記が見つからない新しい概念（回の終わりに聞き直す）
         for first, last in page_chunks(lec.page_count, pages_per_call):
             if concepts:
                 known = "\n".join(f"- {c['id']}: {c['label']}" for c in concepts.values())
-                known_block = ("既出の概念（id と label を揃えるための一覧。このページに出てくるなら同じ id と label で挙げる。"
+                known_block = ("既出の概念（id を揃えるための一覧。このページに出てくるなら同じ id で挙げる。"
                                f"このページに出てこない既出の概念は挙げない）:\n{known}\n")
             else:
                 known_block = ""
+            chunk = list(range(first, last + 1))
             data = call_json(
                 client, model=model, system=system, schema=CONCEPT_SCHEMA,
                 user=CONCEPT_USER.format(
                     course=course, lecture=lec.number, first=first, last=last, kinds=kinds_text, other=OTHER_LABEL,
-                    known_block=known_block, text=_chunk_as_prompt_text(lec, first, last), language=language_name(lang),
+                    known_block=known_block, text=_chunk_as_prompt_text(lec, chunk), language=language_name(lang),
                 ),
             )
             info["calls"] += 1
-            chunk_texts = {p: lec.pages[p - 1] for p in range(first, last + 1)}
-            new_here = missing_here = 0
+            chunk_texts = {p: lec.pages[p - 1] for p in chunk}
+            new_here = fixed_here = pending_here = 0
             for c in data["concepts"]:
                 label = c["label"].strip()
                 if not label:
@@ -262,57 +450,111 @@ def extract_concepts(client, model: str, course: str, vocab: dict, lectures: lis
                 kind = c["kind"].strip()
                 if kind != OTHER_LABEL and kind not in kind_names:
                     # vocab にも「その他」にもない kind を付けてきた。落とさず「その他」に寄せ、件数と例を報告する
-                    if label not in by_label and all(u["label"] != label for u in unmatched_kind):
+                    if _squash(label) not in by_label and all(u["label"] != label for u in unmatched_kind):
                         unmatched_kind.append({"label": label, "kind_given": kind, "lecture": lec.number})
                     kind = OTHER_LABEL
-                cid = by_label.get(label)
-                # 名前の照合は、既出ならその概念の種類で（人物の名前の区切り）
-                named = pages_with_name({"label": label, "kind": concepts[cid]["kind"] if cid else kind},
-                                        chunk_texts, person_kinds)
                 claimed = sorted({p for p in c["pages"] if first <= p <= last})
-                pages = [p for p in claimed if p in named]
-                if not pages:
-                    pages = sorted(named)
+                cid = known_by(label, c["id"])
+                if cid is not None:
+                    # 既出の概念。地図の名前は変えず、このページに名前（地図の名前かこの label の表記）があれば出典に足す
+                    names = [concepts[cid]["label"], label]
+                    pages = sorted({p for n in names for p in pages_with_text(n, chunk_texts)})
+                    if not pages:
+                        found = find_surface(label, concepts[cid]["kind"], chunk_texts, person_kinds, claimed)
+                        pages = pages_with_text(found[0], chunk_texts) if found else []
                     if pages:
-                        info["pages_corrected"] += 1
-                if not pages:
-                    info["label_missing_mentions"] += 1
-                    missing_here += 1
-                    missing.setdefault(label, {"label": label, "kind": kind, "lecture": lec.number,
-                                               "pages": claimed or [first]})
+                        add_source(cid, lec.number, [p for p in pages if p in claimed] or pages)
+                    else:
+                        info["mentions_without_name"] += 1
                     continue
+                found = find_surface(label, kind, chunk_texts, person_kinds, claimed)
+                if found is None:
+                    item = pending.setdefault(label, {"label": label, "kind": kind, "id": c["id"],
+                                                      "definition": c["definition"].strip(),
+                                                      "lecture": lec.number, "pages": set(), "chunk": set()})
+                    item["pages"].update(claimed)
+                    item["chunk"].update(chunk)
+                    pending_here += 1
+                    continue
+                surface, how, page = found
+                cid = by_label.get(_squash(surface))
+                if cid is not None and how in _PART_FIXES:
+                    # 名前の一部だけで既出の別の概念と同じ表記になった。統合すると概念を失うので、聞き直しに回す
+                    item = pending.setdefault(label, {"label": label, "kind": kind, "id": c["id"],
+                                                      "definition": c["definition"].strip(),
+                                                      "lecture": lec.number, "pages": set(), "chunk": set()})
+                    item["pages"].update(claimed)
+                    item["chunk"].update(chunk)
+                    pending_here += 1
+                    continue
+                if how != "そのまま":
+                    fixes.append({"from": label, "to": surface, "how": how, "lecture": lec.number, "page": page,
+                                  "merged_into": cid})
+                    fixed_here += 1
                 if cid is None:
-                    cid = clean_id(c["id"], f"c{len(concepts) + 1:03d}")
-                    while cid in concepts:            # 別 label なのに id が衝突した
-                        cid += "_"
-                    concepts[cid] = {
-                        "id": cid, "label": label, "kind": kind,
-                        "definition": c["definition"].strip(),
-                        "sources": [], "lectures": [],
-                    }
-                    by_label[label] = cid
+                    cid = new_concept(c["id"], surface, kind, c["definition"].strip())
                     new += 1
                     new_here += 1
-                entry = concepts[cid]
-                for p in pages:
-                    src = {"lecture": lec.number, "page": p}
-                    if src not in entry["sources"]:
-                        entry["sources"].append(src)
-                if lec.number not in entry["lectures"]:
-                    entry["lectures"].append(lec.number)
+                pages = pages_with_text(surface, chunk_texts)
+                add_source(cid, lec.number, [p for p in pages if p in claimed] or pages)
             log(f"概念の抽出 第{lec.number}回 p.{first}-{last}: {len(data['concepts'])} 件（新規 {new_here}、"
-                f"名前が本文に無い {missing_here}）")
+                f"表記を本文に合わせた {fixed_here}、本文の表記を聞き直す {pending_here}）")
+
+        # 本文の表記が見つからなかった新しい概念を、回ごとに 1 回だけ聞き直す
+        items = [m for m in pending.values() if _squash(m["label"]) not in by_label]
+        if items:
+            shown = sorted(set().union(*(m["chunk"] for m in items)))
+            lines = "\n".join(
+                f"[{i}] {m['label']}（{m['kind']}）: {m['definition']}"
+                f"（挙げたページ: {', '.join(f'p.{p}' for p in sorted(m['pages'])) or 'なし'}）"
+                for i, m in enumerate(items))
+            data = call_json(
+                client, model=model, system=SURFACE_SYSTEM, schema=SURFACE_SCHEMA,
+                user=SURFACE_USER.format(course=course, lecture=lec.number, items=lines,
+                                         text=_chunk_as_prompt_text(lec, shown)),
+            )
+            info["surface_ask_calls"] += 1
+            info["surface_asked"] += len(items)
+            answers = {a["index"]: a for a in data["answers"] if 0 <= a["index"] < len(items)}
+            shown_texts = {p: lec.pages[p - 1] for p in shown}
+            resolved = 0
+            for i, m in enumerate(items):
+                a = answers.get(i) or {}
+                surface = (a.get("surface") or "").strip()
+                pages = pages_with_text(surface, shown_texts) if surface else []
+                if not pages:
+                    without_surface.append({"label": m["label"], "kind": m["kind"], "definition": m["definition"],
+                                            "lecture": lec.number, "pages": sorted(m["pages"]),
+                                            "asked_surface": surface})
+                    continue
+                # 本文の文字列そのものを名前にする（空白の入り方も本文どおり）
+                s, idx = _folded(lec.pages[pages[0] - 1], _SPACE_ONLY)
+                k = s.find(_squash(surface))
+                surface = _span(lec.pages[pages[0] - 1], idx, k, k + len(_squash(surface))) if k >= 0 else surface
+                cid = by_label.get(_squash(surface))
+                fixes.append({"from": m["label"], "to": surface, "how": "聞き直し", "lecture": lec.number,
+                              "page": pages[0], "merged_into": cid})
+                if cid is None:
+                    cid = new_concept(m["id"], surface, m["kind"], m["definition"])
+                    new += 1
+                add_source(cid, lec.number, [p for p in pages if p in m["pages"]] or pages)
+                resolved += 1
+            info["surface_ask_resolved"] += resolved
+            log(f"表記の聞き直し 第{lec.number}回: {len(items)} 件 → 本文で確かめられた {resolved}")
         info["new_by_lecture"][lec.number] = new
         info["listed_by_lecture"][lec.number] = listed
         log(f"概念 第{lec.number}回: {listed} 件（新規 {new}）→ 累計 {len(concepts)}")
-    # 一度も本文で名前が見つからなかった label だけを「落とした概念」に数える
-    dropped = [m for label, m in missing.items() if label not in by_label]
-    info["label_missing_count"] = len(dropped)
-    info["label_missing_examples"] = dropped[:LABEL_MISSING_EXAMPLES]
-    if dropped:
-        log(f"名前が出典のページの本文に無い概念 {len(dropped)} 件を落とした: "
-            + " / ".join(m["label"] for m in dropped[:LABEL_MISSING_EXAMPLES]))
-    log(f"概念の抽出の呼び出し {info['calls']} 回（{pages_per_call} ページ前後ずつ）")
+
+    info["label_fixes"] = fixes
+    info["label_fix_by_how"] = dict(collections.Counter(f["how"] for f in fixes))
+    info["without_surface"] = without_surface
+    if fixes:
+        log(f"名前を本文の表記に合わせた {len(fixes)} 件（" +
+            ", ".join(f"{k} {v}" for k, v in info["label_fix_by_how"].items()) + "）")
+    if without_surface:
+        log(f"資料の表記が見つからない概念 {len(without_surface)} 件（地図には載せず graph に記録）: "
+            + " / ".join(m["label"] for m in without_surface[:SURFACE_EXAMPLES]))
+    log(f"概念の抽出の呼び出し {info['calls']} 回（{pages_per_call} ページ前後ずつ）、表記の聞き直し {info['surface_ask_calls']} 回")
     return concepts, unmatched_kind, info
 
 
@@ -955,10 +1197,15 @@ def run_extraction(client, model: str, vocab: dict, lectures: list[Lecture], out
         "concept_pages_per_call": concept_info["pages_per_call"],
         "concepts_listed_by_lecture": concept_info["listed_by_lecture"],
         "new_concepts_by_lecture": concept_info["new_by_lecture"],
-        "label_missing_count": concept_info["label_missing_count"],
-        "label_missing_mentions": concept_info["label_missing_mentions"],
-        "label_missing_examples": concept_info["label_missing_examples"],
-        "concept_pages_corrected": concept_info["pages_corrected"],
+        "label_fixed_count": len(concept_info["label_fixes"]),
+        "label_fix_by_how": concept_info["label_fix_by_how"],
+        "label_fixes": concept_info["label_fixes"],
+        "surface_ask_calls": concept_info["surface_ask_calls"],
+        "surface_asked": concept_info["surface_asked"],
+        "surface_ask_resolved": concept_info["surface_ask_resolved"],
+        "without_surface_count": len(concept_info["without_surface"]),
+        "without_surface_examples": concept_info["without_surface"][:SURFACE_EXAMPLES],
+        "mentions_without_name": concept_info["mentions_without_name"],
         "isolated_concepts": n_isolated,
         "relations_by_label": dict(label_counts.most_common()),
         "concepts_by_kind": dict(kind_counts.most_common()),
@@ -968,18 +1215,13 @@ def run_extraction(client, model: str, vocab: dict, lectures: list[Lecture], out
         "model": model,
         "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
     }
-    write_json(out_dir / "graph.json", {
-        "course": course,
-        "concepts": list(concepts.values()),
-        "relations": relations,
-        "stats": stats,
-    })
-
     graph = {
         "course": course,
         "concepts": list(concepts.values()),
         "relations": relations,
         "stats": stats,
+        # 資料の表記が見つからない概念（#101）。地図の点にはしないが消さずに残す
+        "concepts_without_surface": concept_info["without_surface"],
     }
     write_json(out_dir / "graph.json", graph)
     log(f"概念 {len(concepts)} / 関係 {len(relations)} / どの関係にもつながらない概念 {n_isolated} / 関係の「その他」率 {other_rate:.1%} / 種類の「その他」率 {other_kind_rate:.1%}")
