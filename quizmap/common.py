@@ -261,7 +261,12 @@ def _retry_delay(message: str, attempt: int) -> float:
     return base + random.uniform(0, 1)
 
 
-def _post_with_retry(client: LLMClient, url: str, body: dict) -> dict:
+def _post_with_retry(client: LLMClient, url: str, body: dict, retry_on_429: bool = True) -> dict:
+    """POST して JSON を返す。429・5xx・通信エラーは待って再試行する。
+
+    retry_on_429=False なら、429 は待たずにすぐ LLMError(429) を投げる（呼ぶ側が量を減らして送り直すため。
+    rag.embed がバッチを割るのに使う）。5xx と通信エラーはこれまでどおり再試行する。
+    """
     import requests
 
     for attempt in range(MAX_RETRIES + 1):
@@ -282,6 +287,8 @@ def _post_with_retry(client: LLMClient, url: str, body: dict) -> dict:
             message = resp.json().get("error", {}).get("message", resp.text)
         except ValueError:
             message = resp.text
+        if resp.status_code == 429 and not retry_on_429:
+            raise LLMError(429, message)
         if resp.status_code == 429 or resp.status_code >= 500:
             if attempt == MAX_RETRIES:
                 raise LLMError(resp.status_code, message)

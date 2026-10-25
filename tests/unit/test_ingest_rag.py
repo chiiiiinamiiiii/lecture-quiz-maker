@@ -18,8 +18,11 @@ import types
 
 import pytest
 
+import quizmap.rag as _REAL_RAG
 from quizmap import courses, extraction, vocab
 from quizmap.common import Lecture, read_json, write_json
+
+_REAL_EMBED = _REAL_RAG.embed
 
 VOCAB = {"course": "x", "kinds": [{"name": "人物"}], "relations": [{"label": "提唱"}],
          "meta": {"language": "en"}}
@@ -39,11 +42,14 @@ def rag_fakes(monkeypatch, courses_dir):
         loaded: dict = {}
 
         @classmethod
-        def build(cls, client, pages):
+        def build(cls, client, pages, progress=None):
             ev["order"].append("build")
             if "build" in ev["fail"]:
                 raise RuntimeError("embed 429")
             ev["build_pages"] = pages
+            if progress:                              # バッチごとの進み具合（2 ページずつ）
+                for done in range(2, len(pages) + 1, 2):
+                    progress(done, len(pages))
             return cls()
 
         def save(self, course_dir):
@@ -150,6 +156,11 @@ def test_phases_in_order_and_progress_never_decreases(rag_fakes):
     progress = [p for _, p in job._trace]
     assert progress == sorted(progress)
     assert job.progress == 1.0
+    assert "索引: 2 / 4 ページ" in job.log and "索引: 4 / 4 ページ" in job.log
+    start, width = courses._phase_span("index")
+    index_progress = [p for ph, p in job._trace if ph == "index"]
+    assert index_progress[-1] == pytest.approx(start + width)    # 索引づくりの中で進む
+    assert len(set(index_progress)) >= 3
 
 
 def test_phase_widths_sum_to_one_and_every_phase_has_label():
@@ -269,14 +280,13 @@ def test_open_rag_off(rag_fakes, monkeypatch):
 @pytest.fixture
 def real_rag(rag_fakes, monkeypatch):
     """偽の rag を外し、本物の quizmap.rag を使う。埋め込み（HTTP）だけ差し替える。"""
-    import importlib
     import quizmap
 
-    monkeypatch.delitem(sys.modules, "quizmap.rag", raising=False)
-    rag = importlib.import_module("quizmap.rag")
+    rag = _REAL_RAG                      # 読み込み直さない（conftest の偽の時計が効いたまま）
+    monkeypatch.setitem(sys.modules, "quizmap.rag", rag)
     monkeypatch.setattr(quizmap, "rag", rag, raising=False)
 
-    def fake_embed(client, texts, task="RETRIEVAL_DOCUMENT"):
+    def fake_embed(client, texts, task="RETRIEVAL_DOCUMENT", progress=None):
         return [[float(len(t) % 7 + 1), float(i + 1), 1.0] for i, t in enumerate(texts)]
 
     monkeypatch.setattr(rag, "embed", fake_embed)
@@ -311,3 +321,94 @@ def test_real_rag_other_embed_model_opens_as_none(real_rag, rag_fakes):
     data["model"] = "some-other-embedding"
     write_json(d / "rag_index.json", data)
     assert courses.open_rag(d)[0] is None
+
+
+def test_real_rag_index_429_forever_ingest_continues(real_rag, rag_fakes, monkeypatch):
+    """埋め込みが 429 のまま通らなくても、取り込みは索引なしで最後まで進み、ログに残る。"""
+    import requests
+    from quizmap import common
+
+    class R:
+        status_code = 429
+        text = "quota"
+
+        def json(self):
+            return {"error": {"message": "Quota exceeded for metric: embed_content_free_tier_tokens"}}
+
+    monkeypatch.setattr(real_rag, "embed", _REAL_EMBED)        # 埋め込みは本物（HTTP だけ偽物）
+    monkeypatch.setattr(common, "MIN_CALL_INTERVAL", 0.0)
+    monkeypatch.setattr(requests, "post", lambda *a, **k: R())
+    d = _course()
+    job = _run(d)
+    assert job.status == "done"
+    assert any("索引を作れなかった" in m for m in job.log)
+    assert not (d / "rag_index.json").exists()
+    assert rag_fakes["order"] == ["extract", "render"]           # 補完は飛ばす
+
+
+# ------------------------------------------------------------------ あとから索引と補完（start_rag_rebuild）
+
+def _ingested_course(rag_fakes):
+    d = _course()
+    _run(d)
+    (d / "rag_index.json").unlink()
+    (d / "graph_before_completion.json").unlink()
+    write_json(d / "pages.json", rag_fakes["build_pages"])       # 本物の run_extraction は pages.json を書く
+    write_json(d / "graph.json", {"course": "x", "concepts": [{"id": "a"}, {"id": "b"}],
+                                  "relations": [{"from": "a", "to": "b", "label": "提唱"}], "stats": {}})
+    rag_fakes["order"].clear()
+    return d
+
+
+def _rebuild(d):
+    job = _Recorder(course_dir=str(d), phase="index")
+    courses._run_rag_rebuild(job, d, "fake-model")
+    return job
+
+
+def test_rag_rebuild_builds_index_and_completes(rag_fakes):
+    d = _ingested_course(rag_fakes)
+    job = _rebuild(d)
+    assert job.status == "done", job.log
+    assert rag_fakes["order"] == ["build", "save", "complete"]
+    assert _phases(job) == ["index", "completion"]
+    assert (d / "rag_index.json").exists()
+    assert len(read_json(d / "graph_before_completion.json")["relations"]) == 1
+    g = read_json(d / "graph.json")
+    assert [r.get("origin") for r in g["relations"]] == [None, "external"]
+    assert g["course"] == "Natural Language Processing"
+    assert job.progress == 1.0
+
+
+def test_rag_rebuild_twice_does_not_add_twice(rag_fakes):
+    d = _ingested_course(rag_fakes)
+    _rebuild(d)
+    _rebuild(d)
+    assert len(read_json(d / "graph.json")["relations"]) == 2     # 補完の前から始め直す
+
+
+def test_rag_rebuild_failure_keeps_graph(rag_fakes):
+    d = _ingested_course(rag_fakes)
+    rag_fakes["fail"].add("build")
+    job = _rebuild(d)
+    assert job.status == "error" and "embed 429" in job.error
+    assert len(read_json(d / "graph.json")["relations"]) == 1
+    assert read_json(d / "job.json")["status"] == "error"
+
+
+def test_start_rag_rebuild_needs_ingested_course(rag_fakes):
+    d = _course()
+    with pytest.raises(ValueError):
+        courses.start_rag_rebuild(d)
+
+
+def test_start_rag_rebuild_runs_in_background(rag_fakes):
+    import time as _t
+    d = _ingested_course(rag_fakes)
+    job = courses.start_rag_rebuild(d)
+    for _ in range(200):
+        if job.status != "running":
+            break
+        _t.sleep(0.01)
+    assert job.status == "done", job.log
+    assert courses.current_job(d) is job
