@@ -58,7 +58,10 @@ Only the map drawing and the selection are plain code.
 
 **Derive the vocabulary instead of fixing it.** A first prototype used fixed relation labels written for an ethics course. Applied to other material it silently forced relations into wrong labels. The app now asks the model to propose the labels for each course and stores them in `vocab.json`. The vocabulary is then frozen and reused on every re-import, so results can be counted and compared. The share of relations that fall into “other” is the signal that the vocabulary does not fit the material.
 
-**Two-stage extraction.** Concepts are extracted first, lecture by lecture, with the list of concepts already found passed in so names stay consistent across lectures. Relations are extracted second, and the model may only use the concept ids from stage one. Extracting both at once produced edges pointing at concepts that did not exist.
+**Extraction in small chunks, in parallel.** The first version sent one whole lecture per call and asked for its concepts, passing in the concepts already found so names stayed consistent. With the cheapest model this missed most concepts: later lectures mostly repeated known names, and three lectures added no new concept at all. Each lecture is now cut into chunks of about 4,000 characters (at most 8 pages, with one page of overlap), and one call returns both the concepts on those pages and the relations between them. Chunks are independent, so they run in parallel. Code merges the same concept across chunks by its normalised spelling and assigns ids. On the ethics course this raised the concepts on the map from 79 to about 190–280, depending on chunk size.
+
+**Map words are copied from the slides.** The user's rule is that every word on the map appears in the uploaded material. The model is told to copy each concept name exactly as written on the page. Code then checks the name against the page text. If it is not there, code looks for the nearest spelling on the page (spacing, middle dots, brackets, okurigana, a shorter part of the name), and if that fails, the model is asked once more to copy it from the page. A concept is never silently deleted: one whose name cannot be found is kept in the data, left off the map, and reported. A first version dropped such concepts; the user rejected that, and the design was changed.
+
 
 **Every concept and relation keeps its page.** Hints, explanations and the slide shown after grading all depend on it.
 
@@ -87,6 +90,8 @@ Only the map drawing and the selection are plain code.
 **Development:** Claude Code (harness) with Claude Fable 5.1 and Claude Opus 5.5 (models). Development ran as a team of Claude Code sessions: one coordinator and five roles (UI reviewer, UI improver, output reviewer, prompt improver, feature developer), each in its own git worktree and terminal, coordinated through GitHub issues and pull requests. Reviewers never fix and fixers never judge their own fixes. See `CLAUDE.md` and `.claude/agents/`.
 
 **Inside the app:** `gemini-3.1-flash-lite` for generation and `gemini-embedding-001` for the retrieval index, through the Google AI Studio free tier. The work is structured extraction, not hard reasoning, so the cheapest model that does the job was chosen, following the course principle. I listed the available models with the API before choosing: the cheapest free-tier model, `gemini-2.5-flash-lite`, is no longer offered to new users, so the next cheapest was used. The model name is a setting (`QUIZMAP_MODEL`) so other models can be compared. All calls use JSON-schema structured output, wait between calls, and back off on HTTP 429.
+
+**Import speed is set by the free tier.** The free tier allows 15 generation requests per minute for this model and 30,000 embedding tokens per minute (1,000 embedded texts per day). An ethics import first took 838 s. Four changes brought it to 211 s: fewer, larger calls (concepts and relations together, chunked by characters); one call every 4 s, which is exactly 15 per minute (a 2 s interval was tested and was slower, because the 429 back-off cost more than it saved); building the search index in parallel with extraction; and caching embeddings by page text, so re-importing the same slides makes no embedding calls. Relation completion searches the index with the stored page vectors instead of embedding new queries.
 
 | Operation | API calls | Time |
 |---|---|---|
@@ -204,12 +209,12 @@ Measured twice on Ethics imports with RAG on (flash-lite): round 1 with main `13
 ## Known limitations
 
 - **Run-to-run variation.** Extraction runs once per import, and the derived vocabulary changes between runs (one ethics run had *opposes*, the next had *paraphrase* instead). The numbers in the evaluation are single runs; see the evaluation for the size of the variation.
-- **Few concept-to-concept relations.** With the cheapest model, most relations connect a person to an idea. Relations between ideas, which are the best material for relation questions, stay at about 20–30 for the ethics course. Prompting for them did not help (issue #51). A stronger model is compared in the evaluation.
+- **Many concepts have no relation.** After the chunked extraction, about 30% of the concepts on the ethics map (65 of 192 in the latest run) are not connected to any other concept. They can be selected but give no relation questions.
 - **Removing cited books can remove ideas with the same name.** *Social Contract* or *Escape from Freedom* were extracted only as book titles and were removed with them (issue #69). The removed titles are logged so this can be checked.
-- **Many relations are labelled "Other".** In the two full imports with RAG, 49% and 69% of relations were "Other" before completion. The share depends on the vocabulary each run derives. A code rule now widens the kinds a person-subject label may point to (issue #74), but in the second run the vocabulary did not need it, so its effect is not yet measured.
+- **Some relations are labelled "Other".** The share fell from 49–69% to 14–24% after the vocabulary fixes and the chunked extraction, and it still varies with the vocabulary each run derives.
 - **Some books escape the book filter.** A book whose kind is "Other" is not removed before relation extraction (issue #99).
 - **The answer check rarely catches a bad question.** After the fixes it no longer removes good questions, but it kept one question whose wrong options were also correct, and it judged the same question differently in two ranges.
-- **English material gives few concepts.** Four NLP lectures gave only 13 concepts, and later lectures added almost none (issue #25).
+- **The free tier limits how often you can import.** One course of about 200 pages uses about 40 generation calls and up to 200 embedded texts. The embedding limit of 1,000 texts per day is reached after a few imports of new material.
 - **Repeated slides.** Later lectures sometimes repeat earlier slides, which inflates occurrence counts.
 
 ## Repository layout
