@@ -350,7 +350,7 @@ def _extract_with_rag(job: Job, d: Path, client, model: str, vocab: dict, lectur
     job.set_phase("index")
     index = None
     try:
-        index = rag.SlideIndex.build(client, pages)
+        index = rag.SlideIndex.build(client, pages, progress=_index_progress(job))
         index.save(d)
         job.add(f"索引: {len(pages)} ページ")
     except Exception as e:  # noqa: BLE001  補完なしで続ける
@@ -374,6 +374,73 @@ def _extract_with_rag(job: Job, d: Path, client, model: str, vocab: dict, lectur
     job.set_phase("slides")
     n_imgs = extraction.render_slides(lectures, d / "slides", SLIDE_DPI)
     job.add(f"スライド画像 {n_imgs} 枚")
+
+
+def start_rag_rebuild(d: Path, model: str = DEFAULT_MODEL) -> Job:
+    """取り込み済みのコースに、あとから索引を作り、関係の補完を走らせる（別スレッド）。
+
+    索引の無いコース（RAG より前のもの、索引づくりが途中で失敗したもの）のため。画面のボタンは別に作る。
+    補完は graph_before_completion.json（無ければ今の graph.json）から始め直すので、二重には足さない。
+    すでに何か走っていれば ValueError。
+    """
+    for name in ("graph.json", "pages.json", "vocab.json"):
+        if not (d / name).exists():
+            raise ValueError(f"取り込みが済んでいない（{name} が無い）")
+    with _lock:
+        if any(j.status == "running" for j in _jobs.values()):
+            raise ValueError("別の取り込み処理が実行中です。終わってから始めてください。")
+        job = Job(course_dir=str(d), phase="index")
+        _jobs[str(d)] = job
+    job.save()
+    threading.Thread(target=_run_rag_rebuild, args=(job, d, model), daemon=True).start()
+    return job
+
+
+def _run_rag_rebuild(job: Job, d: Path, model: str) -> None:
+    from quizmap import extraction, rag
+    from quizmap.vocab import language_of
+
+    try:
+        pages = read_json(d / "pages.json")
+        vocab = read_json(d / "vocab.json")
+        vocab["course"] = course_info(d)["name"]
+        before = d / "graph_before_completion.json"
+        graph = read_json(before if before.exists() else d / "graph.json")
+        client = make_client()
+
+        job.set_phase("index")
+        index = rag.SlideIndex.build(client, pages, progress=_index_progress(job))
+        index.save(d)
+        job.add(f"索引: {len(pages)} ページ")
+
+        job.set_phase("completion")
+        write_json(before, graph)
+        wiki = rag.Wiki(d, language_of(vocab, [p["text"] for p in pages]))
+        graph = extraction.complete_relations(client, model, vocab, graph, pages, index, wiki, log=job.add)
+        write_json(d / "graph.json", graph)
+        rename_course(d, vocab["course"])
+        job.progress = 1.0
+        job.status = "done"
+        job.add("完了")
+    except Exception as e:  # noqa: BLE001  画面に理由を出す。graph.json はそのまま残る
+        job.status = "error"
+        job.error = f"{type(e).__name__}: {e}"
+        job.add("失敗: " + job.error)
+        job.log.append(traceback.format_exc(limit=3))
+    finally:
+        job.finished_at = now()
+        job.save()
+
+
+def _index_progress(job: Job):
+    """索引づくりの進み具合を、バッチごとに job の progress とログに出す。"""
+    start, width = _phase_span("index")
+
+    def progress(done: int, total: int) -> None:
+        job.progress = max(job.progress, start + width * (done / total if total else 1.0))
+        job.add(f"索引: {done} / {total} ページ")
+
+    return progress
 
 
 def open_rag(d: Path):

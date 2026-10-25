@@ -1,6 +1,7 @@
 """RAG の部品（docs/rag-design.md）。スライドの索引と Wikipedia の引き当て。
 
-- embed(): Gemini の batchEmbedContents で文を埋め込む。100 件ずつ、待機と再試行は common._post_with_retry に任せる
+- embed(): Gemini の batchEmbedContents で文を埋め込む。バッチは件数と文字数の両方で小さくし、
+  1 分あたりの件数・トークン数の上限を超えないよう間を空ける。429 ならバッチを半分に割って送り直す
 - SlideIndex: pages.json の全ページを埋め込み、コサイン類似度で引く。course_dir/rag_index.json に保存する
   （ベクトルは長さ 1 に正規化してから float16 にし、base64 で 1 本の文字列にする。185 ページで約 1.5 MB）
 - Wiki: MediaWiki API で概念名を検索し、最初の 1 件の記事の冒頭を返す。course_dir/wiki_cache.json に残し、
@@ -16,6 +17,8 @@ import re
 import sys
 import unicodedata
 import threading
+import time
+from collections import deque
 from pathlib import Path
 from urllib.parse import quote
 
@@ -24,8 +27,17 @@ import numpy as np
 from quizmap.common import LLMClient, _post_with_retry, read_json, write_json
 
 EMBED_MODEL = os.environ.get("QUIZMAP_EMBED_MODEL", "gemini-embedding-001")
-EMBED_BATCH = 100              # batchEmbedContents の 1 回あたりの上限
 EMBED_MAX_CHARS = 6000         # gemini-embedding-001 の入力上限（2048 トークン）を超えないよう切る
+# 無料枠は、バッチの 1 件ずつが 1 リクエストと数えられ、1 分あたりのトークン数にも上限がある。
+# 100 件（英語で約 7 万字）を 1 回で送ると、それだけで 1 分の枠を超えて 429 が続いた。
+EMBED_BATCH = int(os.environ.get("QUIZMAP_EMBED_BATCH", "20"))                  # 1 回に送る件数の上限
+EMBED_BATCH_CHARS = int(os.environ.get("QUIZMAP_EMBED_BATCH_CHARS", "20000"))   # 1 回に送る文字数の合計の上限
+EMBED_BATCH_TOKENS = int(os.environ.get("QUIZMAP_EMBED_BATCH_TOKENS", "20000"))  # 1 回に送るトークン数（見積もり）の上限
+# 無料枠: embed_content_free_tier_tokens は 1 分あたり 30,000 トークン。見積もりの誤差を見て少し下で止める
+EMBED_ITEMS_PER_MIN = int(os.environ.get("QUIZMAP_EMBED_ITEMS_PER_MIN", "80"))   # 1 分あたりの件数（無料枠 100 より下）
+EMBED_TOKENS_PER_MIN = int(os.environ.get("QUIZMAP_EMBED_TOKENS_PER_MIN", "25000"))  # 1 分あたりのトークン数（見積もり）
+EMBED_429_RETRIES = 4          # 1 件まで割っても 429 のとき、待って送り直す回数
+EMBED_429_MIN_WAIT = 10.0      # 429 の後、割ったバッチを送る前に待つ最小の秒数
 INDEX_FILE = "rag_index.json"
 INDEX_VERSION = 1
 WIKI_CACHE_FILE = "wiki_cache.json"
@@ -37,28 +49,137 @@ WIKI_MAX_EXTRACT = 3000        # 冒頭が長い記事はここで切る（キ�
 
 # ---------------------------------------------------------------- embed
 
-def embed(client: LLMClient, texts: list[str], task: str = "RETRIEVAL_DOCUMENT") -> list[list[float]]:
+_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\uff66-\uff9f]")
+
+
+def approx_tokens(text: str) -> int:
+    """トークン数の概算。日本語・中国語の文字は 1 字 1 トークン、それ以外は 4 字 1 トークン。"""
+    cjk = len(_CJK_RE.findall(text))
+    return cjk + (len(text) - cjk + 3) // 4
+
+
+def split_batches(items: list[tuple[int, str]], max_items: int = None, max_chars: int = None,
+                  max_tokens: int = None) -> list[list]:
+    """[(添字, 文)] を、件数・文字数の合計・トークン数（見積もり）の合計のどれも上限を超えないバッチに分ける。
+
+    順は保つ。1 件だけで上限を超えるものは、その 1 件だけのバッチにする。
+    """
+    max_items = max_items or EMBED_BATCH
+    max_chars = max_chars or EMBED_BATCH_CHARS
+    max_tokens = max_tokens or min(EMBED_BATCH_TOKENS, EMBED_TOKENS_PER_MIN)
+    batches, cur, chars, tokens = [], [], 0, 0
+    for it in items:
+        n, k = len(it[1]), approx_tokens(it[1])
+        if cur and (len(cur) >= max_items or chars + n > max_chars or tokens + k > max_tokens):
+            batches.append(cur)
+            cur, chars, tokens = [], 0, 0
+        cur.append(it)
+        chars += n
+        tokens += k
+    if cur:
+        batches.append(cur)
+    return batches
+
+
+# 直近 1 分に送った量（時刻, 件数, トークン数）。プロセスの中で共有する
+_sent: deque = deque()
+_sent_lock = threading.Lock()
+
+
+def _now() -> float:
+    return time.monotonic()
+
+
+def _sleep(sec: float) -> None:
+    time.sleep(sec)
+
+
+_RETRY_IN_RE = re.compile(r"retry in\s*(\d+(?:\.\d+)?)\s*s", re.I)
+
+
+def _wait_after_429(message: str, attempt: int) -> float:
+    """429 の後に待つ秒数。本文に「Please retry in N s」があればその秒数（＋1 秒）、無ければ指数バックオフ。"""
+    from quizmap.common import _retry_delay
+
+    m = _RETRY_IN_RE.search(message or "")
+    if m:
+        return float(m.group(1)) + 1.0
+    return max(EMBED_429_MIN_WAIT, _retry_delay(message or "", attempt))
+
+
+def _pace(n_items: int, n_tokens: int) -> None:
+    """これから送る量を足しても、直近 60 秒の件数・トークン数が上限を超えないところまで待つ。"""
+    with _sent_lock:
+        while True:
+            t = _now()
+            while _sent and t - _sent[0][0] >= 60.0:
+                _sent.popleft()
+            items = sum(x[1] for x in _sent)
+            tokens = sum(x[2] for x in _sent)
+            if not _sent or (items + n_items <= EMBED_ITEMS_PER_MIN and tokens + n_tokens <= EMBED_TOKENS_PER_MIN):
+                _sent.append((t, n_items, n_tokens))
+                return
+            _sleep(max(0.5, 60.0 - (t - _sent[0][0])))      # いちばん古い記録が 1 分を過ぎるまで
+
+
+def embed(client: LLMClient, texts: list[str], task: str = "RETRIEVAL_DOCUMENT",
+          progress=None) -> list[list[float]]:
     """texts を埋め込み、入力と同じ順でベクトルを返す。task は RETRIEVAL_DOCUMENT / RETRIEVAL_QUERY など。
 
     空の文字列は API が受け付けないので、埋め込まずに長さ 0 のベクトル（全要素 0）を返す。
+    バッチは件数 EMBED_BATCH・文字数 EMBED_BATCH_CHARS・トークン数 EMBED_BATCH_TOKENS（見積もり）まで。
+    送る前に _pace で、直前 60 秒に送った件数・トークン数が 1 分あたりの上限を超えないところまで待つ。
+    429 のときはそのバッチを半分に割って送り直す。1 件でも 429 なら、待って EMBED_429_RETRIES 回まで送り直す。
+    progress(済んだ件数, 全件数) をバッチが済むたびに呼ぶ（索引づくりの進み具合を画面に出すため）。
     """
+    from quizmap.common import LLMError
+
     out: list[list[float] | None] = [None] * len(texts)
     todo = [(i, t[:EMBED_MAX_CHARS]) for i, t in enumerate(texts) if t and t.strip()]
     url = f"{client.base_url}/models/{EMBED_MODEL}:batchEmbedContents"
     dim = 0
-    for start in range(0, len(todo), EMBED_BATCH):
-        chunk = todo[start:start + EMBED_BATCH]
+    done = 0
+
+    def send(chunk: list[tuple[int, str]]) -> None:
+        nonlocal dim, done
         body = {"requests": [
             {"model": f"models/{EMBED_MODEL}", "content": {"parts": [{"text": t}]}, "taskType": task}
             for _, t in chunk
         ]}
-        data = _post_with_retry(client, url, body)
+        for attempt in range(EMBED_429_RETRIES + 1):
+            _pace(len(chunk), sum(approx_tokens(t) for _, t in chunk))
+            try:
+                data = _post_with_retry(client, url, body, retry_on_429=False)
+                break
+            except LLMError as e:
+                if e.status != 429:
+                    raise
+                wait = _wait_after_429(str(e), attempt)
+                if len(chunk) > 1:
+                    half = len(chunk) // 2
+                    print(f"  [embed] 429: {len(chunk)} 件を {half} + {len(chunk) - half} 件に割り、"
+                          f"{wait:.0f} 秒待って送り直す", file=sys.stderr)
+                    _sleep(wait)
+                    send(chunk[:half])
+                    send(chunk[half:])
+                    return
+                if attempt == EMBED_429_RETRIES:
+                    raise
+                print(f"  [embed] 429（1 件）: {wait:.0f} 秒待って送り直す ({attempt + 1}/{EMBED_429_RETRIES})",
+                      file=sys.stderr)
+                _sleep(wait)
         embs = data.get("embeddings") or []
         if len(embs) != len(chunk):
             raise RuntimeError(f"埋め込みの数が合わない: {len(chunk)} 件送って {len(embs)} 件返った")
         for (i, _), e in zip(chunk, embs):
             out[i] = e["values"]
             dim = len(e["values"])
+        done += len(chunk)
+        if progress:
+            progress(done, len(todo))
+
+    for chunk in split_batches(todo):
+        send(chunk)
     return [v if v is not None else [0.0] * dim for v in out]
 
 
@@ -84,8 +205,9 @@ class SlideIndex:
         return len(self.pages)
 
     @classmethod
-    def build(cls, client: LLMClient, pages: list[dict]) -> "SlideIndex":
-        vecs = embed(client, [p.get("text", "") for p in pages], task="RETRIEVAL_DOCUMENT")
+    def build(cls, client: LLMClient, pages: list[dict], progress=None) -> "SlideIndex":
+        """progress(済んだページ数, 本文のあるページ数) をバッチごとに呼ぶ。"""
+        vecs = embed(client, [p.get("text", "") for p in pages], task="RETRIEVAL_DOCUMENT", progress=progress)
         dim = len(vecs[0]) if vecs else 0
         m = np.asarray(vecs, dtype=np.float32).reshape(len(pages), dim)
         return cls(pages, _normalize(m))

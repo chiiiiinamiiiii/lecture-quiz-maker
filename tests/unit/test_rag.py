@@ -67,10 +67,11 @@ PAGES = [
 
 # ---------------------------------------------------------------- embed
 
-def test_embed_sends_batches_of_100_in_order(client, fake_embed_api):
+def test_embed_sends_batches_of_EMBED_BATCH_in_order(client, fake_embed_api):
     texts = [f"文{i}" for i in range(230)]
     vecs = rag.embed(client, texts, task="RETRIEVAL_QUERY")
-    assert [len(c["body"]["requests"]) for c in fake_embed_api] == [100, 100, 30]
+    b = rag.EMBED_BATCH
+    assert [len(c["body"]["requests"]) for c in fake_embed_api] == [b] * (230 // b) + ([230 % b] if 230 % b else [])
     assert vecs == [fake_vector(t) for t in texts]
     first = fake_embed_api[0]
     assert first["url"] == f"https://example.invalid/v1beta/models/{rag.EMBED_MODEL}:batchEmbedContents"
@@ -279,11 +280,12 @@ def test_search_many_reuses_cache_from_search(client, fake_embed_api):
     assert len(fake_embed_api) == before + 1                 # 全部キャッシュにあれば呼ばない
 
 
-def test_search_many_batches_by_100(client, fake_embed_api):
+def test_search_many_batches_by_EMBED_BATCH(client, fake_embed_api):
     index = rag.SlideIndex.build(client, PAGES)
     before = len(fake_embed_api)
     results = index.search_many(client, [f"問い{i}" for i in range(150)], k=1)
-    assert [len(c["body"]["requests"]) for c in fake_embed_api[before:]] == [100, 50]
+    b = rag.EMBED_BATCH
+    assert [len(c["body"]["requests"]) for c in fake_embed_api[before:]] == [b] * (150 // b) + ([150 % b] if 150 % b else [])
     assert len(results) == 150
 
 

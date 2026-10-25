@@ -38,3 +38,20 @@ def ticking_clock(monkeypatch):
     import types
     _TickingDatetime._t = None
     monkeypatch.setattr(courses, "dt", types.SimpleNamespace(datetime=_TickingDatetime))
+
+
+@pytest.fixture(autouse=True)
+def fake_embed_clock(monkeypatch):
+    """rag.embed の 1 分あたりの量の待機を、本当には眠らない偽の時計にする。sleeps に待った秒数が残る。"""
+    from quizmap import rag
+
+    clock = {"t": 1000.0, "sleeps": []}
+
+    def sleep(sec):
+        clock["sleeps"].append(sec)
+        clock["t"] += sec
+
+    monkeypatch.setattr(rag, "_now", lambda: clock["t"])
+    monkeypatch.setattr(rag, "_sleep", sleep)
+    monkeypatch.setattr(rag, "_sent", __import__("collections").deque())
+    return clock
