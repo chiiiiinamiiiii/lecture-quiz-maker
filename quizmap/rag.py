@@ -42,6 +42,12 @@ EMBED_TOKENS_PER_MIN = int(os.environ.get("QUIZMAP_EMBED_TOKENS_PER_MIN", "25000
 EMBED_CACHE_DIR = Path(os.environ.get("QUIZMAP_EMBED_CACHE_DIR", DATA_DIR / "embed_cache"))
 EMBED_429_RETRIES = 4          # 1 件まで割っても 429 のとき、待って送り直す回数
 EMBED_429_MIN_WAIT = 10.0      # 429 の後、割ったバッチを送る前に待つ最小の秒数
+# 1 分あたりの上限は 429 のたびに下げて覚える（プロセスの中だけ）。ここより下には下げない
+EMBED_MIN_ITEMS_PER_MIN = 10
+EMBED_MIN_TOKENS_PER_MIN = 2000
+EMBED_LIMIT_SHRINK = 0.75      # 429 のとき、直近 1 分に送った量のこの割合を新しい上限にする
+EMBED_QUERY_BATCH = 100        # 問い合わせ文（短い）の 1 回の件数の上限。batchEmbedContents の上限が 100 件
+WIKI_WORKERS = int(os.environ.get("QUIZMAP_WIKI_WORKERS", "4"))  # Wikipedia へ同時に問い合わせる数
 INDEX_FILE = "rag_index.json"
 INDEX_VERSION = 1
 WIKI_CACHE_FILE = "wiki_cache.json"
@@ -88,6 +94,8 @@ def split_batches(items: list[tuple[int, str]], max_items: int = None, max_chars
 # 直近 1 分に送った量（時刻, 件数, トークン数）。プロセスの中で共有する
 _sent: deque = deque()
 _sent_lock = threading.Lock()
+# いま使っている 1 分あたりの上限。429 で下がる（_lower_limit_after_429）
+_limits = {"items": EMBED_ITEMS_PER_MIN, "tokens": EMBED_TOKENS_PER_MIN}
 
 
 def _now() -> float:
@@ -111,16 +119,45 @@ def _wait_after_429(message: str, attempt: int) -> float:
     return max(EMBED_429_MIN_WAIT, _retry_delay(message or "", attempt))
 
 
+_QUOTA_RE = re.compile(r"\[quota: ([^\]]*)\]")
+
+
+def quota_names(message: str) -> str:
+    """エラーの本文に common._error_message が足した枠の名前（quotaId, quotaMetric）。無ければ空。"""
+    m = _QUOTA_RE.search(message or "")
+    return m.group(1).strip() if m else ""
+
+
+def _window(t: float) -> tuple[int, int]:
+    """直近 60 秒に送った件数とトークン数（_sent_lock を持って呼ぶ）。"""
+    while _sent and t - _sent[0][0] >= 60.0:
+        _sent.popleft()
+    return sum(x[1] for x in _sent), sum(x[2] for x in _sent)
+
+
+def _lower_limit_after_429(message: str) -> tuple[str, int, int]:
+    """429 を受けて 1 分あたりの上限を下げる。(下げた種類, 前の上限, 新しい上限) を返す。
+
+    枠の名前に token があればトークン数、それ以外（件数・リクエスト数・名前が分からない）は件数の上限を、
+    直近 1 分に送った量（429 になった分も含む）の EMBED_LIMIT_SHRINK 倍まで下げる。上げることはしない。
+    """
+    kind = "tokens" if "token" in quota_names(message).lower() else "items"
+    floor = EMBED_MIN_TOKENS_PER_MIN if kind == "tokens" else EMBED_MIN_ITEMS_PER_MIN
+    with _sent_lock:
+        items, tokens = _window(_now())
+        used = tokens if kind == "tokens" else items
+        old = _limits[kind]
+        _limits[kind] = max(floor, min(old, int(min(old, used) * EMBED_LIMIT_SHRINK)))
+        return kind, old, _limits[kind]
+
+
 def _pace(n_items: int, n_tokens: int) -> None:
     """これから送る量を足しても、直近 60 秒の件数・トークン数が上限を超えないところまで待つ。"""
     with _sent_lock:
         while True:
             t = _now()
-            while _sent and t - _sent[0][0] >= 60.0:
-                _sent.popleft()
-            items = sum(x[1] for x in _sent)
-            tokens = sum(x[2] for x in _sent)
-            if not _sent or (items + n_items <= EMBED_ITEMS_PER_MIN and tokens + n_tokens <= EMBED_TOKENS_PER_MIN):
+            items, tokens = _window(t)
+            if not _sent or (items + n_items <= _limits["items"] and tokens + n_tokens <= _limits["tokens"]):
                 _sent.append((t, n_items, n_tokens))
                 return
             _sleep(max(0.5, 60.0 - (t - _sent[0][0])))      # いちばん古い記録が 1 分を過ぎるまで
@@ -155,13 +192,15 @@ def cache_put(task: str, text: str, vector: list[float]) -> None:
 
 
 def embed(client: LLMClient, texts: list[str], task: str = "RETRIEVAL_DOCUMENT",
-          progress=None) -> list[list[float]]:
+          progress=None, max_items: int | None = None) -> list[list[float]]:
     """texts を埋め込み、入力と同じ順でベクトルを返す。task は RETRIEVAL_DOCUMENT / RETRIEVAL_QUERY など。
 
     空の文字列は API が受け付けないので、埋め込まずに長さ 0 のベクトル（全要素 0）を返す。
-    バッチは件数 EMBED_BATCH・文字数 EMBED_BATCH_CHARS・トークン数 EMBED_BATCH_TOKENS（見積もり）まで。
+    バッチは件数 max_items（省略時は EMBED_BATCH。task が RETRIEVAL_QUERY なら文が短いので EMBED_QUERY_BATCH）・文字数 EMBED_BATCH_CHARS・トークン数 EMBED_BATCH_TOKENS
+    （見積もり）まで。件数はいまの 1 分あたりの件数の上限も超えない。
     送る前に _pace で、直前 60 秒に送った件数・トークン数が 1 分あたりの上限を超えないところまで待つ。
-    429 のときはそのバッチを半分に割って送り直す。1 件でも 429 なら、待って EMBED_429_RETRIES 回まで送り直す。
+    429 のときは、どの枠か（quotaId）を出して 1 分あたりの上限を下げ（_lower_limit_after_429）、
+    そのバッチを半分に割って送り直す。1 件でも 429 なら、待って EMBED_429_RETRIES 回まで送り直す。
     progress(済んだ件数, 全件数) をバッチが済むたびに呼ぶ（索引づくりの進み具合を画面に出すため）。
     キャッシュにある文は送らない。バッチが通るたびにキャッシュに書くので、途中で失敗しても、
     次に呼んだときは残りの文だけを送る。
@@ -200,6 +239,9 @@ def embed(client: LLMClient, texts: list[str], task: str = "RETRIEVAL_DOCUMENT",
                 if e.status != 429 or isinstance(e, DailyQuotaError):
                     raise                                 # 日ごとの枠は待っても通らない（#107）
                 wait = _wait_after_429(str(e), attempt)
+                kind, old, new = _lower_limit_after_429(str(e))
+                print(f"  [embed] 429（枠: {quota_names(str(e)) or '不明'}）: 1 分あたりの"
+                      f"{'トークン数' if kind == 'tokens' else '件数'}の上限 {old} → {new}", file=sys.stderr)
                 if len(chunk) > 1:
                     half = len(chunk) // 2
                     print(f"  [embed] 429: {len(chunk)} 件を {half} + {len(chunk) - half} 件に割り、"
@@ -224,7 +266,8 @@ def embed(client: LLMClient, texts: list[str], task: str = "RETRIEVAL_DOCUMENT",
         if progress:
             progress(done, total)
 
-    for chunk in split_batches(missing):
+    max_items = max_items or (EMBED_QUERY_BATCH if task == "RETRIEVAL_QUERY" else EMBED_BATCH)
+    for chunk in split_batches(missing, max_items=min(max_items, _limits["items"])):
         send(chunk)
     return [v if v is not None else [0.0] * dim for v in out]
 
@@ -313,8 +356,9 @@ class SlideIndex:
                     exclude: set[tuple[int, int]] = frozenset()) -> list[list[dict]]:
         """search を複数の問い合わせ文でまとめて行う。結果は queries と同じ順の search の結果のリスト。
 
-        まだ埋め込んでいない文だけを 1 回の batchEmbedContents（100 件ずつ）でまとめて埋め込み、
-        search と同じキャッシュに入れる。重複した文は 1 回だけ送る。
+        まだ埋め込んでいない文だけを batchEmbedContents でまとめて埋め込み（問い合わせ文は短いので
+        EMBED_QUERY_BATCH 件と 1 分あたりの件数の上限の小さいほうまで 1 回に入れる）、search と同じキャッシュに入れる。重複した文は 1 回だけ送る。
+        埋め込みのキャッシュ（embed_cache）にも残るので、同じ概念名は取り込み直しでも送らない。
         """
         if not self.pages or k <= 0:
             return [[] for _ in queries]
@@ -398,7 +442,7 @@ class Wiki:
             except (ValueError, AttributeError) as e:
                 print(f"[warn] {self.path} を読めなかった: {e}", file=sys.stderr)
 
-    def lookup(self, term: str) -> dict | None:
+    def lookup(self, term: str, save: bool = True) -> dict | None:
         """{"title", "url", "extract"}。見つからない・題名が語と合わなければ None。"""
         term = normalize_term(term)
         if not term:
@@ -415,8 +459,26 @@ class Wiki:
             return None
         with self._lock:
             self._cache[term] = result
-            self._save()
+            if save:
+                self._save()
         return result
+
+    def lookup_many(self, terms: list[str], workers: int | None = None) -> dict[str, dict | None]:
+        """lookup を複数の語で、同時に workers 本（省略時 WIKI_WORKERS）まで並べて行う。{語: lookup の結果}。
+
+        Wikipedia に負担をかけないよう同時に 4 本程度にとどめ、User-Agent は lookup と同じものを付ける。
+        キャッシュのファイルは最後に 1 度だけ書く。
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        uniq = list(dict.fromkeys(terms))
+        workers = max(1, min(workers or WIKI_WORKERS, len(uniq) or 1))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            results = dict(zip(uniq, ex.map(lambda t: self.lookup(t, save=False), uniq)))
+        if uniq:
+            with self._lock:
+                self._save()
+        return {t: results[t] for t in terms}
 
     def _get(self, params: dict) -> dict:
         import requests
