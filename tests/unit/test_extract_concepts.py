@@ -203,3 +203,21 @@ def test_zero_pages_per_call_means_one_call_per_lecture(monkeypatch):
     lectures = [lec(1, "甲野", "乙説", "丙説")]
     _, _, info, fake = run(monkeypatch, lectures, [[c("kouno", "甲野", "人物", 1)]], pages_per_call=0)
     assert info["calls"] == 1 and "p.1〜p.3" in fake.users[0]
+
+
+@pytest.mark.parametrize("raw, want", [
+    ("幸福」(エウダイモニア)", "幸福(エウダイモニア)"),
+    ("「善意志", "善意志"),
+    ("「善意志」", "「善意志」"),
+    ("理(ロゴス", "理ロゴス"),
+    ("『A』と「B」", "『A』と「B」"),
+    ("(「A)」", "「A」"),
+])
+def test_drop_unpaired_brackets(raw, want):
+    assert extraction.drop_unpaired_brackets(raw) == want
+
+
+def test_fixed_surface_has_no_unpaired_bracket():
+    # 括弧を無視して一致させると、本文の範囲の途中に閉じかぎ括弧が入る（#101 の取り込みで起きた形）
+    got = extraction.find_surface("幸福（エウダイモニア）", "学説", {1: "「幸福」(エウダイモニア)とは"}, set())
+    assert got == ("幸福(エウダイモニア)", "表記ゆれ", 1)
