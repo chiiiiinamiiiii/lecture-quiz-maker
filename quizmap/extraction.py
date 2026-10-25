@@ -981,7 +981,7 @@ def check_ends_in_evidence(evidence: str, ends: list[dict], person_kinds: set[st
 
 
 def complete_relations(client, model, vocab, graph, pages, index, wiki, log=print,
-                       max_pairs: int = COMPLETION_MAX_PAIRS) -> dict:
+                       max_pairs: int = COMPLETION_MAX_PAIRS, workers: int | None = None) -> dict:
     """関係の補完（docs/rag-design.md）。graph に関係を足した新しい graph を返す（ファイルは書かない）。
 
     両端は既存の概念 id だけ（新しい概念は作らない）。足す関係には origin を付ける。
@@ -997,6 +997,8 @@ def complete_relations(client, model, vocab, graph, pages, index, wiki, log=prin
        "result": "added" / "rejected" / "none" / "no_answer",
        "reason": 落とした理由, "relation": 足した関係}
     index（SlideIndex）と wiki（Wiki）は None でもよい。そのときは使える層だけで判定する。
+    LLM の判定は COMPLETION_BATCH 対ずつ、workers 本（既定 EXTRACT_WORKERS）で並列に呼ぶ（#107）。
+    呼び出しの間隔は common が全体で守る。答えは対の順に照合するので、終わる順で結果は変わらない。
     """
     concepts = {c["id"]: c for c in graph["concepts"]}
     relations = [dict(r, origin=r.get("origin", "slide")) for r in graph["relations"]]
@@ -1030,7 +1032,7 @@ def complete_relations(client, model, vocab, graph, pages, index, wiki, log=prin
     dropped = collections.Counter()
     adjusted = collections.Counter()
     added: list[dict] = []
-    api_calls = 0
+    batches: list[tuple[int, list[dict], list[str], str]] = []   # (先頭の番号, 対, [W番号] → id, プロンプト)
 
     for start in range(0, len(pairs), COMPLETION_BATCH):
         batch = pairs[start:start + COMPLETION_BATCH]
@@ -1055,12 +1057,20 @@ def complete_relations(client, model, vocab, graph, pages, index, wiki, log=prin
             f"   ページ: {'、'.join(f'第{l}回 p{n}' for l, n in p['pages'])}"
             for i, p in enumerate(batch)
         )
-        data = call_json(
-            client, model=model, system=COMPLETION_SYSTEM, schema=COMPLETION_SCHEMA,
-            user=COMPLETION_USER.format(course=vocab.get("course", ""), relations=rel_text,
-                                        pages=pages_block, wiki=wiki_block, pairs=pairs_block),
-        )
-        api_calls += 1
+        batches.append((start, batch, wiki_ids, COMPLETION_USER.format(
+            course=vocab.get("course", ""), relations=rel_text,
+            pages=pages_block, wiki=wiki_block, pairs=pairs_block)))
+
+    def ask(b: tuple) -> dict:
+        return call_json(client, model=model, system=COMPLETION_SYSTEM, schema=COMPLETION_SCHEMA, user=b[3])
+
+    answers: list[dict] = []
+    if batches:
+        with ThreadPoolExecutor(max_workers=max(1, min(workers or EXTRACT_WORKERS, len(batches)))) as ex:
+            answers = list(ex.map(ask, batches))
+    api_calls = len(batches)
+
+    for (start, batch, wiki_ids, _), data in zip(batches, answers):
         n_before = len(added)
 
         done: set[int] = set()

@@ -370,3 +370,38 @@ def test_prompt_has_direction_and_definition_rules(llm):
     assert "例（「A → B」の A が from、B が to）と同じ向き" in user
     assert "定義の言い換え" in user and "（例: A → B）" in user
     assert "引用には二つの概念の名前を両方入れる" in user
+
+
+def test_judgements_are_called_in_parallel_and_checked_in_pair_order(monkeypatch):
+    """判定の呼び出しを並列にしても、答えは対の順に照合し、ログも対の順に出す（#107）。"""
+    import threading
+    import time
+
+    monkeypatch.setattr(extraction, "COMPLETION_BATCH", 1)
+    lock, state = threading.Lock(), {"active": 0, "max_active": 0, "calls": 0}
+
+    def fake(client, *, model, system, user, schema, max_tokens=32000):
+        with lock:
+            state["active"] += 1
+            state["calls"] += 1
+            state["max_active"] = max(state["max_active"], state["active"])
+            first = state["calls"] == 1
+        time.sleep(0.05 if first else 0.01)      # 先に呼んだ対ほど遅く終わる
+        with lock:
+            state["active"] -= 1
+        try:
+            n = pair_no(user, "kouno", "otsu")
+        except AssertionError:
+            return {"judgements": []}
+        return {"judgements": [J(n, "slide", "kouno", "otsu", "提唱", 1, 1, evidence="甲野は乙説を唱えた")]}
+
+    monkeypatch.setattr(extraction, "call_json", fake)
+    logs: list[str] = []
+    g = extraction.complete_relations(None, "m", VOCAB, graph(), PAGES, index=None, wiki=None,
+                                      log=logs.append, workers=4)
+    c = g["stats"]["completion"]
+    assert c["judged"] >= 2 and c["api_calls"] == c["judged"] == state["calls"]
+    assert state["max_active"] >= 2
+    assert [r["from"] for r in g["relations"] if r.get("added_by")] == ["kouno"]
+    steps = [s for s in logs if s.startswith("関係の補完 ") and "追加" in s and "〜" in s]
+    assert [int(s.split()[1].split("〜")[0]) for s in steps] == list(range(1, c["judged"] + 1))
