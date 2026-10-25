@@ -262,9 +262,45 @@ def _folded(text: str, drop: set[str]) -> tuple[str, list[int]]:
     return "".join(out), idx
 
 
+_BRACKET_PAIRS = {")": "(", "]": "[", "}": "{", "」": "「", "』": "『", "〉": "〈", "》": "《", "】": "【",
+                  "”": "“", "’": "‘", "）": "（", "］": "［"}
+_OPENERS = set(_BRACKET_PAIRS.values())
+
+
+def drop_unpaired_brackets(text: str) -> str:
+    """対の合わないかぎ括弧・括弧を除く（#101。本文の範囲を切り出すと、範囲の外の相手を失った括弧が残るため）。"""
+    stack, drop = [], set()
+    for i, ch in enumerate(text):
+        if ch in _OPENERS:
+            stack.append(i)
+        elif ch in _BRACKET_PAIRS:
+            if stack and text[stack[-1]] == _BRACKET_PAIRS[ch]:
+                stack.pop()
+            else:
+                drop.add(i)
+    drop.update(stack)
+    return "".join(ch for i, ch in enumerate(text) if i not in drop).strip()
+
+
+def _unclosed(text: str) -> list[str]:
+    """閉じていない開き括弧（内側が後ろ）。"""
+    stack = []
+    for ch in text:
+        if ch in _OPENERS:
+            stack.append(ch)
+        elif ch in _BRACKET_PAIRS and stack and stack[-1] == _BRACKET_PAIRS[ch]:
+            stack.pop()
+    return stack
+
+
 def _span(text: str, idx: list[int], start: int, end: int) -> str:
-    """畳んだ文字列の [start, end) に当たる、元の text の部分（前後の空白を除く）。"""
-    return normalize_text(text[idx[start]: idx[end - 1] + 1]).strip()
+    """畳んだ文字列の [start, end) に当たる、元の text の部分（前後の空白と、対の合わない括弧を除く）。
+
+    範囲の中で開いた括弧のすぐ後に閉じ括弧が続くなら、それも含める（例: 「理(ロゴス」→「理(ロゴス)」）。"""
+    a, b = idx[start], idx[end - 1] + 1
+    while b < len(text) and (open_ := _unclosed(text[a:b])) and _BRACKET_PAIRS.get(text[b]) == open_[-1]:
+        b += 1
+    return drop_unpaired_brackets(normalize_text(text[a:b]).strip())
 
 
 def _okurigana_re(loose_label: str) -> re.Pattern | None:
