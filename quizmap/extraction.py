@@ -630,6 +630,38 @@ def extract_graph(client, model: str, course: str, vocab: dict, lectures: list[L
             r = rep[(jobs[m["job"]][0].number, merge_key(m["label"]))]
             if r["surface"]:
                 m["surface"], m["how"], m["page"] = r["surface"], r["how"], r["page"]
+                if r.get("ask_pages"):
+                    m["ask_pages"] = r["ask_pages"]
+
+    # 3b) 直した表記（聞き直しを含む）が元の名前より短く、別の名前で挙がった概念と同じ表記になったものは、
+    #     まとめるとその概念を失う（「徳倫理学」→「徳」）。元の名前が本文にあるページを同じ回の中で探して
+    #     出典を付け替える。それでも無ければ地図に載せず concepts_without_surface に回す（#101）
+    strong_keys = {merge_key(m["surface"]) for m in mentions if m["surface"] and m["how"] == "そのまま"}
+    relocated = collided = 0
+
+    def shortened_into_other(label: str, surface: str) -> bool:
+        k = merge_key(surface)
+        return len(_squash(surface)) < len(_squash(label)) and k in strong_keys and k != merge_key(label)
+
+    for m in mentions:
+        if not m["surface"] or m["how"] == "そのまま" or not shortened_into_other(m["label"], m["surface"]):
+            continue
+        lec = jobs[m["job"]][0]
+        lecture_texts = {p: lec.pages[p - 1] for p in range(1, lec.page_count + 1)}
+        found = find_surface(m["label"], m["kind"], lecture_texts, person_kinds, m["claimed"])
+        m["collided_with"] = m["surface"]
+        if found and not shortened_into_other(m["label"], found[0]):
+            m["surface"], m["how"], m["page"] = found[0], "同じ回の別のページ", found[2]
+            m["ask_pages"] = pages_with_text(found[0], lecture_texts) or [found[2]]
+            relocated += 1
+        else:
+            m["surface"] = m["how"] = m["page"] = None
+            collided += 1
+    info["surface_collisions_relocated"] = relocated
+    info["surface_collisions_without"] = collided
+    if relocated or collided:
+        log(f"直した表記が別の概念と重なった {relocated + collided} 件: 同じ回の別のページに付け替えた {relocated}、"
+            f"地図に載せず記録した {collided}")
 
     # 4) 本文の表記でまとめ、id を振る（かたまりの順）
     concepts: dict[str, dict] = {}
@@ -648,7 +680,8 @@ def extract_graph(client, model: str, course: str, vocab: dict, lectures: list[L
                                                     for w in without_surface):
                 without_surface.append({"label": m["label"], "kind": m["kind"], "definition": m["definition"],
                                         "lecture": lec.number, "pages": m["claimed"],
-                                        "asked_surface": m.get("asked_surface", "")})
+                                        "asked_surface": m.get("asked_surface", ""),
+                                        **({"collided_with": m["collided_with"]} if m.get("collided_with") else {})})
             continue
         key = merge_key(m["surface"])
         cid = by_key.get(key)
@@ -1420,6 +1453,8 @@ def run_extraction(client, model: str, vocab: dict, lectures: list[Lecture], out
         "surface_ask_calls": concept_info["surface_ask_calls"],
         "surface_asked": concept_info["surface_asked"],
         "surface_ask_resolved": concept_info["surface_ask_resolved"],
+        "surface_collisions_relocated": concept_info["surface_collisions_relocated"],
+        "surface_collisions_without": concept_info["surface_collisions_without"],
         "without_surface_count": len(concept_info["without_surface"]),
         "without_surface_examples": concept_info["without_surface"][:SURFACE_EXAMPLES],
         "isolated_concepts": n_isolated,

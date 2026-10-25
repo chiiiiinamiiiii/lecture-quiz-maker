@@ -309,3 +309,46 @@ def test_prompt_asks_to_relate_listed_concepts_and_copy_evidence_verbatim(monkey
     assert "項目のそれぞれを、まとめる側の概念と結ぶ" in user
     assert "括弧書き（原語・訳語・読み）、かぎ括弧、記号も省かない" in user
     assert "離れた箇所をつながない" in user
+
+
+# ---------------------------------------------------------------- 直した表記が別の概念と重なる（#101）
+
+def _toku_case(p3: str):
+    lectures = [lec(1, "徳とは何か。", "アレテー(徳)の倫理", p3)]
+    answers = {(1, 1, 1): ([c("toku", "徳", "学説", 1)], []),
+               (1, 2, 2): ([c("toku_rinri", "徳倫理学", "学説", 2)], []),
+               (1, 3, 3): ([], [])}
+    surfaces = {1: [{"index": 0, "surface": "徳", "page": 2}]}    # 聞き直しが、短い別の概念の表記を返す
+    return lectures, answers, surfaces
+
+
+def test_shortened_fix_into_other_concept_moves_to_page_with_original_name(monkeypatch):
+    """「徳倫理学」の聞き直しが「徳」を返しても「徳」にまとめず、同じ回の元の名前のあるページに付け替える。"""
+    lectures, answers, surfaces = _toku_case("徳倫理学の復権")
+    concepts, _, info, _, _, logs = run(monkeypatch, lectures, answers, size=1, surfaces=surfaces)
+    assert labels(concepts) == ["徳", "徳倫理学"]
+    assert concepts["toku_rinri"]["sources"] == [{"lecture": 1, "page": 3}]
+    assert concepts["toku"]["sources"] == [{"lecture": 1, "page": 1}]    # 「徳」に p.2 の出典を足さない
+    assert info["surface_collisions_relocated"] == 1 and info["surface_collisions_without"] == 0
+    assert any(f["how"] == "同じ回の別のページ" and f["to"] == "徳倫理学" for f in info["label_fixes"])
+    assert info["without_surface"] == []
+
+
+def test_shortened_fix_into_other_concept_without_original_name_is_recorded(monkeypatch):
+    lectures, answers, surfaces = _toku_case("ほかの話")
+    concepts, _, info, _, _, _ = run(monkeypatch, lectures, answers, size=1, surfaces=surfaces)
+    assert labels(concepts) == ["徳"]
+    assert concepts["toku"]["sources"] == [{"lecture": 1, "page": 1}]   # 「徳」に出典を足さない
+    assert info["surface_collisions_without"] == 1
+    [w] = info["without_surface"]
+    assert w["label"] == "徳倫理学" and w["collided_with"] == "徳"
+
+
+def test_shortened_fix_without_other_concept_is_kept(monkeypatch):
+    """短くなっても、同じ表記の別の概念が無ければ、これまでどおりその表記にする。"""
+    lectures = [lec(1, "ほか", "アレテー(徳)の倫理")]
+    answers = {(1, 1, 1): ([], []), (1, 2, 2): ([c("toku_rinri", "徳倫理学", "学説", 2)], [])}
+    concepts, _, info, _, _, _ = run(monkeypatch, lectures, answers, size=1,
+                                     surfaces={1: [{"index": 0, "surface": "徳", "page": 2}]})
+    assert labels(concepts) == ["徳"]
+    assert info["surface_collisions_relocated"] == info["surface_collisions_without"] == 0
