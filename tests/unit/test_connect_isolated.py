@@ -133,14 +133,43 @@ def A(target, partner, f, t, label="提唱", lecture=0, page=0, evidence="", sli
 def test_stage1_adds_verified_relation_and_stage2_takes_the_rest(llm):
     def answer(user):
         num = targets(user)
-        return [A(num["bo"], "hei", "hei", "bo", lecture=1, page=2, evidence="丙は丁説を唱えた"),   # 戊説が evidence に無い
-                A(num["bo"], "hei", "hei", "bo")]                                                # 同じ番号の 2 つ目は数えない
+        return [A(num["bo"], "hei", "hei", "bo", lecture=1, page=2, evidence="戊説もある"),   # 丙は同じページにある
+                A(num["bo"], "hei", "hei", "bo"),                                         # 同じ番号の 2 つ目は数えない
+                A(num["ki"], "kou", "ki", "kou", label=OTHER_LABEL, lecture=1, page=3, evidence="の話")]   # 短すぎる断片
     llm["answer"] = answer
     g = extraction.connect_isolated(object(), "m", VOCAB, graph(), PAGES, page_index(VEC), None, log=lambda *_: None)
     st = g["stats"]["connect"]
     assert st["stage1"]["targets"] == 4 and st["stage1"]["api_calls"] == 1
-    assert st["stage1"]["added_slide"] == 0
-    assert st["isolated_after"] == 0 and st["stage2"]["added"] == 4
+    assert st["stage1"]["added_slide"] == 1
+    assert st["isolated_after"] == 0 and st["stage2"]["added"] == 3
+
+
+@pytest.mark.parametrize("evidence, want", [
+    ("丙は丁説を唱えた", None),                                   # 一方（丙）が断片に、もう一方（丁説）がページに
+    ("丙は丁説を ... 戊説もある", None),                          # 2 つの断片
+    ("丙は丁説を…戊説もある", None),
+    ("丙は丁説を唱えた ... 戊説 ... もある", "断片が多すぎる"),
+    ("丙は戊説を唱えた", "evidence が本文に無い"),                # 断片が本文に無い（つないで書き換えた）
+    ("を唱えた", "evidence にどちらの端も無い"),
+    ("", "evidence が空"),
+])
+def test_fragment_evidence(evidence, want):
+    ends = [concept("hei", "丙", "人物", (1, 2)), concept("tei", "丁説", "学説", (1, 2))]
+    assert extraction.check_fragment_evidence(evidence, ends, PAGES[1]["text"], {"人物"}) == want
+
+
+def test_fragment_names_missing_from_page():
+    ends = [concept("hei", "丙", "人物", (1, 2)), concept("ki", "己説", "学説", (1, 3))]
+    assert extraction.check_fragment_evidence("丙は丁説を唱えた", ends, PAGES[1]["text"], set()) == "両端の概念名が本文に無い"
+
+
+def test_name_matching_ignores_case_plural_and_hyphen():
+    assert extraction.name_in("Normal Distribution", "follows a normal distribution")
+    assert extraction.name_in("Vectors", "Multiplication of Matrix and Vector")
+    assert extraction.name_in("Euler’s number", "Eulers number e")
+    assert extraction.name_in("Predator-Prey", "a Predator Prey model")
+    assert not extraction.name_in("statistics", "a statistic")
+    assert extraction.name_in("甲野", "甲野は乙説を唱えた")
 
 
 def test_stage1_relation_passes_the_same_checks_as_completion(llm):
