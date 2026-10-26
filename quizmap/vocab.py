@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import re
 
 from quizmap.common import OTHER_LABEL, call_json, lecture_as_prompt_text
@@ -100,6 +101,8 @@ USER_TEMPLATE = """以下は「{course_hint}」という授業の資料です（
 - 種類は、資料のすべての回にわたって、概念を重ならずに分けられるものにする。1 つの種類に概念の大半が入らないようにする。
   分野の名前（例えば「統計」）を種類にして、ほかの分野（微積分・線形代数など）の概念まで入れない。
   数学の資料なら、例えば「数学的対象（関数・行列など）」「定理・手法」「量・指標」「応用の題材」のように、概念の役割で分ける
+- 種類を減らしてまとめすぎない。人物・出典の文献以外の内容の種類を {min_content} つ以上作り、役割の違うものは同じ種類にしない
+  （例えば、学説・主義・立場の名前と、その中で論じられる個々の概念（価値・心の働き・原則など）と、法律・制度・規範は別の種類）
 - 人物が唱えた原則・学説・考え方は、法律・制度・社会の規範の種類に入れず、考え方・学説の種類に入れる
 - 各種類について、その種類に属する概念が、資料が出典・参考・引用元として挙げた文献・作品（本・論文・報告書・記事・作品など）であれば cited_work を true、そうでなければ false にする。
   文献・作品と、授業の内容の概念・人物を同じ種類に混ぜない
@@ -337,6 +340,26 @@ def find_direction_gaps(vocab: dict) -> list[str]:
                                                    and _TO_RE.search(r.get("definition", "")))]
 
 
+MIN_CONTENT_KINDS = int(os.environ.get("QUIZMAP_MIN_CONTENT_KINDS", "3"))   # 人物・出典以外の内容の種類の数の下限（#150）
+MIN_KIND_EXAMPLES = 3
+
+
+def find_content_kind_gaps(vocab: dict) -> list[str]:
+    """内容の種類（person・cited_work 以外）が MIN_CONTENT_KINDS より少ない、または実例の足りない内容の種類があるか（#150）。
+    作り直しの不足として文で返す。旗の無い古い vocab.json では確かめない。"""
+    if not any("person" in k or "cited_work" in k for k in vocab["kinds"]):
+        return []
+    content = [k for k in vocab["kinds"] if k.get("person") is not True and k.get("cited_work") is not True]
+    problems = []
+    if len(content) < MIN_CONTENT_KINDS:
+        problems.append(f"人物・出典の文献以外の内容の種類が {len(content)} 個（{'・'.join(k['name'] for k in content) or 'なし'}）"
+                        f"だけ。役割の違う概念を分けて {MIN_CONTENT_KINDS} 個以上にする")
+    for k in content:
+        if len(kind_examples(k)) < MIN_KIND_EXAMPLES:
+            problems.append(f"内容の種類「{k['name']}」の実例が {len(kind_examples(k))} 個。{MIN_KIND_EXAMPLES} 個以上挙げる")
+    return problems
+
+
 def find_cited_ends(vocab: dict) -> list[str]:
     """from_kinds か to_kinds が cited_work の種類だけのラベル（#141）。作り直しの不足として文で返す。"""
     cited = {k["name"] for k in vocab["kinds"] if k.get("cited_work") is True}
@@ -402,7 +425,7 @@ def derive_vocab(client, model: str, lectures, course_hint: str, log=print) -> d
     log(f"{len(chosen)} 回分 {len(corpus):,} 文字を {model} に渡して語彙を導出中…")
     user = USER_TEMPLATE.format(
         course_hint=course_hint, n_lectures=len(chosen), other=OTHER_LABEL, corpus=corpus,
-        language=language_name(lang), structures="・".join(STRUCTURES), core_structures="・".join(CORE_STRUCTURES),
+        language=language_name(lang), min_content=MIN_CONTENT_KINDS, structures="・".join(STRUCTURES), core_structures="・".join(CORE_STRUCTURES),
     )
     vocab = call_json(client, model=model, system=system, schema=SCHEMA, user=user, max_tokens=16000)
 
@@ -410,7 +433,8 @@ def derive_vocab(client, model: str, lectures, course_hint: str, log=print) -> d
     # 定義に from・to の向きが無い（#148）なら、
     # 不足を伝えて 1 回だけ作り直させる
     # （人間の確認は挟まない）
-    gaps = find_kind_gaps(vocab) + find_cited_ends(vocab) + find_structure_gaps(vocab) + find_direction_gaps(vocab)
+    gaps = find_kind_gaps(vocab) + find_cited_ends(vocab) + find_structure_gaps(vocab) + find_direction_gaps(vocab) \
+        + find_content_kind_gaps(vocab)
     retried = False
     if gaps:
         log("関係の端になる種類が足りない。1 回だけ作り直す: " + " / ".join(gaps))
@@ -422,7 +446,8 @@ def derive_vocab(client, model: str, lectures, course_hint: str, log=print) -> d
                 problems="\n".join(f"- {g}" for g in gaps),
             ),
         )
-        gaps = find_kind_gaps(vocab) + find_cited_ends(vocab) + find_structure_gaps(vocab) + find_direction_gaps(vocab)
+        gaps = find_kind_gaps(vocab) + find_cited_ends(vocab) + find_structure_gaps(vocab) + find_direction_gaps(vocab) \
+        + find_content_kind_gaps(vocab)
         if gaps:
             log("警告: 作り直しても関係の端になる種類が足りない: " + " / ".join(gaps))
     cited_ends = drop_cited_ends(vocab)

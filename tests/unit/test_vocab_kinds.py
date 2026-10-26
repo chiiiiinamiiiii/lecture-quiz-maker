@@ -81,6 +81,7 @@ def test_widen_person_targets_noop_without_person_flag():
 
 def test_derive_vocab_records_widening(monkeypatch):
     from quizmap.common import Lecture
+    monkeypatch.setattr(V, "MIN_CONTENT_KINDS", 2)          # 種類の数の確かめ（#150）はこのテストの外
 
     def fake(client, *, model, system, user, schema, max_tokens=32000):
         return {"course": "c", "kinds": KINDS2, "relations": [rel("提唱", ["人物"], ["学説・立場"])]}
@@ -171,6 +172,7 @@ def test_structure_gaps_ok_and_same_kind_rule():
 
 def test_derive_vocab_retries_for_structure_gaps(monkeypatch):
     from quizmap.common import Lecture
+    monkeypatch.setattr(V, "MIN_CONTENT_KINDS", 2)
     calls = []
     first = [srel("Models", ["概念"], ["概念"], "例題の形"), srel("Optimizes", ["概念"], ["概念"], "例題の形")]
     second = [srel("一種", ["概念"], ["概念"], "一種・下位概念"), srel("部分", ["概念"], ["概念"], "部分と全体"),
@@ -206,3 +208,24 @@ def test_direction_gaps():
 
 def test_prompt_asks_for_direction_words():
     assert "「from」「to」という語を使って必ず書く" in V.USER_TEMPLATE and "定義に書いた向きと同じ向きで" in V.USER_TEMPLATE
+
+
+# ---------------------------------------------------------------- 内容の種類の数（#150）
+
+def test_content_kind_gaps():
+    one = kinds(("人物", True), ("概念", False)) + [
+        {"name": "文献", "definition": "", "examples": ["a", "b", "c"], "cited_work": True, "person": False}]
+    got = V.find_content_kind_gaps({"kinds": one, "relations": []})
+    assert len(got) == 1 and "内容の種類が 1 個（概念）だけ" in got[0]
+    few = kinds(("概念", False), ("規範", False), ("手法", False))
+    few[1]["examples"] = ["a"]
+    assert V.find_content_kind_gaps({"kinds": few, "relations": []}) == ["内容の種類「規範」の実例が 1 個。3 個以上挙げる"]
+    few[1]["examples"] = ["a", "b", "c"]
+    assert V.find_content_kind_gaps({"kinds": few, "relations": []}) == []
+    two = V.find_content_kind_gaps({"kinds": KINDS3, "relations": []})        # 内容の種類が 2 つ（下限は 3）
+    assert two == ["人物・出典の文献以外の内容の種類が 2 個（概念・規範）だけ。役割の違う概念を分けて 3 個以上にする"]
+    assert V.find_content_kind_gaps({"kinds": [{"name": "a"}], "relations": []}) == []      # 旗の無い古い形
+
+
+def test_prompt_asks_not_to_merge_kinds_too_much():
+    assert "種類を減らしてまとめすぎない" in V.USER_TEMPLATE and "{min_content}" in V.USER_TEMPLATE
