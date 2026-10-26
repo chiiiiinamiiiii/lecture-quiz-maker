@@ -207,3 +207,32 @@ def test_over_cap_only_when_no_one_else():
     g = extraction.connect_isolated(None, "m", VOCAB, gr, pages, None, None, log=lambda *_: None, max_received=0)
     assert g["stats"]["connect"]["isolated_after"] == 0
     assert {r["via"] for r in g["relations"]} == {"over_cap"}
+
+
+def test_link_groups():
+    gr = graph()
+    rels = gr["relations"] + [{"from": "otsu", "to": "bo", "label": "提唱"}]
+    concepts = {c["id"]: c for c in gr["concepts"]}
+    assert extraction.link_groups(concepts, rels) == {"kouno": 0, "otsu": 0, "bo": 0, "hei": 1, "tei": 1,
+                                                      "ki": 2, "kou": 2, "shin": 2}
+
+
+def test_prefers_main_component_over_isolated_in_the_same_tier():
+    """同じページに、内容のより近いつながらない概念がいても、最大の連結成分の概念を先に選ぶ（島を作らない）。"""
+    pages = [{"lecture": 1, "page": 1, "text": "x"}, {"lecture": 1, "page": 2, "text": "y"},
+             {"lecture": 1, "page": 3, "text": "z"}]
+    gr = {"concepts": [concept("a", "甲", "学説", (1, 1)), concept("b", "乙", "学説", (1, 1)),
+                       concept("c", "丙", "学説", (1, 1), (1, 2)), concept("iso1", "丁", "学説", (1, 2), (1, 3)),
+                       concept("iso2", "戊", "学説", (1, 2), (1, 3))],
+          "relations": [{"from": "a", "to": "b", "label": "提唱", "source": {"lecture": 1, "page": 1}}]}
+    import numpy as np
+
+    from quizmap import rag
+    index = rag.SlideIndex(pages, rag._normalize(np.array([[1, 0], [0.7, 0.7], [0, 1]], dtype=np.float32)))
+    g = extraction.connect_isolated(None, "m", VOCAB, gr, pages, index, None, log=lambda *_: None)
+    rels = {r["from"]: r["to"] for r in g["relations"] if r.get("added_by") == "connect"}
+    assert rels["c"] in ("a", "b")                  # 前後のページではなく同じページの、最大の連結成分の概念
+    assert rels["iso1"] == "c"                      # iso2 のほうが内容は近いが、つながっている c を先に
+    assert rels["iso2"] in ("c", "iso1")            # iso1 はもう最大の連結成分に入っている
+    concepts = {c["id"]: c for c in g["concepts"]}
+    assert set(extraction.link_groups(concepts, g["relations"]).values()) == {0}   # 島が残らない
