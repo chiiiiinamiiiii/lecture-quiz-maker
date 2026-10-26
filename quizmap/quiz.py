@@ -15,7 +15,7 @@ import unicodedata
 from collections import Counter
 
 from quizmap.common import OTHER_LABEL, call_json
-from quizmap.vocab import relation_sentence
+from quizmap.vocab import is_symmetric, relation_sentence
 
 # 関係を問う問題の材料にしない関係の origin（#127）。external は Wikipedia だけが根拠、cooccurrence は資料の上で
 # 近くに出るだけの「関連」で、どちらも答えが資料の記述から導けない
@@ -179,7 +179,13 @@ def materials_text(concepts, selected, inner, neighbors, needed, page_text, styl
             if sentence:
                 # 文の型に名前を入れた文で渡し、問うときに示す概念と正答の概念も書く（#155・#156。LLM に向きを読み解かせない）
                 ask = relation_answer(style_of[r["label"]], a, b)
-                how = f"この関係を問うときは「{ask[0]}」を示し、正答は「{ask[1]}」" if ask else ""
+                if is_symmetric(style_of[r["label"]]):
+                    how = "入れ替えても成り立つ関係。どちらを示してどちらを答えさせてもよい"
+                elif ask:
+                    how = (f"既定の問い方は「{ask[0]}」を示して「{ask[1]}」を答えさせる。「{ask[1]}」を示して「{ask[0]}」を"
+                           f"答えさせてもよいが、文の向き（{a} が from、{b} が to）は変えない")
+                else:
+                    how = ""
                 parts.append(f"- 「{sentence}」（{r['label']}。from は「{a}」、to は「{b}」。{how}）{src}")
             else:
                 # 向きを言葉にする（#32）。ラベルの定義に from / to の説明があればそれで A・B のどちらが何かが決まる
@@ -214,7 +220,8 @@ def gen_user(materials: str, n: int, counts: dict[str, int], n_short: int) -> st
 - 問題文に、正答に当たる関係ラベルの名前（「関係ラベルごとの出題の方針」にあるラベル名）を書かない
 - 1 つの問題で問うラベルは 1 つだけ
 - 関係を問う問題では、材料の関係の from と to を入れ替えない。出題の方針の A・B がどちらに当たるかは、関係の行の括弧の説明で決める
-- 関係の行に「この関係を問うときは「X」を示し、正答は「Y」」とあれば、問題文で X を示し、正答を Y にする（逆にしない）
+- 関係を問う問題は、関係の行の文（「…」）の向きのとおりに問う。どちらの概念を示し、どちらを答えさせてもよいが、
+  文と逆の向き（from と to を入れ替えた関係）を主張する問題文・正答にしない
 - relation_used には、関係を問う問題で根拠にした関係の行の from・to・label を、概念の表記そのままで書く。関係を問う問題でなければ 3 つとも空文字列にする
 - 具体例を問う問題は、資料が概念の例として挙げている事例・比喩・身近な例（例: 第◯回で概念 X の例として挙げられている事柄）と概念の対応を問う。概念の定義文を言い換えて語を当てさせる問題は、具体例ではなく定義の問題として数える
 - 資料に具体例が見つからない概念で、具体例の問題を作らない。具体例の枠が埋まらなければ、その分を定義の問題にして、aspect を definition にする
@@ -377,11 +384,13 @@ RELATION_DIRECTION_REASON = "関係を問う問題の向き・正答が、材料
 
 
 def relation_direction_problem(q: dict, inner: list[dict], concepts: dict[str, dict], styles: list[dict]) -> str | None:
-    """関係を問う問題を外す理由（#156）。LLM は呼ばない。外さないなら None。
+    """関係を問う問題を外す理由（#156・#160）。LLM は呼ばない。外さないなら None。
 
-    - relation_used が材料の関係と逆向き
-    - ラベルに answer_end があり、正答（answer_text）が正答になるべき端の概念ではなく、もう一方の端の概念
-    relation_used が材料に無い問題は、ここでは外さない（check_relation_direction の警告のまま）。
+    どちらの端を示し、どちらを答えさせるかは自由（answer_end は既定の問い方の目安）。外すのは、問題が材料の関係と
+    逆の向きを主張しているときだけ: relation_used が材料の行と逆向きで、かつ問題文と正答がその逆の向きに沿っている
+    （正答が relation_used の片方の端で、問題文にもう片方の端がある）とき。
+    入れ替えても成り立つラベル（is_symmetric）は外さない。relation_used が材料に無い問題は、ここでは外さない
+    （check_relation_direction の警告のまま）。
     """
     if q.get("aspect") != "relation":
         return None
@@ -390,22 +399,16 @@ def relation_direction_problem(q: dict, inner: list[dict], concepts: dict[str, d
     if not (f and t and label):
         return None
     style_of = {_norm(v["label"]): v for v in styles}
-    for r in inner:
-        a, b = concepts[r["from"]]["label"], concepts[r["to"]]["label"]
-        if _norm(r["label"]) != label:
-            continue
-        if (_norm(b), _norm(a)) == (f, t) and (_norm(a), _norm(b)) != (f, t):
-            return RELATION_DIRECTION_REASON
-        if (_norm(a), _norm(b)) != (f, t):
-            continue
-        ask = relation_answer(style_of.get(label), a, b)
-        if ask is None:
-            return None
-        answer = _norm(q.get("answer_text", ""))
-        right, wrong = _norm(ask[1]), _norm(ask[0])
-        if answer and right not in answer and wrong in answer:
-            return RELATION_DIRECTION_REASON
+    if is_symmetric(style_of.get(label)):
         return None
+    rows = {(_norm(concepts[r["from"]]["label"]), _norm(concepts[r["to"]]["label"])) for r in inner
+            if _norm(r["label"]) == label}
+    if (f, t) in rows or (t, f) not in rows:
+        return None
+    answer, prompt = _norm(q.get("answer_text", "")), _norm(q.get("prompt", ""))
+    for shown, asked in ((f, t), (t, f)):
+        if asked in answer and shown not in answer and shown in prompt:
+            return RELATION_DIRECTION_REASON
     return None
 
 
@@ -967,9 +970,11 @@ def generate_quiz(client, model: str, graph: dict, vocab: dict, pages: list[dict
     # (3) 自動検証
     direction_warnings = [w for q in final for w in check_relation_direction(q, inner, concepts)]
     # 関係の向き・正答が材料と逆の問題は外す（#156。逆の模範解答で採点されるのを防ぐ）
-    dropped_direction = [q.get("id", "?") for q in final if relation_direction_problem(q, inner, concepts, styles)]
-    final = [q for q in final if q.get("id", "?") not in dropped_direction]
-    direction_warnings += [f"{qid}: {RELATION_DIRECTION_REASON}ので外した" for qid in dropped_direction]
+    dropped_direction = [{"id": q.get("id", "?"), "reason": reason, "relation_used": q.get("relation_used")}
+                         for q in final if (reason := relation_direction_problem(q, inner, concepts, styles))]
+    gone = {d["id"] for d in dropped_direction}
+    final = [q for q in final if q.get("id", "?") not in gone]
+    direction_warnings += [f"{d['id']}: {d['reason']}ので外した" for d in dropped_direction]
     style_warnings = [w for q in final for w in check_prompt_style(q, styles)]
     warnings = (["aspect を自己確認で直した: " + c for c in aspect_changes] + answer_warnings + resolve_warnings + direction_warnings + style_warnings
                 + validate(final, confirmed_ids, pages))
@@ -991,6 +996,7 @@ def generate_quiz(client, model: str, graph: dict, vocab: dict, pages: list[dict
         "materials_chars": len(materials),
         "distractors_replaced": n_replaced,
         "dropped_relation_direction": len(dropped_direction),
+        "dropped_relation_direction_records": dropped_direction,       # 外した問題の id と理由（#160）
         "api_calls": calls,
         "seconds": round(time.monotonic() - t0, 1),
     }

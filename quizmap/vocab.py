@@ -84,7 +84,8 @@ USER_TEMPLATE = """以下は「{course_hint}」という授業の資料です（
      （例: 「{{from}}は{{to}}の根拠である」「{{from}}は{{to}}の一種である」「{{from}} is a part of {{to}}」）。
      ふつうの読み方の向きにする（根拠なら from が理由、to が判断・結果。一種なら from が下位、to が上位）。
      定義・実例・問い方は、この文の型と同じ向きで書く（実例「A → B」の A・B を型に入れると、資料どおりの文になること）
- (h) answer_end: その関係を問う問題で正答になる端（"from" か "to"）。問い方 (c) と合わせる
+ (h) answer_end: その関係を問う既定の問い方で正答になる端（"from" か "to"）。問い方 (c) と合わせる
+ (i) symmetric: from と to を入れ替えても同じ関係として文が成り立つ（対立・対比など）なら true、そうでなければ false
 を書いてください。
 
 ラベルの組み合わせについて:
@@ -159,9 +160,10 @@ SCHEMA = {
                     "structure": {"type": "string", "enum": list(STRUCTURES)},
                     "template": {"type": "string"},
                     "answer_end": {"type": "string", "enum": ["from", "to"]},
+                    "symmetric": {"type": "boolean"},
                 },
                 "required": ["label", "definition", "question_style", "example", "from_kinds", "to_kinds",
-                             "structure", "template", "answer_end"],
+                             "structure", "template", "answer_end", "symmetric"],
                 "additionalProperties": False,
             },
         },
@@ -376,6 +378,12 @@ def relation_sentence(rel: dict, a: str, b: str) -> str | None:
     return t.replace("{from}", a).replace("{to}", b)
 
 
+def is_symmetric(rel: dict | None) -> bool:
+    """from と to を入れ替えても成り立つラベルか（#160）。symmetric の旗、無ければ型が対立・対比か。"""
+    rel = rel or {}
+    return rel.get("symmetric") is True or rel.get("structure") == "対立・対比"
+
+
 def find_template_gaps(vocab: dict) -> list[str]:
     """文の型 template が使えないラベル（#155）。作り直しの不足として文で返す。型の無い古い形の答えでは確かめない。"""
     rels = [r for r in vocab["relations"] if r["label"] != OTHER_LABEL]
@@ -499,6 +507,7 @@ def derive_vocab(client, model: str, lectures, course_hint: str, log=print) -> d
         "to_kinds": [],
         "template": "",
         "answer_end": "",
+        "symmetric": False,
     })
     vocab["meta"] = {
         "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
