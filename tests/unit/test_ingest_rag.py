@@ -101,6 +101,14 @@ def rag_fakes(monkeypatch, courses_dir):
         log("補完: 1 本")
         return g
 
+    def connect_isolated(client, model, vocab_, graph, pages, index, wiki, log=print, use_llm=True, **kw):
+        ev["order"].append("connect" if use_llm else "connect_code")
+        ev.setdefault("connect_args", []).append((graph, index, wiki, use_llm))
+        if use_llm and "connect" in ev["fail"]:
+            raise RuntimeError("LLM error in connect")
+        log("つなぐ: 0 本")
+        return dict(graph, stats=dict(graph.get("stats") or {}, connect={"isolated_after": 0}))
+
     def render_slides(lectures, slides_dir, dpi):
         ev["order"].append("render")
         return 4
@@ -111,6 +119,7 @@ def rag_fakes(monkeypatch, courses_dir):
     monkeypatch.setattr(vocab, "derive_vocab", lambda *a, **k: dict(VOCAB))
     monkeypatch.setattr(extraction, "run_extraction", run_extraction)
     monkeypatch.setattr(extraction, "complete_relations", complete_relations, raising=False)
+    monkeypatch.setattr(extraction, "connect_isolated", connect_isolated, raising=False)
     monkeypatch.setattr(extraction, "render_slides", render_slides)
     return ev
 
@@ -158,8 +167,8 @@ def test_phases_in_order_and_progress_never_decreases(rag_fakes):
     d = _course()
     job = _run(d)
     assert job.status == "done", job.error
-    assert _phases(job) == ["read", "vocab", "concepts", "relations", "index", "completion", "slides"]
-    assert _sorted_order(rag_fakes["order"]) == ["build", "save", "extract", "complete", "render"]
+    assert _phases(job) == ["read", "vocab", "concepts", "relations", "index", "completion", "connect", "slides"]
+    assert _sorted_order(rag_fakes["order"]) == ["build", "save", "extract", "complete", "connect", "render"]
     progress = [p for _, p in job._trace]
     assert progress == sorted(progress)
     assert job.progress == 1.0
@@ -170,7 +179,7 @@ def test_phases_in_order_and_progress_never_decreases(rag_fakes):
 def test_phase_widths_sum_to_one_and_every_phase_has_label():
     assert sum(w for _, _, w in courses.PHASES) == pytest.approx(1.0)
     assert [k for k, _, _ in courses.PHASES] == ["read", "vocab", "concepts", "relations", "index",
-                                                  "completion", "slides"]
+                                                  "completion", "connect", "slides"]
     assert all(courses.PHASE_LABEL[k] for k, _, _ in courses.PHASES)
 
 
@@ -206,7 +215,7 @@ def test_index_failure_skips_completion_but_ingest_finishes(rag_fakes):
     d = _course()
     job = _run(d)
     assert job.status == "done"
-    assert _sorted_order(rag_fakes["order"]) == ["build", "extract", "render"]
+    assert _sorted_order(rag_fakes["order"]) == ["build", "extract", "connect", "render"]
     assert not (d / "rag_index.json").exists()
     assert any("索引を作れなかった" in m for m in job.log)
     assert len(read_json(d / "graph.json")["relations"]) == 1
@@ -218,7 +227,7 @@ def test_completion_failure_keeps_extracted_graph(rag_fakes):
     d = _course()
     job = _run(d)
     assert job.status == "done"
-    assert _sorted_order(rag_fakes["order"]) == ["build", "save", "extract", "complete", "render"]
+    assert _sorted_order(rag_fakes["order"]) == ["build", "save", "extract", "complete", "connect", "render"]
     assert any("関係の補完に失敗した" in m for m in job.log)
     assert len(read_json(d / "graph.json")["relations"]) == 1
 
@@ -231,7 +240,7 @@ def test_rag_off_is_previous_behaviour(rag_fakes, monkeypatch, value):
     d = _course()
     job = _run(d)
     assert job.status == "done"
-    assert rag_fakes["order"] == ["extract", "render_in_extract"]       # 索引・補完なし、画像は抽出の中
+    assert rag_fakes["order"] == ["extract", "render_in_extract", "connect"]   # 索引・補完なし、画像は抽出の中。つなぐ段階は走る
     assert rag_fakes["slides_kw"] is True
     assert "index" not in _phases(job) and "completion" not in _phases(job)
     assert not (d / "rag_index.json").exists()
@@ -301,7 +310,7 @@ def test_real_rag_ingest_then_open(real_rag, rag_fakes):
     d = _course()
     job = _run(d)
     assert job.status == "done", job.log
-    assert rag_fakes["order"] == ["extract", "complete", "render"]
+    assert rag_fakes["order"] == ["extract", "complete", "connect", "render"]
     index, wiki = courses.open_rag(d)
     assert isinstance(index, real_rag.SlideIndex) and len(index) == 4
     assert [(p["lecture"], p["page"]) for p in index.pages] == [(1, 1), (1, 2), (2, 1), (2, 2)]
@@ -350,7 +359,7 @@ def test_real_rag_index_429_forever_ingest_continues(real_rag, rag_fakes, monkey
     assert sent, "埋め込みを送ったはず"
     assert any("索引を作れなかった" in m and "429" in m for m in job.log)
     assert not (d / "rag_index.json").exists()
-    assert rag_fakes["order"] == ["extract", "render"]           # 補完は飛ばす
+    assert rag_fakes["order"] == ["extract", "connect", "render"]           # 補完は飛ばす（つなぐ段階は走る）
 
 
 # ------------------------------------------------------------------ あとから索引と補完（start_rag_rebuild）
@@ -377,8 +386,8 @@ def test_rag_rebuild_builds_index_and_completes(rag_fakes):
     d = _ingested_course(rag_fakes)
     job = _rebuild(d)
     assert job.status == "done", job.log
-    assert rag_fakes["order"] == ["build", "save", "complete"]
-    assert _phases(job) == ["index", "completion"]
+    assert rag_fakes["order"] == ["build", "save", "complete", "connect"]
+    assert _phases(job) == ["index", "completion", "connect"]
     assert (d / "rag_index.json").exists()
     assert len(read_json(d / "graph_before_completion.json")["relations"]) == 1
     g = read_json(d / "graph.json")
@@ -485,7 +494,7 @@ def test_embed_daily_quota_skips_index_without_waiting(real_rag, rag_fakes, monk
     assert len(sent) == 1, job.log                                    # 1 回で諦める
     msg = next(m for m in job.log if "索引を作れなかった" in m)
     assert "（埋め込み）の 1 日の上限" in msg and "日本時間" in msg
-    assert rag_fakes["order"] == ["extract", "render"]
+    assert rag_fakes["order"] == ["extract", "connect", "render"]
 
 
 def test_generate_daily_quota_fails_ingest_with_reason(rag_fakes, monkeypatch):
@@ -541,3 +550,73 @@ def test_completion_breakdown_without_lookup_many(rag_fakes):
     job = _rebuild(d)
     assert job.status == "done", job.log
     assert any("補完の内訳" in m and "Wikipedia 0 秒" in m for m in job.log), job.log
+
+
+# ------------------------------------------------------------------ つながらない概念をつなぐ（#127）
+
+def _connect_args(rag_fakes):
+    (graph, index, wiki, use_llm), = rag_fakes["connect_args"]
+    return graph, index, wiki, use_llm
+
+
+def test_connect_runs_after_completion_with_index_and_wiki(rag_fakes):
+    d = _course()
+    job = _run(d)
+    graph, index, wiki, use_llm = _connect_args(rag_fakes)
+    assert [r.get("origin") for r in graph["relations"]] == [None, "external"]   # 補完の結果を渡す
+    assert index is not None and wiki is not None and use_llm
+    assert read_json(d / "graph.json")["stats"]["connect"] == {"isolated_after": 0}
+    assert any(m.startswith("   つながらない概念をつなぐ: ") and m.endswith(" 秒") for m in job.log), job.log
+
+
+def test_connect_runs_without_index(rag_fakes):
+    rag_fakes["fail"].add("build")
+    d = _course()
+    _run(d)
+    graph, index, wiki, _ = _connect_args(rag_fakes)
+    assert index is None and wiki is None
+    assert read_json(d / "graph.json")["stats"]["connect"] == {"isolated_after": 0}
+
+
+def test_connect_runs_after_completion_failure(rag_fakes):
+    rag_fakes["fail"].add("complete")
+    d = _course()
+    _run(d)
+    graph, index, wiki, _ = _connect_args(rag_fakes)
+    assert len(graph["relations"]) == 1 and wiki is None
+    assert "connect" in read_json(d / "graph.json")["stats"]
+
+
+def test_connect_llm_failure_falls_back_to_code(rag_fakes):
+    rag_fakes["fail"].add("connect")
+    d = _course()
+    job = _run(d)
+    assert job.status == "done"
+    assert [a[3] for a in rag_fakes["connect_args"]] == [True, False]
+    assert any("2 段目だけでつなぐ" in m for m in job.log)
+    assert "connect" in read_json(d / "graph.json")["stats"]
+
+
+def test_connect_runs_when_rag_off(rag_fakes, monkeypatch):
+    monkeypatch.setenv("QUIZMAP_RAG", "off")
+    d = _course()
+    job = _run(d)
+    assert job.status == "done", job.log
+    graph, index, wiki, _ = _connect_args(rag_fakes)
+    assert index is None and wiki is None
+    assert "connect" in read_json(d / "graph.json")["stats"]
+
+
+def test_rag_rebuild_connects_and_saves(rag_fakes):
+    d = _ingested_course(rag_fakes)
+    rag_fakes["connect_args"].clear()
+    job = _rebuild(d)
+    assert job.status == "done", job.log
+    graph, index, wiki, _ = _connect_args(rag_fakes)
+    assert index is not None and wiki is not None
+    assert [r.get("origin") for r in graph["relations"]] == [None, "external"]
+    assert read_json(d / "graph.json")["stats"]["connect"] == {"isolated_after": 0}
+
+
+def test_related_label_in_common():
+    assert common.RELATED_LABEL == "関連" and extraction.RELATED_LABEL == common.RELATED_LABEL

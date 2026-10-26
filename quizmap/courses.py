@@ -166,7 +166,8 @@ PHASES = [  # (名前, 表示, 進捗の幅)。index と completion は RAG（do
     ("concepts", "概念の抽出（§5）", 0.38),
     ("relations", "関係の抽出（§5）", 0.27),
     ("index", "索引づくり", 0.05),
-    ("completion", "関係の補完", 0.12),
+    ("completion", "関係の補完", 0.08),
+    ("connect", "つながらない概念をつなぐ", 0.04),        # #127。RAG が off でも、索引が無くても走る
     ("slides", "スライド画像の作成", 0.05),
 ]
 PHASE_LABEL = {k: label for k, label, _ in PHASES}
@@ -338,7 +339,8 @@ def _run(job: Job, d: Path, rebuild_vocab: bool, model: str) -> None:
             _extract_with_rag(job, d, client, model, vocab, lectures)
         else:
             job.add("RAG は使わない（QUIZMAP_RAG=off）")
-            extraction.run_extraction(client, model, vocab, lectures, d, log=job.add, step=job.set_phase)
+            graph = extraction.run_extraction(client, model, vocab, lectures, d, log=job.add, step=job.set_phase)
+            write_json(d / "graph.json", _connect(job, client, model, vocab, graph, _pages_of(lectures), None, None))
         _record_boilerplate(d, boiler)
         rename_course(d, info["name"])
         job.end_phase()
@@ -445,6 +447,7 @@ def _extract_with_rag(job: Job, d: Path, client, model: str, vocab: dict, lectur
     index = built["index"]
 
     job.set_phase("completion")
+    wiki = None
     if index is None:
         job.add("索引が無いので関係の補完は飛ばした")
     else:
@@ -455,6 +458,9 @@ def _extract_with_rag(job: Job, d: Path, client, model: str, vocab: dict, lectur
         except Exception as e:  # noqa: BLE001  抽出だけの地図を残す
             job.add(f"関係の補完に失敗した（抽出だけの地図を使う）: {error_text(e)}")
             _log_traceback(job, e)
+            wiki = None
+
+    write_json(d / "graph.json", _connect(job, client, model, vocab, graph, pages, index, wiki))
 
     job.set_phase("slides")
     n_imgs = extraction.render_slides(lectures, d / "slides", SLIDE_DPI)
@@ -504,6 +510,7 @@ def _run_rag_rebuild(job: Job, d: Path, model: str) -> None:
         wiki = rag.Wiki(d, language_of(vocab, [p["text"] for p in pages]))
         graph = _complete_timed(job, client, model, vocab, graph, pages, index, wiki)
         write_json(d / "graph.json", graph)
+        write_json(d / "graph.json", _connect(job, client, model, vocab, graph, pages, index, wiki))
         rename_course(d, vocab["course"])
         job.end_phase()                          # 「関係の補完: N 秒」
         job.progress = 1.0
@@ -517,6 +524,24 @@ def _run_rag_rebuild(job: Job, d: Path, model: str) -> None:
     finally:
         job.finished_at = now()
         job.save()
+
+
+def _connect(job: Job, client, model: str, vocab: dict, graph: dict, pages: list[dict], index, wiki) -> dict:
+    """どの関係にもつながらない概念をつなぐ段階（#127）。補完の後に必ず走らせる。
+
+    索引が無い・補完に失敗したときは index=None, wiki=None で呼ぶ。1 段目（LLM）が失敗したら、
+    2 段目（コードで「関連」）だけでつなぎ直す。つながらない概念を残さないため。
+    """
+    from quizmap import extraction
+
+    job.set_phase("connect")
+    try:
+        return extraction.connect_isolated(client, model, vocab, graph, pages, index, wiki, log=job.add)
+    except Exception as e:  # noqa: BLE001  LLM の段だけ失敗した。コードの段でつなぐ
+        job.add(f"つなぐ 1 段目（LLM）に失敗した（2 段目だけでつなぐ）: {error_text(e)}")
+        _log_traceback(job, e)
+        return extraction.connect_isolated(client, model, vocab, graph, pages, index, wiki, log=job.add,
+                                           use_llm=False)
 
 
 def _complete_timed(job: Job, client, model: str, vocab: dict, graph: dict, pages: list[dict], index, wiki) -> dict:
