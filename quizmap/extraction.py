@@ -176,13 +176,37 @@ def evidence_in(evidence: str, text: str) -> str | None:
     return "loose" if len(lev) >= 4 and lev in _loose(text) else None
 
 
+_NAME_DROP_RE = re.compile(r"[\u2010-\u2015\u2212\-'‘’`′]")
+
+
+def _name_fold(text: str) -> str:
+    """概念名を本文・evidence の中で探すための形（#127）: 空白を除き、ラテン文字は小文字にし、ハイフン・ダッシュ・
+    アポストロフィを除く（Normal Distribution と normal distribution、Euler’s と Eulers を同じに見る）。"""
+    return _NAME_DROP_RE.sub("", _ASCII_UPPER_RE.sub(lambda m: m.group().lower(), _squash(text)))
+
+
+def _name_keys(name: str) -> list[str]:
+    """_name_fold した名前と、英語の名前なら最後の s を除いた形（Vectors → vector。ss・us・is・ics は除かない）。"""
+    k = _name_fold(name)
+    out = [k] if k else []
+    if _LATIN_RE.search(name) and not _CJK_RE.search(name) and len(k) >= 4 and k.endswith("s") \
+            and not _KEEP_FINAL_S_RE.search(k):
+        out.append(k[:-1])
+    return out
+
+
+def name_in(name: str, text: str) -> bool:
+    """概念名 name が text にあるか（_name_keys のどれかが _name_fold(text) に含まれる）。"""
+    t = _name_fold(text)
+    return any(k in t for k in _name_keys(name))
+
+
 def check_evidence(evidence: str, end_labels: list[str], page_text: str) -> str | None:
     """関係が出典ページに根拠を持つか（Issue #11）。落とす理由、または None を返す。"""
-    page = _squash(page_text)
     if not evidence_in(evidence, page_text):
         return "evidence が本文に無い"
     heads = [_label_head(l) for l in end_labels]
-    if not any(h and h in page for h in heads):
+    if not any(h and name_in(h, page_text) for h in heads):
         return "両端の概念名が本文に無い"
     return None
 
@@ -1252,11 +1276,10 @@ def check_external_evidence(evidence: str, end_labels: list[str], article: dict)
     evidence が記事の冒頭（プロンプトに載せた範囲）にそのまま有ること、
     両端の概念名がどちらも記事の題名か冒頭に出てくること（片方の記事に自分の名前が出るだけでは足りない）。
     """
-    text = _squash(_wiki_text(article))
     if not evidence_in(evidence, _wiki_text(article)):
         return "evidence が記事に無い"
-    where = _squash(article.get("title", "")) + text
-    if not all(h and h in where for h in (_label_head(l) for l in end_labels)):
+    where = article.get("title", "") + " " + _wiki_text(article)
+    if not all(h and name_in(h, where) for h in (_label_head(l) for l in end_labels)):
         return "両端の概念名が記事に無い"
     return None
 
@@ -1279,20 +1302,47 @@ def check_ends_in_evidence(evidence: str, ends: list[dict], person_kinds: set[st
 
     別の概念についての記述（片方の名前しか無い）を根拠にした関係を足さないため。迷うものは落とす側に倒す。
     """
-    ev = _squash(evidence)
-    if all(any(n in ev for n in _name_variants(c, person_kinds)) for c in ends):
+    if all(any(name_in(n, evidence) for n in _name_variants(c, person_kinds)) for c in ends):
         return None
     return "evidence に両端が無い"
 
 
+_FRAGMENT_SEP_RE = re.compile(r"\s*(?:\.{3,}|…+|・・・|‥)\s*")
+FRAGMENTS_MAX = 2
+
+
+def check_fragment_evidence(evidence: str, ends: list[dict], page_text: str, person_kinds: set[str]) -> str | None:
+    """つなぐ工程の 1 段目の資料の根拠（#127）。落とす理由、または None を返す。
+
+    evidence は同じページの本文から写した 1〜FRAGMENTS_MAX 個の断片（「...」「…」で区切る）でよい。
+    断片はそれぞれ本文にそのまま有ること（evidence_in）。両端の名前は、それぞれ断片のどれかか同じページの本文に有り、
+    少なくとも一方は断片の中に有ること（どちらの概念にも触れない断片を根拠にしない）。
+    """
+    frags = [f for f in _FRAGMENT_SEP_RE.split(evidence or "") if _squash(f)]
+    if not frags:
+        return "evidence が空"
+    if len(frags) > FRAGMENTS_MAX:
+        return "断片が多すぎる"
+    if not all(len(_squash(f)) >= 4 and evidence_in(f, page_text) for f in frags):
+        return "evidence が本文に無い"
+    names = [_name_variants(c, person_kinds) for c in ends]
+    in_frag = [any(name_in(n, f) for n in ns for f in frags) for ns in names]
+    if not all(hit or any(name_in(n, page_text) for n in ns) for hit, ns in zip(in_frag, names)):
+        return "両端の概念名が本文に無い"
+    if not any(in_frag):
+        return "evidence にどちらの端も無い"
+    return None
+
+
 def verify_judgement(j: dict, pages_allowed: set, wiki_ids: list[str], articles: dict, concepts: dict,
                      page_text: dict, labels: set[str], rel_by_label: dict, wide: dict,
-                     person_kinds: set[str]) -> tuple[dict, list[str], str | None]:
+                     person_kinds: set[str], fragments: bool = False) -> tuple[dict, list[str], str | None]:
     """補完・つなぐ工程の LLM の判定 1 件を照合する（#78・#88・#127）。LLM は呼ばない。
 
     ラベルが語彙にあるか、端の種類（check_end_kinds）、資料の根拠（ページが pages_allowed にあり、evidence が本文にあり、
     両端の名前が evidence にある）、通らなければ Wikipedia の根拠（記事が wiki_ids にあり両端の記事のどちらかで、
     evidence が記事にあり、両端の名前が evidence にある）の順に見る。
+    fragments が真なら、資料の根拠は check_fragment_evidence で見る（つなぐ工程の 1 段目、#127）。
     戻り値: (関係（origin を持てば通った。external の source は呼ぶ側が決める）, 根拠が通らなかった理由,
              "語彙にないラベル" / "端の種類が合わない"（ここで落とした）/ "swapped" / "widened" / None)
     """
@@ -1308,9 +1358,13 @@ def verify_judgement(j: dict, pages_allowed: set, wiki_ids: list[str], articles:
     reasons = []
     if j["slide_found"]:
         page = (j["lecture"], j["page"])
-        reason = "対に付けていないページ" if page not in pages_allowed or page not in page_text else \
-            check_evidence(j["slide_evidence"], ends, page_text[page]) or \
-            check_ends_in_evidence(j["slide_evidence"], end_concepts, person_kinds)
+        if page not in pages_allowed or page not in page_text:
+            reason = "対に付けていないページ"
+        elif fragments:
+            reason = check_fragment_evidence(j["slide_evidence"], end_concepts, page_text[page], person_kinds)
+        else:
+            reason = check_evidence(j["slide_evidence"], ends, page_text[page]) or \
+                check_ends_in_evidence(j["slide_evidence"], end_concepts, person_kinds)
         if reason:
             reasons.append(reason)
         else:
@@ -1537,11 +1591,15 @@ CONNECT_USER = """授業「{course}」で、まだどの概念とも関係が無
 - partner: 候補の id から 1 つ。資料の記述でいちばん確かに結びつく相手を選ぶ
 - from・to・label: target の概念と partner の関係を、上のラベルの定義で表す。from と to は 2 つの id で、ラベルの定義が決める向きに従う。
   そのラベルの例（「A → B」の A が from、B が to）と同じ向きで書く。どのラベルにも当てはまらなければ「{other}」にする
-- 資料の根拠: 資料のページに二つの概念を結びつける記述があれば slide_found を true にし、lecture と page にそのページを、
-  slide_evidence にその箇所をページ本文からそのまま 40 字以内で抜き出す。引用には二つの概念の名前を両方入れる
+- 相手を選ぶ前に、各候補について、二つの概念の関係を書いた文が資料のページにあるかを確かめる。
+  文が無い候補は選ばず、文がある別の候補を選ぶ（資料にある候補を、Wikipedia だけにある候補より先にする）
+- 資料の根拠: 資料のページに二つの概念を結びつける記述があれば slide_found を true にし、lecture と page にそのページを書く。
+  slide_evidence には、そのページの本文から写した断片を 1 つか 2 つ書く（2 つのときは「 ... 」で区切る。合わせて 80 字以内）。
+  断片はそれぞれページ本文の連続した文字をそのまま写す（言い換えない・記号や数式を書き直さない・語を省かない）。
+  断片の少なくとも 1 つには、どちらかの概念の名前を入れる。もう一方の名前は同じページにあればよい
 - Wikipedia の根拠: 記事の本文に二つの概念を結びつける記述があれば external_found を true にし、wiki にその記事の番号を、
   wiki_evidence にその箇所を記事の本文からそのまま 80 字以内で抜き出す。引用には二つの概念の名前を両方入れる
-- 引用は本文の連続した文字をそのまま写す。離れた箇所をつながない。言い換えない。あなた自身の知識だけで関係を決めない
+- 引用は本文の文字をそのまま写す。あなた自身の知識だけで関係を決めない
 - 使わない欄は、文字列なら空、数なら 0、真偽なら false にする
 """
 
@@ -1825,7 +1883,7 @@ def connect_isolated(client, model, vocab, graph, pages, index, wiki, log=print,
                     continue
                 rel, reasons, fix = verify_judgement(
                     {**a, "label": a["label"].strip() or OTHER_LABEL}, set(page_keys), wiki_ids, articles,
-                    concepts, page_text, labels, rel_by_label, wide, person_kinds)
+                    concepts, page_text, labels, rel_by_label, wide, person_kinds, fragments=True)
                 if fix in ("語彙にないラベル", "端の種類が合わない"):
                     reject(fix)
                     continue
