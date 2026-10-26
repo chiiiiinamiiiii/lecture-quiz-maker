@@ -56,7 +56,7 @@ EXTRACT_USER = """授業「{course}」の第{lecture}回の資料のうち、p.{
 - pages はその概念の名前が書かれているページの番号（p.{first}〜p.{last} から。複数可）。必ず 1 つ以上入れる
 
 関係について守ること:
-- from と to には、concepts に挙げた概念の label をそのまま書く。同じ概念を両端にしない
+- from と to には、concepts に挙げた概念の label をそのまま書く（id ではなく label）。同じ概念を両端にしない
 - 資料に明示的に書かれている関係だけを挙げる。一般知識から補わない
 - label はラベルの定義に従って選ぶ。無理に当てはめず、合わなければ「{other}」にする
 - from と to はラベルの定義が決める向きに従う。逆向きの関係ならば from と to を入れ替える
@@ -529,14 +529,37 @@ def extraction_chunks(n_pages: int, size: int = CONCEPT_PAGES, overlap: int = CH
 _MERGE_QUOTES = set("「」\"“”")
 _TRAILING_GLOSS_RE = re.compile(r"^(.+?)\([^()]*\)$")
 _ASCII_UPPER_RE = re.compile(r"[A-Z]")
+_ID_ONLY_RE = re.compile(r"[a-z0-9]+(?:_[a-z0-9]+)+")               # 応答の id の形（小文字と _ だけ、_ を含む）
+_LATIN_RE = re.compile(r"[A-Za-z]")
+_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff々]")
+_LATIN_SEP_RE = re.compile(r"[\u2010-\u2015\u2212_-]")               # ハイフン・ダッシュ・下線（語の区切りとして扱う）
+_ARTICLES = {"the", "a", "an"}
+_KEEP_FINAL_S_RE = re.compile(r"(ss|us|is|ics)$")                     # 複数形の s ではない語尾（class, Bayes 以外の us/is/ics）
+
+
+def _latin_fold(label: str) -> str:
+    """ラテン文字の名前の、統合の鍵の前処理（#119）。日本語などを含む名前はそのまま。
+    ハイフン・ダッシュ・下線を空白にし、アポストロフィを除き、先頭の冠詞を除き、最後の語の複数形の s を除く
+    （points → point、Eigenvalues → Eigenvalue。statistics・analysis・class は除かない）。"""
+    s = normalize_text(label)
+    if not _LATIN_RE.search(s) or _CJK_RE.search(s):
+        return label
+    s = _APOS_RE.sub("", _LATIN_SEP_RE.sub(" ", s))
+    words = s.split()
+    if len(words) > 1 and words[0].lower() in _ARTICLES:
+        words = words[1:]
+    if words and len(words[-1]) >= 4 and words[-1].endswith("s") and not _KEEP_FINAL_S_RE.search(words[-1].lower()):
+        words[-1] = words[-1][:-1]
+    return " ".join(words)
 
 
 def merge_key(label: str) -> str:
     """概念を同じものとしてまとめる鍵（#107・#114）: NFKC にし、空白・中黒・イコールの違いを無視する。
     かぎ括弧（「」）の有無と、末尾の括弧書き（「幸福(エウダイモニアー)」の訳語・原語）の有無も無視する。
     『』は無視しない（書名と、同じ名前の学説を分けるため）。括弧の中の語（ロゴス）とは別の概念のまま。
-    ラテン文字の大文字・小文字は区別しない（#119。Derivative / derivative）。ただし 3 字未満の鍵（変数名など。P と p）は区別する。"""
-    key = _folded(label, _MERGE_DROP | _MERGE_QUOTES)[0]
+    ラテン文字の大文字・小文字は区別しない（#119。Derivative / derivative）。ただし 3 字未満の鍵（変数名など。P と p）は区別する。
+    英語などの名前は、単数・複数、先頭の冠詞、ハイフンと空白、アポストロフィの違いも無視する（_latin_fold、#119）。"""
+    key = _folded(_latin_fold(label), _MERGE_DROP | _MERGE_QUOTES)[0]
     m = _TRAILING_GLOSS_RE.match(key)
     key = m.group(1) if m else key
     return _ASCII_UPPER_RE.sub(lambda c: c.group().lower(), key) if len(key) >= 3 else key
@@ -741,6 +764,8 @@ def extract_graph(client, model: str, course: str, vocab: dict, lectures: list[L
     fixes: list[dict] = []
     without_surface: list[dict] = []
     local: list[dict[str, str]] = [{} for _ in jobs]     # かたまりごと: 応答の label → 概念 id
+    local_ids: list[dict[str, str]] = [{} for _ in jobs]  # かたまりごと: 応答の id → 概念 id（#119）
+    by_answer_id: dict[str, str] = {}                     # 応答の id → 概念 id（最初に出たもの）
     first_label_of: dict[str, set[str]] = collections.defaultdict(set)
     surface_count: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
     surface_order: dict[str, list[str]] = collections.defaultdict(list)
@@ -785,6 +810,9 @@ def extract_graph(client, model: str, course: str, vocab: dict, lectures: list[L
             concepts[cid]["lectures"].append(lec.number)
         local[m["job"]][m["label"]] = cid
         local[m["job"]].setdefault(m["surface"], cid)
+        if aid := clean_id(m.get("id") or "", ""):
+            local_ids[m["job"]].setdefault(aid, cid)
+            by_answer_id.setdefault(aid, cid)
     for cid, c in concepts.items():
         c["sources"].sort(key=lambda s: (s["lecture"], s["page"]))
         c["lectures"].sort()
@@ -837,7 +865,13 @@ def extract_graph(client, model: str, course: str, vocab: dict, lectures: list[L
         for lab, cid in loc.items():
             if merge_key(lab) == key:
                 return cid
+        # 端に概念の id（snake_case）を書いてくることがある（#119）。そのかたまりの応答の id、次にほかのかたまりの id
+        aid = clean_id(name, "")
+        if aid in local_ids[i]:
+            return local_ids[i][aid]
         cid = by_key.get(key)                 # ほかのかたまりで挙がった概念で、名前（どれかの表記）がこのかたまりの本文にあるもの
+        if cid is None:
+            cid = by_answer_id.get(aid) if _ID_ONLY_RE.fullmatch(name) else None
         if cid and any(pages_with_text(l, chunk_texts) for l in surface_order[cid]):
             return cid
         return None
