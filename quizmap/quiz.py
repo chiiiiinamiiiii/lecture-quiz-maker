@@ -380,6 +380,50 @@ def relation_answer(style: dict | None, a: str, b: str) -> tuple[str, str] | Non
     return None
 
 
+_END_MARK_RE = re.compile(r"\s*[(（]\s*(?:from|to)\s*[)）]", re.I)
+_TEMPLATE_SLOT_RE = re.compile(r"\{\s*(?:from|to)\s*\}", re.I)
+
+
+def tidy_question(q: dict, inner: list[dict], concepts: dict[str, dict], styles: list[dict]) -> tuple[dict | None, list[str]]:
+    """出題の後片付け（#161）。LLM は呼ばない。戻り値: (使う問題 または None, 直したことの記録)。
+
+    - 問題文・選択肢・正答・解説に残った「(from)」「(to)」「（from）」「（to）」を除く（出題の方針の印が漏れた）
+    - 「{from}」「{to}」（文の型の字）が問題文・選択肢・正答に残っていれば外す（直せないため）
+    - relation_used.label がラベル名でなく文の型の文なら、材料の関係と照らしてラベル名と from・to に直す
+    - 記述式（type=short）の choices を空にする
+    """
+    qid = q.get("id", "?")
+    notes: list[str] = []
+    q = dict(q)
+    for key in ("prompt", "answer_text", "explanation"):
+        if isinstance(q.get(key), str) and _END_MARK_RE.search(q[key]):
+            q[key] = _END_MARK_RE.sub("", q[key])
+            notes.append(f"{qid}: {key} から from・to の印を除いた")
+    if q.get("choices") and any(_END_MARK_RE.search(c) for c in q["choices"]):
+        q["choices"] = [_END_MARK_RE.sub("", c) for c in q["choices"]]
+        notes.append(f"{qid}: choices から from・to の印を除いた")
+    texts = [q.get("prompt", ""), q.get("answer_text", "")] + list(q.get("choices") or [])
+    if any(_TEMPLATE_SLOT_RE.search(t or "") for t in texts):
+        return None, notes + [f"{qid}: 問題に文の型の字（{{from}}・{{to}}）が残っているので外した"]
+    used = q.get("relation_used") or {}
+    labels = {_norm(v["label"]) for v in styles}
+    if q.get("aspect") == "relation" and used.get("label") and _norm(used["label"]) not in labels:
+        style_of = {v["label"]: v for v in styles}
+        for r in inner:
+            a, b = concepts[r["from"]]["label"], concepts[r["to"]]["label"]
+            sentence = relation_sentence(style_of.get(r["label"]), a, b)
+            if sentence and _norm(sentence).rstrip("。.") == _norm(used["label"]).rstrip("。."):
+                q["relation_used"] = {"from": a, "to": b, "label": r["label"]}
+                notes.append(f"{qid}: relation_used のラベル欄の文をラベル名「{r['label']}」に直した")
+                break
+        else:
+            notes.append(f"{qid}: relation_used のラベル「{used['label']}」がラベル名でなく、材料の関係とも合わない")
+    if q.get("type") == "short" and q.get("choices"):
+        q["choices"] = []
+        notes.append(f"{qid}: 記述式の choices を空にした")
+    return q, notes
+
+
 RELATION_DIRECTION_REASON = "関係を問う問題の向き・正答が、材料の関係と逆"
 
 
@@ -968,6 +1012,15 @@ def generate_quiz(client, model: str, graph: dict, vocab: dict, pages: list[dict
         }
 
     # (3) 自動検証
+    # 後片付け（#161）: 型の印の漏れ、relation_used のラベル欄の文、記述式の choices
+    tidy_notes: list[str] = []
+    tidied = []
+    for q in final:
+        q2, notes = tidy_question(q, inner, concepts, styles)
+        tidy_notes += notes
+        if q2 is not None:
+            tidied.append(q2)
+    final = tidied
     direction_warnings = [w for q in final for w in check_relation_direction(q, inner, concepts)]
     # 関係の向き・正答が材料と逆の問題は外す（#156。逆の模範解答で採点されるのを防ぐ）
     dropped_direction = [{"id": q.get("id", "?"), "reason": reason, "relation_used": q.get("relation_used")}
@@ -976,7 +1029,8 @@ def generate_quiz(client, model: str, graph: dict, vocab: dict, pages: list[dict
     final = [q for q in final if q.get("id", "?") not in gone]
     direction_warnings += [f"{d['id']}: {d['reason']}ので外した" for d in dropped_direction]
     style_warnings = [w for q in final for w in check_prompt_style(q, styles)]
-    warnings = (["aspect を自己確認で直した: " + c for c in aspect_changes] + answer_warnings + resolve_warnings + direction_warnings + style_warnings
+    warnings = (["aspect を自己確認で直した: " + c for c in aspect_changes] + answer_warnings + resolve_warnings + tidy_notes
+                + direction_warnings + style_warnings
                 + validate(final, confirmed_ids, pages))
     # 補正の後でも正答の添字が answer_text と合わない 4 択は出さない（正しく答えても不正解になるため）
     final = [q for q in final if q.get("type") != "mcq" or _answer_matches(q)]
@@ -997,6 +1051,7 @@ def generate_quiz(client, model: str, graph: dict, vocab: dict, pages: list[dict
         "distractors_replaced": n_replaced,
         "dropped_relation_direction": len(dropped_direction),
         "dropped_relation_direction_records": dropped_direction,       # 外した問題の id と理由（#160）
+        "tidied": tidy_notes,                                          # 後片付けで直したこと（#161）
         "api_calls": calls,
         "seconds": round(time.monotonic() - t0, 1),
     }
