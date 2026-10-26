@@ -54,6 +54,11 @@ def language_rule(lang: str) -> str:
             "資料の用語は、資料での表記のまま使います（訳さない）。")
 
 
+# 関係ラベルの型（#143）。ラベルの名前は資料に合わせて LLM が決め、型はラベルの組み合わせの偏りを確かめるためだけに使う
+CORE_STRUCTURES = ("一種・下位概念", "部分と全体", "対立・対比", "具体例", "前提・根拠", "用いる・適用")
+STRUCTURES = CORE_STRUCTURES + ("定義・言い換え", "人物の主張・批判", "出典", "その他の構造", "例題の形")
+MIN_CORE_STRUCTURES = 3      # ラベルの組み合わせに含まれてほしい、構造の型の数の下限
+
 SYSTEM = """あなたは大学の授業資料を読み、その授業に固有の「概念の種類」と「概念どうしの関係ラベル」を設計する専門家です。
 {language_rule}資料に実際に現れるものだけを挙げ、一般論で思いつくものを足してはいけません。"""
 
@@ -68,7 +73,15 @@ USER_TEMPLATE = """以下は「{course_hint}」という授業の資料です（
  (e) from 側・to 側になる概念の種類（下で提案する種類の名前で。複数可）。
      from 側・to 側の種類は、そのラベルの実例として資料に出てくる関係の両端の種類をすべて含めること。
      人物・思想家を主語とするラベル（例えば 提唱・批判）の相手には、概念・立場・学説の種類をすべて含めること
+ (f) そのラベルの関係の型 structure（次から 1 つ）: {structures}
+     どれにも当たらず、特定の例題・練習問題の形（関数が現象を記述する、関数を最大化する など）だけを表すなら「例題の形」
 を書いてください。
+
+ラベルの組み合わせについて:
+- ラベルは、資料のいろいろな回に共通する、概念どうしの構造を表すものを中心にする。名前は資料に合わせる
+- 資料に次の型の関係が出てくるなら、その型のラベルを必ず含める: {core_structures}
+- 特定の例題の形だけのラベルにしない。ラベルの少なくとも半分は、両端が同じ種類の概念どうしでも使えるもの
+  （from_kinds と to_kinds に同じ種類がある）にする
 
 守ること:
 - 資料に実際に現れる関係だけを挙げること。一般論で思いつくラベルを足さないこと
@@ -127,8 +140,10 @@ SCHEMA = {
                     "example": {"type": "string"},
                     "from_kinds": {"type": "array", "items": {"type": "string"}},
                     "to_kinds": {"type": "array", "items": {"type": "string"}},
+                    "structure": {"type": "string", "enum": list(STRUCTURES)},
                 },
-                "required": ["label", "definition", "question_style", "example", "from_kinds", "to_kinds"],
+                "required": ["label", "definition", "question_style", "example", "from_kinds", "to_kinds",
+                             "structure"],
                 "additionalProperties": False,
             },
         },
@@ -276,6 +291,32 @@ def concept_label_kinds(vocab: dict) -> dict[str, list[str]]:
     return out
 
 
+def find_structure_gaps(vocab: dict) -> list[str]:
+    """ラベルの組み合わせが例題向けに偏っていないか（#143）。作り直しの不足として文で返す。LLM は呼ばない。
+
+    - 構造の型（CORE_STRUCTURES）のラベルが MIN_CORE_STRUCTURES 種類より少ない
+    - 「例題の形」のラベルが半分を超える
+    - 両端に同じ種類を持てるラベル（from_kinds と to_kinds が重なる）が半分に満たない
+    型（structure）の無い古い形の答えでは、どれも確かめない。
+    """
+    rels = [r for r in vocab["relations"] if r["label"] != OTHER_LABEL]
+    if not rels or not all("structure" in r for r in rels):
+        return []
+    problems = []
+    core = {r["structure"] for r in rels if r["structure"] in CORE_STRUCTURES}
+    if len(core) < MIN_CORE_STRUCTURES:
+        problems.append(f"概念どうしの構造を表す型のラベルが {len(core)} 種類（{'・'.join(sorted(core)) or 'なし'}）だけ。"
+                        f"資料に出てくるなら、{'・'.join(c for c in CORE_STRUCTURES if c not in core)} の型のラベルも含める")
+    example = [r["label"] for r in rels if r["structure"] == "例題の形"]
+    if len(example) * 2 > len(rels):
+        problems.append(f"例題の形だけのラベルが {len(example)} / {len(rels)} 個（{'・'.join(example)}）。"
+                        "回をまたいで使える、概念どうしの構造のラベルにする")
+    same = [r for r in rels if set(r.get("from_kinds") or []) & set(r.get("to_kinds") or [])]
+    if len(same) * 2 < len(rels):
+        problems.append(f"両端が同じ種類の概念どうしで使えるラベルが {len(same)} / {len(rels)} 個。少なくとも半分にする")
+    return problems
+
+
 def find_cited_ends(vocab: dict) -> list[str]:
     """from_kinds か to_kinds が cited_work の種類だけのラベル（#141）。作り直しの不足として文で返す。"""
     cited = {k["name"] for k in vocab["kinds"] if k.get("cited_work") is True}
@@ -341,13 +382,14 @@ def derive_vocab(client, model: str, lectures, course_hint: str, log=print) -> d
     log(f"{len(chosen)} 回分 {len(corpus):,} 文字を {model} に渡して語彙を導出中…")
     user = USER_TEMPLATE.format(
         course_hint=course_hint, n_lectures=len(chosen), other=OTHER_LABEL, corpus=corpus,
-        language=language_name(lang),
+        language=language_name(lang), structures="・".join(STRUCTURES), core_structures="・".join(CORE_STRUCTURES),
     )
     vocab = call_json(client, model=model, system=system, schema=SCHEMA, user=user, max_tokens=16000)
 
-    # 関係の端になる種類が kinds に無い、または端が出典の文献の種類だけ（#141）なら、不足を伝えて 1 回だけ作り直させる
+    # 関係の端になる種類が kinds に無い、端が出典の文献の種類だけ（#141）、ラベルの組み合わせが例題向けに偏る（#143）なら、
+    # 不足を伝えて 1 回だけ作り直させる
     # （人間の確認は挟まない）
-    gaps = find_kind_gaps(vocab) + find_cited_ends(vocab)
+    gaps = find_kind_gaps(vocab) + find_cited_ends(vocab) + find_structure_gaps(vocab)
     retried = False
     if gaps:
         log("関係の端になる種類が足りない。1 回だけ作り直す: " + " / ".join(gaps))
@@ -359,7 +401,7 @@ def derive_vocab(client, model: str, lectures, course_hint: str, log=print) -> d
                 problems="\n".join(f"- {g}" for g in gaps),
             ),
         )
-        gaps = find_kind_gaps(vocab) + find_cited_ends(vocab)
+        gaps = find_kind_gaps(vocab) + find_cited_ends(vocab) + find_structure_gaps(vocab)
         if gaps:
             log("警告: 作り直しても関係の端になる種類が足りない: " + " / ".join(gaps))
     cited_ends = drop_cited_ends(vocab)
