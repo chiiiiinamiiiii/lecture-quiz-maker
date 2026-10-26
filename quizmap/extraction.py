@@ -49,10 +49,6 @@ EXTRACT_USER = """授業「{course}」の第{lecture}回の資料のうち、p.{
   その本の内容として説明されている概念や、著者の人物を挙げる
 - 本の題名が、その本の主張する考え方の名前にもなっている場合（例: ある本の題名と同じ名前の学説）は、本とは別に、
   その考え方を概念として挙げる。その種類は【出典の文献】の種類にしない
-- 講師の名前、ページの署名・見出し・脚注に出る名前、教科書や引用元の著者、計算ツール・ウェブサイトとその作者は、
-  授業の内容ではなく出典・署名として出てくるもの。これらを挙げるときは source_only を true にする（地図には載せず、
-  出典として記録する）。授業がその人の考え・業績や、その道具そのものを内容として扱っている場合だけ source_only を false にする。
-  ほかの概念は source_only を false にする
 - 授業の中で筋や内容が論じられている作品（劇・小説・報告書など）は、出典として挙がっているだけの本と区別する。
   作品そのものを【出典の文献】ではない種類で挙げ、内容を表す概念（その作品の中の対立や原則など）も挙げる
 - 一方で、資料に書かれていない概念を足さない
@@ -99,9 +95,8 @@ EXTRACT_SCHEMA = {
                     "kind": {"type": "string"},
                     "definition": {"type": "string"},
                     "pages": {"type": "array", "items": {"type": "integer"}},
-                    "source_only": {"type": "boolean"},
                 },
-                "required": ["id", "label", "kind", "definition", "pages", "source_only"],
+                "required": ["id", "label", "kind", "definition", "pages"],
                 "additionalProperties": False,
             },
         },
@@ -747,7 +742,6 @@ def extract_graph(client, model: str, course: str, vocab: dict, lectures: list[L
             claimed = sorted({p for p in c["pages"] if first <= p <= last})
             found = find_surface(label, kind, chunk_texts, person_kinds, claimed)
             mentions.append({"job": i, "label": label, "kind": kind, "id": c["id"],
-                             "source_only": c.get("source_only") is True,
                              "definition": c["definition"].strip(), "claimed": claimed,
                              "surface": found[0] if found else None, "how": found[1] if found else None,
                              "page": found[2] if found else None})
@@ -858,7 +852,6 @@ def extract_graph(client, model: str, course: str, vocab: dict, lectures: list[L
     surface_count: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
     surface_order: dict[str, list[str]] = collections.defaultdict(list)
     kind_order: dict[str, list[str]] = collections.defaultdict(list)    # まとめた挙げ方の種類（出た順、重複あり）
-    source_votes: dict[str, list[bool]] = collections.defaultdict(list)  # 挙げ方ごとの source_only（#136）
     new_of = collections.Counter()
     for m in mentions:
         lec, first, last = jobs[m["job"]]
@@ -886,7 +879,6 @@ def extract_graph(client, model: str, course: str, vocab: dict, lectures: list[L
         first_label_of[cid].add(m["surface"])
         surface_count[cid][m["surface"]] += 1
         kind_order[cid].append(m["kind"])
-        source_votes[cid].append(m.get("source_only") is True)
         if m["surface"] not in surface_order[cid]:
             surface_order[cid].append(m["surface"])
         chunk_texts = m.get("ask_pages") and {p: lec.pages[p - 1] for p in m["ask_pages"]} \
@@ -909,8 +901,6 @@ def extract_graph(client, model: str, course: str, vocab: dict, lectures: list[L
         c["label"] = _display_label(surface_count[cid], surface_order[cid])
         c["kind"] = _majority_kind(kind_order[cid])
     n_mentions = sum(1 for m in mentions if m["surface"])
-    # 出典・署名としてだけ出る人物・ツール（#136）: 挙げ方の過半数で source_only なら、地図に載せず出典として記録する
-    info["source_only_ids"] = [cid for cid, v in source_votes.items() if sum(v) * 2 > len(v)]
     info.update({
         "mentions": n_mentions,
         "merged_mentions": n_mentions - len(concepts),                       # 統合でまとめた挙げ方の数
@@ -2072,19 +2062,6 @@ def run_extraction(client, model: str, vocab: dict, lectures: list[Lecture], out
     concepts, relations, unmatched_kind, concept_info, dropped, adjusted = extract_graph(
         client, model, course, vocab, lectures, log=log, step=step, workers=workers,
         end_kind_mismatch=end_kind_mismatch)
-    # 出典・署名としてだけ出る人物・ツール（講師、教科書の著者、計算ツールなど。#136）。本（cited_work）と同じく
-    # 地図から外し、件数と名前を記録に残す。その概念を端にする関係も落とす
-    source_ids = [cid for cid in concept_info.get("source_only_ids", []) if cid in concepts]
-    source_labels = [concepts[cid]["label"] for cid in source_ids]
-    if source_ids:
-        for cid in source_ids:
-            del concepts[cid]
-        n_rel = len(relations)
-        relations = [r for r in relations if r["from"] in concepts and r["to"] in concepts]
-        if n_rel - len(relations):
-            dropped["端が出典の人物・ツール"] = n_rel - len(relations)
-        log(f"出典・署名としてだけ出る人物・ツールの概念 {len(source_ids)} 件と、それを端にする関係 "
-            f"{n_rel - len(relations)} 本を地図から外した: " + " / ".join(source_labels))
     n_before = len(concepts)
     removed_labels = cited_work_labels(concepts, vocab)
     concepts, cited_kinds = remove_cited_works(concepts, vocab)
@@ -2123,8 +2100,6 @@ def run_extraction(client, model: str, vocab: dict, lectures: list[Lecture], out
         "removed_cited_work_concepts": n_cited,
         "cited_work_kinds": cited_kinds,
         "removed_cited_work_examples": removed_labels,
-        "removed_source_only_concepts": len(source_ids),        # 出典・署名としてだけ出る人物・ツール（#136）
-        "removed_source_only_examples": source_labels,
         "unmatched_kind_examples": unmatched_kind[:20],
         "extract_chunks": concept_info["chunks"],
         "extract_calls": concept_info["calls"],
