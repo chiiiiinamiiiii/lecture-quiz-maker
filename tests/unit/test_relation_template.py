@@ -93,3 +93,34 @@ def test_vocab_asks_symmetric():
     assert "symmetric" in V.SCHEMA["properties"]["relations"]["items"]["required"]
     assert V.is_symmetric({"symmetric": True}) and V.is_symmetric({"structure": "対立・対比"})
     assert not V.is_symmetric({"structure": "前提・根拠"}) and not V.is_symmetric(None)
+
+
+# ---------------------------------------------------------------- 出題の後片付け（#161）
+
+def test_tidy_removes_end_marks_and_clears_short_choices():
+    q1 = {"id": "q1", "type": "mcq", "aspect": "relation", "prompt": "What is the abstract concept (to) illustrated by X?",
+          "choices": ["尊厳（to）", "b", "c", "d"], "answer_text": "尊厳（to）", "explanation": "x (from) y",
+          "relation_used": {"from": "自律", "to": "尊厳", "label": "根拠"}}
+    out, notes = quiz.tidy_question(q1, INNER, CONCEPTS, [GROUND])
+    assert out["prompt"] == "What is the abstract concept illustrated by X?"
+    assert out["choices"][0] == "尊厳" and out["answer_text"] == "尊厳" and out["explanation"] == "x y"
+    assert len(notes) == 4
+    short = {"id": "q2", "type": "short", "prompt": "p", "choices": ["模範"], "answer_text": "模範"}
+    out, notes = quiz.tidy_question(short, INNER, CONCEPTS, [GROUND])
+    assert out["choices"] == [] and notes == ["q2: 記述式の choices を空にした"]
+
+
+def test_tidy_drops_template_slots():
+    q1 = {"id": "q1", "type": "mcq", "prompt": "{from}は何の根拠か", "choices": ["a"], "answer_text": "a"}
+    out, notes = quiz.tidy_question(q1, INNER, CONCEPTS, [GROUND])
+    assert out is None and "外した" in notes[-1]
+
+
+def test_tidy_fixes_relation_label_written_as_sentence():
+    q1 = {"id": "q1", "type": "mcq", "aspect": "relation", "prompt": "p", "choices": ["自律"], "answer_text": "自律",
+          "relation_used": {"from": "自律", "to": "尊厳", "label": "自律は尊厳の根拠である。"}}
+    out, notes = quiz.tidy_question(q1, INNER, CONCEPTS, [GROUND])
+    assert out["relation_used"] == {"from": "自律", "to": "尊厳", "label": "根拠"} and "ラベル名「根拠」に直した" in notes[0]
+    q2 = {**q1, "relation_used": {"from": "a", "to": "b", "label": "a is a part of b"}}
+    out, notes = quiz.tidy_question(q2, INNER, CONCEPTS, [GROUND])
+    assert out["relation_used"]["label"] == "a is a part of b" and "材料の関係とも合わない" in notes[0]
