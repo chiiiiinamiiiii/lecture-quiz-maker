@@ -638,3 +638,18 @@ def test_title_in_double_brackets_is_not_a_person(monkeypatch):
     kinds = {x["label"]: x["kind"] for x in concepts.values()}
     assert kinds == {"『モモ』": OTHER_LABEL, "エンデ": "人物"}
     assert info["titles_not_person"] == ["『モモ』"]
+
+
+def test_kind_dominance():
+    import collections
+    d = extraction.kind_dominance(collections.Counter({"統計": 128, "文脈": 37, "モデル": 22, OTHER_LABEL: 50}))
+    assert d == {"kind": "統計", "share": 0.6845, "warning": True}
+    assert extraction.kind_dominance(collections.Counter({"a": 5, "b": 5}))["warning"] is False
+    assert extraction.kind_dominance(collections.Counter())["warning"] is False
+
+
+def test_vocab_prompt_asks_for_kinds_by_role_and_wide_contrast_ends():
+    from quizmap import vocab
+    assert "1 つの種類に概念の大半が入らないようにする" in vocab.USER_TEMPLATE
+    assert "法律・制度・社会の規範の種類に入れず" in vocab.USER_TEMPLATE
+    assert "対立・対比のラベルには、資料で対比される両端の種類をすべて含めること" in vocab.USER_TEMPLATE
