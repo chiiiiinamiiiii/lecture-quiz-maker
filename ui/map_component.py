@@ -8,7 +8,7 @@ from urllib.parse import unquote, urlparse
 
 import streamlit as st
 
-from quizmap.common import OTHER_LABEL
+from quizmap.common import OTHER_LABEL, RELATED_LABEL
 from ui.i18n import map_texts, t
 from ui.layout import compute_weights, layout_relation, layout_timeline
 
@@ -34,8 +34,18 @@ def _positions(graph) -> dict:
 
 
 def rel_label(label: str) -> str:
-    """関係ラベルを画面に出す形にする。「その他」は資料の言語によらず固定の名前なので、画面の言語で出す。"""
-    return t("rel_other") if label == OTHER_LABEL else label
+    """関係ラベルを画面に出す形にする。「その他」「関連」は資料の言語によらず固定の名前なので、画面の言語で出す。"""
+    if label == OTHER_LABEL:
+        return t("rel_other")
+    if label == RELATED_LABEL:
+        return t("rel_related")
+    return label
+
+
+def origin_of(rel: dict) -> str:
+    """関係の出どころ: "slide"（資料の記述）/ "external"（Wikipedia）/ "cooccurrence"（同じスライドに出るだけ、#127）。
+    origin の無い関係（RAG より前の graph）は slide。"""
+    return rel.get("origin") or "slide"
 
 
 def is_external(rel: dict) -> bool:
@@ -67,6 +77,7 @@ def concept_map(graph, asked: set[str], selected: list[str], sel_version: int, c
         "id": f"e{i}", "s": r["from"], "t": r["to"], "label": rel_label(r["label"]),
         "lecture": r["source"]["lecture"], "page": r["source"]["page"],
         "external": is_external(r), "article": article_title(r) if is_external(r) else "",
+        "cooccur": origin_of(r) == "cooccurrence",
     } for i, r in enumerate(graph["relations"])]
     data = {
         "course_id": course_id,

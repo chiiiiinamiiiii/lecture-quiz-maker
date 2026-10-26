@@ -49,11 +49,14 @@ TEXTS = {
     "external_rel": {"ja": "外部資料（Wikipedia）で補った関係", "en": "Relation added from an external source (Wikipedia)"},
     "external_legend": {"ja": "外部資料で補った関係", "en": "From external source"},
     "external_src": {"ja": "出典", "en": "Source"},
+    "cooccur_rel": {"ja": "同じスライドに出る（{lec} p.{page}）", "en": "Appear on the same slide ({lec} p.{page})"},
+    "cooccur_legend": {"ja": "同じスライドに出る（関連）", "en": "On the same slide (related)"},
     "lecture_short": {"ja": "{n}", "en": "L{n}"},   # 「講義回」の配置の列の見出し（短い形。#44）
     "count_fmt": {"ja": "{n} 個を選択中", "en": "{n} selected"},
     "def_hidden": {"ja": "解答中は定義を隠しています", "en": "Definitions are hidden while you answer"},
 
     "rel_other": {"ja": "その他", "en": "Other"},   # 関係ラベル「その他」の表示
+    "rel_related": {"ja": "関連", "en": "Related"},   # 関係ラベル「関連」（同じスライドに出るだけの関係、#127）の表示
 
     # 右側: 選択
     "sel_title": {"ja": "選択した範囲", "en": "Selection"},
@@ -145,6 +148,7 @@ TEXTS = {
     "phase_concepts": {"ja": "概念の抽出", "en": "Extracting concepts"},
     "phase_relations": {"ja": "関係の抽出", "en": "Extracting relations"},
     "phase_completion": {"ja": "関係の補完", "en": "Completing relations"},
+    "phase_connect": {"ja": "つながらない概念をつなぐ", "en": "Connecting isolated concepts"},
     "phase_slides": {"ja": "スライド画像の作成", "en": "Rendering slide images"},
 }
 
@@ -163,5 +167,5 @@ def map_texts() -> dict:
     keys = ["tool_hand", "tool_lasso", "tool_rect", "zoom_in", "zoom_out", "fit", "clear", "layout_force",
             "layout_timeline", "density", "unasked", "asked", "selected", "hint_hand", "hint_select", "by_lecture", "all",
             "lecture_fmt", "lecture_short", "count_fmt", "def_hidden",
-            "external_rel", "external_legend", "external_src"]
+            "external_rel", "external_legend", "external_src", "cooccur_rel", "cooccur_legend"]
     return {k: TEXTS[k].get(lang()) or TEXTS[k]["ja"] for k in keys}
