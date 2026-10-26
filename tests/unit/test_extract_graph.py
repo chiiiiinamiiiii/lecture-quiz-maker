@@ -660,3 +660,37 @@ def test_kanji_surname_prefix_merges_when_unique():
                                      P("t3", "高橋源一郎"), P("w", "和辻哲郎"), P("k", "金子"), P("k2", "金子武蔵", kind="学説")]}
     alias = extraction.person_aliases(concepts, {"人物"}, {"m1": 3, "m2": 1})
     assert alias == {"m2": "m1"}                     # 高橋は 2 人に合うのでまとめない。種類の違う金子武蔵とは合わせない
+
+
+# ---------------------------------------------------------------- 『』の題名を含む名前（#157）
+
+def test_same_title_ids():
+    concepts = {"a": {"label": "ミヒャエル・エンデ『モモ』"}, "b": {"label": "『アンティゴネー』"}, "c": {"label": "時間"},
+                "d": {"label": "高橋和巳『楽しく生きる』"}}
+    assert extraction.same_title_ids(concepts, ["『モモ』", "『楽しく生きる』"]) == ["a", "d"]
+
+
+def test_run_extraction_drops_titles_of_removed_books_and_checks_the_rest(monkeypatch, tmp_path):
+    vocab = {**VOCAB, "kinds": VOCAB["kinds"]}
+    lectures = [lec(1, "『乙書』を参照。甲野『乙書』。『丙劇』の筋を読む。『丁書』も参照。")]
+    answers = {(1, 1, 1): ([c("otsu", "『乙書』", "文献", 1), c("kotsu", "甲野『乙書』", "学説", 1),
+                            c("hei", "『丙劇』", "学説", 1), c("tei", "『丁書』", "学説", 1), c("kouno", "甲野", "人物", 1)],
+                           [rel("甲野", "甲野『乙書』", 1, "甲野『乙書』")])}
+    fake = FakeLLM(answers)
+    seen = []
+
+    def call(client, *, model, system, user, schema, **kw):
+        if schema is extraction.TITLE_CHECK_SCHEMA:
+            seen.append(user)
+            assert "1. 『丙劇』" in user and "2. 『丁書』" in user and "3. " not in user   # 著者名付きの『乙書』は聞かずに落とす
+            return {"answers": [{"index": 1, "discussed": True, "reason": "筋を論じる"},
+                                {"index": 2, "discussed": False, "reason": "参照だけ"}]}
+        return fake(client, model=model, system=system, user=user, schema=schema, **kw)
+    monkeypatch.setattr(extraction, "call_json", call)
+    g = extraction.run_extraction(object(), "m", vocab, lectures, tmp_path, slides=False, log=lambda *_: None)
+    assert sorted(x["label"] for x in g["concepts"]) == ["『丙劇』", "甲野"]
+    st = g["stats"]
+    assert st["removed_cited_work_examples"] == ["『乙書』", "甲野『乙書』", "『丁書』"]
+    assert st["cited_titles"]["same_title"] == ["甲野『乙書』"] and st["cited_titles"]["api_calls"] == 1
+    assert [x["discussed"] for x in st["cited_titles"]["checked"]] == [True, False]
+    assert g["relations"] == [] and st["dropped"]["端が出典の文献"] == 1 and len(seen) == 1

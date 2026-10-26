@@ -1260,6 +1260,68 @@ def kind_dominance(kind_counts: collections.Counter, share: float = KIND_DOMINAN
     return {"kind": kind, "share": round(n / total, 4), "warning": n / total > share}
 
 
+_TITLE_IN_RE = re.compile(r"『([^『』]+)』")
+
+
+def same_title_ids(concepts: dict[str, dict], removed_labels: list[str]) -> list[str]:
+    """落とした本の題名（『』の中）と同じ題名を含む概念（著者名付きの「ミヒャエル・エンデ『モモ』」など、#157）。"""
+    titles = {_squash(t) for label in removed_labels for t in _TITLE_IN_RE.findall(label)}
+    return [cid for cid, c in concepts.items()
+            if any(_squash(t) in titles for t in _TITLE_IN_RE.findall(c["label"]))]
+
+
+TITLE_CHECK_SYSTEM = """あなたは大学の授業資料を読み、資料に出てくる本・作品の扱いを判定する専門家です。"""
+
+TITLE_CHECK_USER = """授業「{course}」の資料に、『』の題名を含む次の名前が出てきます。各名前について、授業がその作品の内容
+（筋・登場人物・場面・その作品の中の主張）そのものを論じているなら discussed を true、出典・参考・引用元・紹介として
+名前が挙がるだけなら false にしてください。判断は、下の資料のページの記述だけで行います。
+
+{items}
+
+=== 資料のページ ===
+{pages}
+"""
+
+TITLE_CHECK_SCHEMA = {
+    "type": "object",
+    "properties": {"answers": {"type": "array", "items": {
+        "type": "object",
+        "properties": {"index": {"type": "integer"}, "discussed": {"type": "boolean"}, "reason": {"type": "string"}},
+        "required": ["index", "discussed", "reason"], "additionalProperties": False}}},
+    "required": ["answers"],
+    "additionalProperties": False,
+}
+TITLE_CHECK_PAGES = 2   # 1 つの名前に付けるページの数
+
+
+def check_titled_works(client, model: str, course: str, concepts: dict[str, dict], lectures: list[Lecture],
+                       log=print) -> tuple[dict[str, dict], int]:
+    """『』の題名を含む概念が、授業で内容が論じられる作品か、名前が挙がるだけの本かを LLM に確かめる（#157）。
+    1 回の呼び出しでまとめて判定する。戻り値: ({概念 id: {"discussed", "reason"}}, 呼び出し回数)。
+    答えの無い概念は残す側（discussed: true）にする。"""
+    by_lec = {lec.number: lec for lec in lectures}
+    ids = list(concepts)
+    keys = []
+    lines = []
+    for i, cid in enumerate(ids, 1):
+        c = concepts[cid]
+        srcs = [(s["lecture"], s["page"]) for s in c.get("sources", [])][:TITLE_CHECK_PAGES]
+        keys += [k for k in srcs if k not in keys]
+        lines.append(f"{i}. {c['label']}（{c.get('definition', '')}）ページ: "
+                     + "、".join(f"第{l}回 p{p}" for l, p in srcs))
+    pages = "\n\n".join(f"[第{l}回 p{p}]\n{by_lec[l].pages[p - 1][:PAGE_CHARS]}" for l, p in keys
+                         if l in by_lec and 0 < p <= len(by_lec[l].pages))
+    data = call_json(client, model=model, system=TITLE_CHECK_SYSTEM, schema=TITLE_CHECK_SCHEMA,
+                     user=TITLE_CHECK_USER.format(course=course, items="\n".join(lines), pages=pages or "（なし）"))
+    out = {cid: {"discussed": True, "reason": "答えが無い"} for cid in ids}
+    for a in data.get("answers", []):
+        if 1 <= a.get("index", 0) <= len(ids):
+            out[ids[a["index"] - 1]] = {"discussed": bool(a["discussed"]), "reason": a.get("reason", "")}
+    log("『』の題名を含む名前の判定: " + " / ".join(
+        f"{concepts[cid]['label']}（{'内容を論じる' if v['discussed'] else '名前が挙がるだけ'}）" for cid, v in out.items()))
+    return out, 1
+
+
 def remove_cited_works(concepts: dict[str, dict], vocab: dict) -> tuple[dict[str, dict], list[str]]:
     """cited_work が true の種類（資料が出典・参考として挙げた文献・作品）の概念を落とす（#50）。
 
@@ -2255,14 +2317,28 @@ def run_extraction(client, model: str, vocab: dict, lectures: list[Lecture], out
     removed_labels = cited_work_labels(concepts, vocab)
     concepts, cited_kinds = remove_cited_works(concepts, vocab)
     n_cited = n_before - len(concepts)
+    # 『』の題名を含む名前（#157）: 1) 落とした本と同じ題名を含む概念（著者名付き）は本として落とす
+    # 2) 残りの『』の題名を含む概念は、授業が作品の内容を論じているかを LLM に確かめ、論じていなければ本として落とす
+    titled_record = {"same_title": [], "checked": [], "api_calls": 0}
+    if cited_kinds:
+        same = same_title_ids(concepts, removed_labels)
+        titled_record["same_title"] = [concepts[cid]["label"] for cid in same]
+        cands = [cid for cid in concepts if cid not in same and _TITLE_IN_RE.search(concepts[cid]["label"])]
+        checked, calls = check_titled_works(client, model, course, {cid: concepts[cid] for cid in cands}, lectures, log) \
+            if cands and client is not None else ({}, 0)
+        titled_record.update(checked=[{"label": concepts[cid]["label"], **v} for cid, v in checked.items()], api_calls=calls)
+        drop_ids = set(same) | {cid for cid, v in checked.items() if not v["discussed"]}
+        removed_labels += [concepts[cid]["label"] for cid in concepts if cid in drop_ids]
+        concepts = {cid: c for cid, c in concepts.items() if cid not in drop_ids}
+        n_cited = n_before - len(concepts)
     if cited_kinds:
         # 概念と関係を同時に取るので、落とした概念を端にする関係もここで落とす
         n_rel = len(relations)
         relations = [r for r in relations if r["from"] in concepts and r["to"] in concepts]
         if n_rel - len(relations):
             dropped["端が出典の文献"] = n_rel - len(relations)
-        log(f"出典・参考の文献・作品の種類（{'・'.join(cited_kinds)}）の概念 {n_cited} 件と、それを端にする関係 "
-            f"{n_rel - len(relations)} 本を落とした: " + " / ".join(removed_labels))
+        log(f"出典・参考の文献・作品の種類（{'・'.join(cited_kinds)}）の概念と、題名でそれと分かる概念 {n_cited} 件と、"
+            f"それを端にする関係 {n_rel - len(relations)} 本を落とした: " + " / ".join(removed_labels))
     if slides:
         step("slides")
         n_imgs = render_slides(lectures, out_dir / "slides", dpi)
@@ -2292,6 +2368,7 @@ def run_extraction(client, model: str, vocab: dict, lectures: list[Lecture], out
         "removed_cited_work_concepts": n_cited,
         "cited_work_kinds": cited_kinds,
         "removed_cited_work_examples": removed_labels,
+        "cited_titles": titled_record,                                  # 『』の題名を含む名前の扱い（#157）
         "unmatched_kind_examples": unmatched_kind[:20],
         "extract_chunks": concept_info["chunks"],
         "extract_calls": concept_info["calls"],
