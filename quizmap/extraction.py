@@ -26,7 +26,8 @@ try:                                       # 「関連」は語彙の外の固�
     from quizmap.common import RELATED_LABEL
 except ImportError:  # pragma: no cover
     RELATED_LABEL = "関連"
-from quizmap.vocab import concept_label_kinds, kind_examples, language_name, language_of, language_rule
+from quizmap.vocab import (concept_label_kinds, kind_examples, language_name, language_of, language_rule,
+                           relation_sentence)
 
 # ------------------------------------------------------------------ 概念と関係の抽出（かたまりごとに 1 回、#107）
 
@@ -41,7 +42,11 @@ STRUCTURE_RULES = """- ラベルを書く前に、ラベルの定義の from と
 - 同じものを指す・定義・言い換えを表すラベルは、資料が二つを同じものとして書いているときだけ使う。
   一方が他方から計算されるだけのもの（1 − x、〜の確率）、総称とその中身（ある原則の集まりと個々の原則）、
   類と種、例と概念、制度とその条件には使わない
-- 具体例を表すラベルは、定義で from と to のどちらが具体例かを確かめ、その向きで書く"""
+- 具体例を表すラベルは、定義で from と to のどちらが具体例かを確かめ、その向きで書く
+- ラベルに【文の型】があるときは、型の {{from}} と {{to}} に二つの名前を入れた文（型「{{from}}は{{to}}の根拠である」なら
+  「自律は尊厳の根拠である」）が、資料の内容として正しいかで確かめる。正しくなければ from と to を入れ替えた文で確かめ、
+  それも正しくなければそのラベルを使わない
+- 対応する別の量（母集団の量と標本の量、量とそれを表す記号）や、量どうしを、一種・下位概念の関係にしない"""
 
 EXTRACT_SYSTEM = """あなたは大学の授業資料から、学習者が理解すべき「概念」と、概念どうしの「関係」を漏れなく取り出す専門家です。
 {language_rule}与えられた種類（kind）と関係ラベルだけを使います。"""
@@ -528,6 +533,13 @@ def _direction_text(rel: dict, wide: list[str] | None = None) -> str:
     return f"【向き: from は {'・'.join(f) or '指定なし'}、to は {'・'.join(t) or '指定なし'}{extra}】"
 
 
+def _label_line(rel: dict, wide: dict) -> str:
+    """プロンプトに載せるラベルの行。定義・文の型（#155）・向き・例。"""
+    sentence = relation_sentence(rel, "{from}", "{to}")
+    form = f"【文の型: 「{sentence}」】" if sentence else ""
+    return f"- {rel['label']}: {rel['definition']}{form}{_direction_text(rel, wide.get(rel['label']))}（例: {rel['example']}）"
+
+
 _FORMULA_RE = re.compile(r"[=<>≤≥→]")
 
 
@@ -824,7 +836,7 @@ def extract_graph(client, model: str, course: str, vocab: dict, lectures: list[L
     )
     wide = concept_label_kinds(vocab)
     rel_text = "\n".join(
-        f"- {r['label']}: {r['definition']}{_direction_text(r, wide.get(r['label']))}（例: {r['example']}）"
+        _label_line(r, wide)
         for r in vocab["relations"] if r["label"] != OTHER_LABEL
     )
     kind_names = {k["name"] for k in vocab["kinds"]}
@@ -1680,7 +1692,7 @@ def complete_relations(client, model, vocab, graph, pages, index, wiki, log=prin
     ]
     wide = concept_label_kinds(vocab)
     rel_text = "\n".join(
-        f"- {r['label']}: {r['definition']}{_direction_text(r, wide.get(r['label']))}（例: {r['example']}）"
+        _label_line(r, wide)
         for r in vocab["relations"] if r["label"] in labels
     )
     dropped = collections.Counter()
@@ -2065,7 +2077,7 @@ def connect_isolated(client, model, vocab, graph, pages, index, wiki, log=print,
             got = wiki.lookup_many([concepts[cid]["label"] for cid in targets])
             articles = {cid: got.get(concepts[cid]["label"]) for cid in targets}
         rel_text = "\n".join(
-            f"- {r['label']}: {r['definition']}{_direction_text(r, wide.get(r['label']))}（例: {r['example']}）"
+            _label_line(r, wide)
             for r in vocab["relations"] if r["label"] != OTHER_LABEL)
         batches = []
         for start in range(0, len(targets), max(1, batch_size)):
