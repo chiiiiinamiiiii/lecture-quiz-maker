@@ -4,6 +4,8 @@ LLM は extraction.call_json を差し替え、SlideIndex は本物をページ�
 """
 from __future__ import annotations
 
+import collections
+
 import pytest
 
 from quizmap import extraction
@@ -70,16 +72,17 @@ def test_stage2_connects_every_isolated_concept_by_position():
     g = extraction.connect_isolated(None, "m", VOCAB, graph(), PAGES, page_index(VEC), None, log=lambda *_: None)
     rels = by_from(g)
     assert set(rels) == {"bo", "ki", "kou", "shin"}
-    assert rels["bo"]["to"] in ("hei", "tei") and rels["bo"]["via"] == "same_page"     # 同じページの、関係の多い概念
+    assert rels["bo"]["to"] in ("hei", "tei") and rels["bo"]["via"] == "same_page"     # 同じページの概念
     assert rels["bo"]["source"] == {"lecture": 1, "page": 2}
     assert rels["ki"]["via"] == "adjacent_page" and rels["ki"]["source"] == {"lecture": 1, "page": 3}
-    assert rels["kou"]["via"] == "same_lecture" and rels["kou"]["to"] == "ki"           # 同じ回で、ページの近い順
+    assert rels["kou"]["via"] == "same_lecture" and rels["kou"]["to"] == "tei"          # 同じ回で、内容の近い順
     assert rels["shin"]["via"] == "vector" and rels["shin"]["to"] in ("kouno", "otsu")  # 別の回だけなので索引で近いページ
     for r in rels.values():
         assert r["label"] == extraction.RELATED_LABEL and r["origin"] == "cooccurrence" and "evidence" not in r
     st = g["stats"]["connect"]
     assert st["isolated_before"] == 4 and st["isolated_after"] == 0
-    assert st["stage2"] == {"added": 4, "by_via": {"same_page": 1, "adjacent_page": 1, "same_lecture": 1, "vector": 1}}
+    assert st["stage2"] == {"added": 4, "by_via": {"same_page": 1, "adjacent_page": 1, "same_lecture": 1, "vector": 1},
+                            "max_received": 1, "partners": 4, "similarity": True}
     assert g["stats"]["isolated_concepts"] == 0 and g["stats"]["relations"] == 6
 
 
@@ -87,10 +90,11 @@ def test_stage2_without_index_and_without_pages_falls_back():
     gr = graph()
     gr["concepts"].append(concept("nopage", "癸説", "学説"))
     g = extraction.connect_isolated(None, "m", VOCAB, gr, PAGES, None, None, log=lambda *_: None)
-    rels = by_from(g)
-    assert rels["shin"]["via"] == "fallback" or rels["shin"]["via"] == "same_lecture"
-    assert rels["nopage"]["via"] == "fallback"
+    rels = [r for r in g["relations"] if r.get("added_by") == "connect"]
+    assert {r["via"] for r in rels if "shin" in (r["from"], r["to"])} == {"fallback"}   # 別の回だけ。索引が無いので fallback
+    assert any("nopage" in (r["from"], r["to"]) for r in rels)
     assert g["stats"]["connect"]["isolated_after"] == 0
+    assert g["stats"]["connect"]["stage2"]["similarity"] is False
 
 
 def test_nothing_to_do_when_all_linked():
@@ -173,6 +177,33 @@ def test_candidates_order():
             on_page.setdefault((s["lecture"], s["page"]), []).append(c["id"])
     deg = extraction._degree(gr["relations"])
     out = extraction.connect_candidates("ki", concepts, on_page, deg, [{"lecture": 2, "page": 1}])
-    assert [(o, v) for o, v, _ in out] == [("hei", "adjacent_page"), ("tei", "adjacent_page"), ("bo", "adjacent_page"),
-                                           ("kouno", "same_lecture"), ("otsu", "same_lecture"),   # 同じ距離なら関係の多い順
-                                           ("kou", "same_lecture"), ("shin", "vector")]
+    # 索引が無いとき: 段の中は関係の少ない順（同じ回はページの近い順を先に）
+    assert [(o, v) for o, v, _ in out] == [("bo", "adjacent_page"), ("hei", "adjacent_page"), ("tei", "adjacent_page"),
+                                           ("kou", "same_lecture"), ("kouno", "same_lecture"),
+                                           ("otsu", "same_lecture"), ("shin", "vector")]
+    # 索引があるとき: 段の中は内容の近い順
+    sim = extraction.similarities("ki", extraction.concept_vectors(page_index(VEC), concepts))
+    out = extraction.connect_candidates("ki", concepts, on_page, deg, [], sim)
+    assert [o for o, v, _ in out if v == "same_lecture"] == ["kou", "kouno", "otsu"]
+
+
+def test_each_concept_receives_at_most_three_related():
+    """同じページに関係の多い概念が 1 つだけあっても、「関連」は 3 本までで、残りは次の候補に回す（星形を避ける）。"""
+    pages = [{"lecture": 1, "page": 1, "text": "x"}]
+    gr = {"concepts": [concept("hub", "中心", "学説", (1, 1)), concept("o", "相手", "学説", (1, 1))]
+          + [concept(f"c{i}", f"概念{i}", "学説", (1, 1)) for i in range(8)],
+          "relations": [{"from": "hub", "to": "o", "label": "提唱", "source": {"lecture": 1, "page": 1}}]}
+    g = extraction.connect_isolated(None, "m", VOCAB, gr, pages, None, None, log=lambda *_: None)
+    got = collections.Counter(r["to"] for r in g["relations"] if r.get("added_by") == "connect")
+    assert max(got.values()) <= 3 and g["stats"]["connect"]["isolated_after"] == 0
+    st = g["stats"]["connect"]["stage2"]
+    assert st["max_received"] <= 3 and st["partners"] == len(got)
+
+
+def test_over_cap_only_when_no_one_else():
+    pages = [{"lecture": 1, "page": 1, "text": "x"}]
+    gr = {"concepts": [concept("a", "甲", "学説", (1, 1)), concept("b", "乙", "学説", (1, 1)),
+                       concept("c", "丙", "学説", (1, 1))], "relations": []}
+    g = extraction.connect_isolated(None, "m", VOCAB, gr, pages, None, None, log=lambda *_: None, max_received=0)
+    assert g["stats"]["connect"]["isolated_after"] == 0
+    assert {r["via"] for r in g["relations"]} == {"over_cap"}
