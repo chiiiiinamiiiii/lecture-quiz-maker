@@ -21,6 +21,8 @@ MIN_SHARE = 0.5      # コースの全ページのうち、この割合以上の
 MIN_PAGES = 6        # ページがこれより少ないコースでは探さない（偶然の一致を避ける）
 EDGE_CHARS = 80      # 見出し・脚注とみなす、ページの頭・末尾からの字数
 HEADER_SHARE = 0.75  # 出るページのうち、この割合以上で 1 回だけ・頭か末尾に出るものを見出し・脚注とみなす
+WORD_MIN_LEN = 4     # 決まり文句の中の語を単独でも除くときの、語の最短の長さ
+WORD_OUTSIDE_SHARE = 0.05  # 決まり文句の外に出るページが、決まり文句の出るページのこの割合以下の語を除く
 GROW_KEEP = 0.95     # 伸ばすとき、出るページ数がこの割合より減るなら伸ばさない
 SEED_LEN = 8         # 探し始める文字の並びの長さ
 MIN_PAGE_NUMBERS = 3  # 1 回のうち、ページ番号と見なせるページがこれより少なければ除かない
@@ -149,16 +151,63 @@ def _remove(text: str, parts: list[str]) -> str:
     return re.sub(r"[ \t]{2,}", " ", text).strip()
 
 
+_LATIN_WORD_RE = re.compile(r"[A-Za-z\u00C0-\u024F]{%d,}" % WORD_MIN_LEN)
+
+
+def _is_ordinary_word(w: str, pages: list[str]) -> bool:
+    """小文字の形が、どこかのページに 1 語として出るか（natural、language などのふつうの語）。
+    人名（Tomoo、Matsumura）は小文字の 1 語としては出ないので、残りを除く対象になる。"""
+    pat = re.compile(r"(?<![A-Za-z\u00C0-\u024F])%s(?![A-Za-z\u00C0-\u024F])" % re.escape(w.lower()))
+    return any(pat.search(p) for p in pages)
+
+
+def find_boilerplate_words(pages: list[str], repeated: list[dict]) -> list[dict]:
+    """決まり文句の残りとして除く文字列。[{"text", "outside_pages"}]
+
+    PDF の文字の重なりで、講師名の間に別の文字が入ったもの（'Tomoo We Matsumura'）や、ファイルのパスの中の
+    名前（'…/tomoomatsumura/…'）は、決まり文句としては除けない。その残りから LLM が名前を組み立てたので（#119）:
+    - 決まり文句の中の WORD_MIN_LEN 字以上のラテン文字の語で、決まり文句を除いた本文に（大文字・小文字も同じ形で）
+      出るページが、決まり文句の出るページの WORD_OUTSIDE_SHARE 以下のもの。ただし、小文字の形がどこかに 1 語として
+      出るふつうの語（見出しの帯 'NATURAL LANGUAGE PROCESSING' の語）は除かない。大文字・小文字は区別する
+    - 決まり文句から空白・記号を除いてつなげた形（'tomoomatsumura'。大文字・小文字は区別しない）
+    """
+    out: list[dict] = []
+    for r in repeated:
+        rest = [p.replace(r["text"], " ") for p in pages]
+        for w in dict.fromkeys(_LATIN_WORD_RE.findall(r["text"])):
+            if _is_ordinary_word(w, pages):
+                continue
+            n = sum(1 for p in rest if w in p)
+            if n <= WORD_OUTSIDE_SHARE * r["pages"] and all(o["text"] != w for o in out):
+                out.append({"text": w, "outside_pages": n})
+        joined = re.sub(r"[\W_]+", "", r["text"])
+        if len(joined) >= MIN_LEN and joined != r["text"]:
+            n = sum(1 for p in rest if joined.lower() in p.lower())
+            if n:
+                out.append({"text": joined, "outside_pages": n, "ignore_case": True})
+    return out
+
+
+def _word_pattern(words: list[dict]) -> re.Pattern | None:
+    if not words:
+        return None
+    parts = [("(?i:%s)" if w.get("ignore_case") else "%s") % re.escape(w["text"])
+             for w in sorted(words, key=lambda w: -len(w["text"]))]
+    return re.compile("|".join(parts))
+
+
 def strip_boilerplate(lectures: list[Lecture]) -> dict:
     """lectures の prompt_pages に、決まり文句とページ番号を除いた本文を入れる。何を除いたかを返す。
 
     返す形（graph.json の stats.boilerplate に入れる）:
-    {"repeated": [{"text", "pages"}], "page_numbers": 除いたページ数, "page_number_examples": [...],
-     "pages": 全ページ数, "chars_removed": 除いた文字数}
+    {"repeated": [{"text", "pages"}], "words": [{"text", "outside_pages"}],
+     "page_numbers": 除いたページ数, "page_number_examples": [...], "pages": 全ページ数, "chars_removed": 除いた文字数}
     """
     all_pages = [p for lec in lectures for p in lec.pages]
     repeated = find_repeated(all_pages)
     texts = [r["text"] for r in repeated]
+    words = find_boilerplate_words(all_pages, repeated)
+    word_re = _word_pattern(words)
     n_numbers, examples, removed = 0, [], 0
     for lec in lectures:
         new = []
@@ -169,12 +218,14 @@ def strip_boilerplate(lectures: list[Lecture]) -> dict:
                 if len(examples) < 3:
                     examples.append(page[cut:].strip())
                 text = page[:cut]
-            if text != page or any(t in text for t in texts):
+            if text != page or any(t in text for t in texts) or (word_re and word_re.search(text)):
                 text = _remove(text, texts)
+                if word_re:
+                    text = re.sub(r"[ \t]{2,}", " ", word_re.sub(" ", text)).strip()
             removed += len(page) - len(text)
             new.append(text)
         lec.prompt_pages = new
-    return {"repeated": repeated, "page_numbers": n_numbers, "page_number_examples": examples,
+    return {"repeated": repeated, "words": words, "page_numbers": n_numbers, "page_number_examples": examples,
             "pages": len(all_pages), "chars_removed": removed}
 
 
@@ -184,6 +235,9 @@ def report_lines(report: dict) -> list[str]:
     if report["repeated"]:
         shown = " / ".join(f"「{r['text']}」({r['pages']} ページ)" for r in report["repeated"][:5])
         lines.append(f"抽出に渡す本文から、半分以上のページに出る文字列を除いた: {shown}")
+    if report.get("words"):
+        lines.append("抽出に渡す本文から、上の文字列の外にはほとんど出ない語も除いた: "
+                     + " / ".join(f"「{w['text']}」" for w in report["words"][:10]))
     if report["page_numbers"]:
         lines.append(f"抽出に渡す本文から、ページ番号を除いた: {report['page_numbers']} ページ"
                      f"（例: {' / '.join(report['page_number_examples'])}）")
