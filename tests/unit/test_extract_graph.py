@@ -563,3 +563,50 @@ def test_plural_variants_merge_into_one_concept(monkeypatch):
 
 def test_prompt_says_relation_ends_are_labels_not_ids():
     assert "label をそのまま書く（id ではなく label）" in extraction.EXTRACT_USER
+
+
+# ---------------------------------------------------------------- 同じ人物の別の書き方（姓だけ・頭文字）
+
+@pytest.mark.parametrize("a, b, same", [
+    ("カント", "イマヌエル・カント", True),
+    ("ヘーゲル", "ゲオルク・ヴィルヘルム・フリードリヒ・ヘーゲル", True),
+    ("フロム", "エーリヒ＝フロム", True),
+    ("ジョン・ミル", "ジェームズ・ミル", False),                      # 同じ姓で名が違う
+    ("L.M.Sullivan", "Lisa M. Sullivan", True),
+    ("Sullivan", "Lisa M. Sullivan", True),
+    ("L. Sullivan", "K. Sullivan", False),                            # 頭文字が違う
+    ("Lisa Sullivan", "Laura Sullivan", False),                       # 頭文字は同じでも名が違う
+    ("Dr. Alan H. Howard", "A. Howard", True),                        # 敬称は除く
+    ("Kant", "カント", False),                                        # 文字の種類が違えばまとめない
+])
+def test_same_person(a, b, same):
+    assert extraction._same_person(extraction._person_name(a), extraction._person_name(b)) is same
+
+
+def P(cid, label, kind="人物"):
+    return {"id": cid, "label": label, "kind": kind}
+
+
+def test_person_aliases_skip_ambiguous_surname_and_non_person_kinds():
+    concepts = {x["id"]: x for x in [P("kant", "カント"), P("ikant", "イマヌエル・カント"),
+                                     P("mill", "ミル"), P("jmill", "ジョン・ミル"), P("jamill", "ジェームズ・ミル"),
+                                     P("hegel", "ヘーゲル", kind="学説"), P("ghegel", "G・ヘーゲル")]}
+    alias = extraction.person_aliases(concepts, {"人物"}, {"kant": 1, "ikant": 3})
+    assert alias == {"kant": "ikant"}                 # ミルは 2 人に合うのでまとめない、学説の種類は見ない
+
+
+def test_extract_graph_merges_people_and_their_relations(monkeypatch):
+    lectures = [lec(1, "イマヌエル・カントは乙説を唱えた。", "カントの乙説。カント", "カントは丙説を唱えた。")]
+    answers = {
+        (1, 1, 1): ([c("ikant", "イマヌエル・カント", "人物", 1), c("otsu", "乙説", "学説", 1)],
+                    [rel("イマヌエル・カント", "乙説", 1, "イマヌエル・カントは乙説を唱えた")]),
+        (1, 2, 2): ([c("kant", "カント", "人物", 2)], []),
+        (1, 3, 3): ([c("kant", "カント", "人物", 3), c("hei", "丙説", "学説", 3)],
+                    [rel("カント", "丙説", 3, "カントは丙説を唱えた")]),
+    }
+    concepts, relations, info, *_ = run(monkeypatch, lectures, answers, size=1)
+    assert labels(concepts) == ["カント", "丙説", "乙説"]            # 多く挙がった表記
+    (k,) = [x for x in concepts.values() if x["kind"] == "人物"]
+    assert k["id"] == "kant" and [s["page"] for s in k["sources"]] == [1, 2, 3]   # id も多く挙がったほう
+    assert sorted((r["from"], r["to"]) for r in relations) == [("kant", "hei"), ("kant", "otsu")]
+    assert info["merged_people"] == [["イマヌエル・カント", "カント"]]

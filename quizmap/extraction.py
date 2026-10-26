@@ -647,6 +647,83 @@ def merge_key(label: str) -> str:
     return _ASCII_UPPER_RE.sub(lambda c: c.group().lower(), key) if len(key) >= 3 else key
 
 
+_PERSON_SPLIT_RE = re.compile(r"[・･=＝\s]+")
+_LATIN_NAME_SPLIT_RE = re.compile(r"[\s.]+")
+_TITLES = {"dr", "prof", "mr", "mrs", "ms", "sir"}
+
+
+def _person_name(label: str) -> tuple[str, list[str], bool] | None:
+    """人名を (姓, 名の並び, ラテン文字か) に分ける（#127 のつづき）。括弧書きは除く。分けられなければ None。
+    日本語などは「・」「=」・空白で区切った最後を姓に、ラテン文字は空白・「.」で区切った最後を姓にする
+    （L.M.Sullivan → Sullivan、名は L・M）。"""
+    head = normalize_text(label).split("(")[0].strip()
+    latin = bool(_LATIN_RE.search(head)) and not _CJK_RE.search(head)
+    parts = [p for p in (_LATIN_NAME_SPLIT_RE if latin else _PERSON_SPLIT_RE).split(_APOS_RE.sub("", head)) if p]
+    if not parts:
+        return None
+    surname = parts[-1].lower() if latin else _squash(parts[-1])
+    if len(surname) < 2:
+        return None
+    given = [p.lower() if latin else _squash(p) for p in parts[:-1]]
+    if latin:
+        given = [g for g in given if g not in _TITLES]
+    return surname, given, latin
+
+
+def _same_person(a: tuple, b: tuple) -> bool:
+    """_person_name の 2 つが同じ人か。姓が同じで、名の短い側が長い側と食い違わないこと。
+    ラテン文字は名を頭文字で比べ（Lisa と L）、先頭からそろえて比べる。日本語などは、名の無い側（姓だけ）とだけ合わせる。
+    名がどちらにもあって違う（頭文字が違う）ときは別人とみなす。"""
+    if a[0] != b[0] or a[2] != b[2]:
+        return False
+    ga, gb = a[1], b[1]
+    if not ga or not gb:
+        return True                                  # 片方が姓だけ
+    if not a[2]:
+        return ga == gb
+    return all(x[0] == y[0] and (len(x) == 1 or len(y) == 1 or x == y) for x, y in zip(ga, gb))
+
+
+def person_aliases(concepts: dict[str, dict], person_kinds: set[str],
+                   weight: dict[str, int] | None = None) -> dict[str, str]:
+    """人物の種類の概念で、同じ人の別の書き方（姓だけ・頭文字）をまとめる先（#127 のつづき）。{まとめる id: 残す id}。
+    LLM は呼ばない。ある概念が別人どうしの 2 人以上と合ってしまうとき（姓だけで、同じ姓の別人がいる）はまとめない。
+    残すのは weight（挙げられた回数）の多いほう、同じなら先に出たほう。"""
+    weight = weight or {}
+    people = [(cid, n) for cid, c in concepts.items() if c.get("kind") in person_kinds
+              if (n := _person_name(c["label"])) is not None]
+    order = {cid: i for i, cid in enumerate(concepts)}
+    matches = {cid: [o for o, m in people if o != cid and _same_person(n, m)] for cid, n in people}
+    parent = {cid: cid for cid, _ in people}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    named = dict(people)
+    # 合う相手どうしが別人なら（姓だけの名前が、同じ姓の 2 人に合う）、その概念はどれともまとめない
+    ambiguous = {cid for cid, others in matches.items()
+                 if any(not _same_person(named[x], named[y]) for i, x in enumerate(others) for y in others[i + 1:])}
+    for cid, others in matches.items():
+        if cid in ambiguous:
+            continue
+        for o in others:
+            if o not in ambiguous:
+                parent[find(cid)] = find(o)
+    groups: dict[str, list[str]] = collections.defaultdict(list)
+    for cid, _ in people:
+        groups[find(cid)].append(cid)
+    out = {}
+    for ids in groups.values():
+        if len(ids) < 2:
+            continue
+        keep = min(ids, key=lambda x: (-weight.get(x, 0), order[x]))
+        out.update({x: keep for x in ids if x != keep})
+    return out
+
+
 def _majority_kind(kinds: list[str]) -> str:
     """まとめた概念の種類（#119）: 多く挙がった種類。「その他」より vocab の種類を先にし、同じなら先に出たほう。"""
     counts = collections.Counter(kinds)
@@ -900,6 +977,28 @@ def extract_graph(client, model: str, course: str, vocab: dict, lectures: list[L
         c["lectures"].sort()
         c["label"] = _display_label(surface_count[cid], surface_order[cid])
         c["kind"] = _majority_kind(kind_order[cid])
+    # 同じ人物の別の書き方（姓だけ・頭文字。カント / イマヌエル・カント、L.M.Sullivan / Lisa M. Sullivan）をまとめる
+    alias = person_aliases(concepts, person_kinds, {cid: sum(v.values()) for cid, v in surface_count.items()})
+    merged_people = collections.defaultdict(list)
+    for b, a in alias.items():
+        ca, cb = concepts[a], concepts.pop(b)
+        merged_people[a].append(cb["label"])
+        ca["sources"] = sorted({(s["lecture"], s["page"]): s for s in ca["sources"] + cb["sources"]}.values(),
+                               key=lambda s: (s["lecture"], s["page"]))
+        ca["lectures"] = sorted(set(ca["lectures"]) | set(cb["lectures"]))
+        surface_count[a].update(surface_count.pop(b, {}))
+        surface_order[a] += [l for l in surface_order.pop(b, []) if l not in surface_order[a]]
+        first_label_of[a] |= first_label_of.pop(b, set())
+    for a in merged_people:
+        merged_people[a].append(concepts[a]["label"])
+        concepts[a]["label"] = _display_label(surface_count[a], surface_order[a])
+    if alias:
+        for table in [by_key, by_answer_id, *local, *local_ids]:
+            for k, v in table.items():
+                table[k] = alias.get(v, v)
+        log(f"同じ人物の別の書き方をまとめた {len(alias)} 件: "
+            + " / ".join("・".join(sorted(set(v))) + f" → {concepts[a]['label']}" for a, v in merged_people.items()))
+    info["merged_people"] = [sorted(set(v)) for v in merged_people.values()]
     n_mentions = sum(1 for m in mentions if m["surface"])
     info.update({
         "mentions": n_mentions,
@@ -2111,6 +2210,7 @@ def run_extraction(client, model: str, vocab: dict, lectures: list[Lecture], out
         "merged_mentions": concept_info["merged_mentions"],
         "merged_variants": concept_info["merged_variants"],
         "merged_variant_examples": concept_info["merged_variant_examples"],
+        "merged_people": concept_info.get("merged_people", []),       # 同じ人物の別の書き方をまとめた組（姓だけ・頭文字）
         "concepts_listed_by_lecture": concept_info["listed_by_lecture"],
         "new_concepts_by_lecture": concept_info["new_by_lecture"],
         "label_fixed_count": len(concept_info["label_fixes"]),
