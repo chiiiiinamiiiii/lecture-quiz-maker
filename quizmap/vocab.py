@@ -83,6 +83,9 @@ USER_TEMPLATE = """以下は「{course_hint}」という授業の資料です（
 - 種類は授業全体を通して使える分類の軸に限る。特定の回や特定の人物・話題でしか使わない種類は作らない
 - 各種類について、その種類に属する概念が、資料が出典・参考・引用元として挙げた文献・作品（本・論文・報告書・記事・作品など）であれば cited_work を true、そうでなければ false にする。
   文献・作品と、授業の内容の概念・人物を同じ種類に混ぜない
+- cited_work を true にした種類の概念（本・文献・作品）は、地図の概念にしない（関係の抽出の前に落とす）。
+  そのため、関係ラベルの from_kinds・to_kinds に cited_work の種類を入れない。例を表すラベルは、
+  抽象的な概念 → その具体的な事例・制度・現象の関係として、概念の種類どうしで定義する
 - cited_work を true にした種類の definition には、「出典・参考として名前が挙がるだけの本。授業で内容が論じられる作品や、本の題名と同じ名前の学説・考え方は含めない」という範囲を書く
 - 各種類について、その種類に属する概念が人物（人名）であれば person を true、そうでなければ false にする
 - 種類の名前を、その種類に属する概念の名前と同じにしない（例: 「X」という概念を入れるための「X」という種類は作らない）
@@ -273,6 +276,59 @@ def concept_label_kinds(vocab: dict) -> dict[str, list[str]]:
     return out
 
 
+def find_cited_ends(vocab: dict) -> list[str]:
+    """from_kinds か to_kinds が cited_work の種類だけのラベル（#141）。作り直しの不足として文で返す。"""
+    cited = {k["name"] for k in vocab["kinds"] if k.get("cited_work") is True}
+    problems = []
+    for r in vocab["relations"]:
+        if r["label"] == OTHER_LABEL or not cited:
+            continue
+        for side in ("from_kinds", "to_kinds"):
+            given = r.get(side) or []
+            if given and set(given) <= cited:
+                problems.append(f"関係「{r['label']}」の {side} が出典の文献の種類（{'・'.join(given)}）だけ。"
+                                f"出典の文献は概念にしないので、このラベルは使えない。概念の種類どうしの関係として定義し直す")
+    return problems
+
+
+def drop_cited_ends(vocab: dict) -> list[str]:
+    """関係ラベルの from_kinds・to_kinds から cited_work の種類を除く（#141）。vocab を書き換え、記録の文を返す。LLM は呼ばない。
+
+    cited_work の種類の概念は関係の抽出の前に落とすので、その種類を端にするラベルは使われない
+    （端が本の種類だけのラベルは 1 本も付かなかった）。除いて端が空になった側は、人物以外かつ cited_work 以外の
+    種類をすべて入れる（例を表すラベルの to が本の種類だけだったものを、概念の事例にも使えるようにする）。
+    cited_work の旗の無い古い vocab.json では何もしない。
+    """
+    cited = {k["name"] for k in vocab["kinds"] if k.get("cited_work") is True}
+    if not cited:
+        return []
+    content = [k["name"] for k in vocab["kinds"] if k.get("person") is not True and k.get("cited_work") is not True]
+    notes, kept = [], []
+    for r in vocab["relations"]:
+        if r["label"] == OTHER_LABEL:
+            kept.append(r)
+            continue
+        removed = {side: [k for k in (r.get(side) or []) if k in cited] for side in ("from_kinds", "to_kinds")}
+        if not any(removed.values()):
+            kept.append(r)
+            continue
+        rest = {side: [k for k in (r.get(side) or []) if k not in cited] for side in ("from_kinds", "to_kinds")}
+        if not content and (not rest["from_kinds"] or not rest["to_kinds"]):
+            notes.append(f"関係「{r['label']}」を除いた（端が出典の文献の種類だけで、ほかに広げる種類も無いため）")
+            continue
+        names = '・'.join(sorted(set(removed['from_kinds'] + removed['to_kinds'])))
+        for side in ("from_kinds", "to_kinds"):
+            if not rest[side]:
+                rest[side] = list(content)
+                notes.append(f"関係「{r['label']}」の {side} が出典の文献の種類 {names} だけだったので、"
+                             f"{'・'.join(content)} にした")
+        r.update(rest)
+        notes.append(f"関係「{r['label']}」の端から出典の文献の種類 {names} を除いた")
+        kept.append(r)
+    vocab["relations"] = kept
+    return notes
+
+
 def derive_vocab(client, model: str, lectures, course_hint: str, log=print) -> dict:
     """語彙を導出して dict で返す（保存は呼び出し側）。「その他」は必ず 1 つ付ける。"""
     chosen = choose_lectures(lectures, MAX_CORPUS_CHARS)
@@ -289,8 +345,9 @@ def derive_vocab(client, model: str, lectures, course_hint: str, log=print) -> d
     )
     vocab = call_json(client, model=model, system=system, schema=SCHEMA, user=user, max_tokens=16000)
 
-    # 関係の端になる種類が kinds に無ければ、不足を伝えて 1 回だけ作り直させる（人間の確認は挟まない）
-    gaps = find_kind_gaps(vocab)
+    # 関係の端になる種類が kinds に無い、または端が出典の文献の種類だけ（#141）なら、不足を伝えて 1 回だけ作り直させる
+    # （人間の確認は挟まない）
+    gaps = find_kind_gaps(vocab) + find_cited_ends(vocab)
     retried = False
     if gaps:
         log("関係の端になる種類が足りない。1 回だけ作り直す: " + " / ".join(gaps))
@@ -302,11 +359,12 @@ def derive_vocab(client, model: str, lectures, course_hint: str, log=print) -> d
                 problems="\n".join(f"- {g}" for g in gaps),
             ),
         )
-        gaps = find_kind_gaps(vocab)
+        gaps = find_kind_gaps(vocab) + find_cited_ends(vocab)
         if gaps:
             log("警告: 作り直しても関係の端になる種類が足りない: " + " / ".join(gaps))
+    cited_ends = drop_cited_ends(vocab)
     widened = widen_person_targets(vocab)
-    for w in widened:
+    for w in cited_ends + widened:
         log("語彙の後処理: " + w)
     warnings = widened + find_kind_warnings(vocab)
     for w in warnings[len(widened):]:
@@ -331,6 +389,7 @@ def derive_vocab(client, model: str, lectures, course_hint: str, log=print) -> d
         "kind_gaps": gaps,
         "kind_warnings": warnings,
         "widened_to_kinds": widened,
+        "dropped_cited_ends": cited_ends,
     }
     log(f"種類 {len(vocab['kinds'])} 個: " + " / ".join(k["name"] for k in vocab["kinds"]))
     log(f"関係 {len(vocab['relations'])} 個: " + " / ".join(r["label"] for r in vocab["relations"]))

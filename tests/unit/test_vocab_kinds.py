@@ -89,3 +89,52 @@ def test_derive_vocab_records_widening(monkeypatch):
     assert out["relations"][0]["to_kinds"] == ["学説・立場", "概念"]
     assert out["meta"]["widened_to_kinds"] and out["meta"]["kind_warnings"][0] == out["meta"]["widened_to_kinds"][0]
     assert out["meta"]["retried_for_kind_gaps"] is False                 # 作り直しの API は使わない
+
+
+# ---------------------------------------------------------------- 端が出典の文献の種類だけのラベル（#141）
+
+KINDS3 = kinds(("人物", True), ("概念", False), ("規範", False)) + [
+    {"name": "文献", "definition": "", "examples": ["a", "b", "c"], "cited_work": True, "person": False}]
+
+
+def test_find_cited_ends():
+    v = {"kinds": KINDS3, "relations": [rel("具体例", ["概念"], ["文献"]), rel("出典", ["文献"], ["概念"]),
+                                        rel("著す", ["人物"], ["文献", "概念"]), rel(OTHER_LABEL, [], [])]}
+    got = V.find_cited_ends(v)
+    assert len(got) == 2 and "「具体例」の to_kinds" in got[0] and "「出典」の from_kinds" in got[1]
+
+
+def test_drop_cited_ends_removes_cited_kinds_and_widens_empty_side():
+    v = {"kinds": KINDS3, "relations": [rel("具体例", ["概念"], ["文献"]), rel("著す", ["人物"], ["文献", "概念"]),
+                                        rel("前提", ["概念"], ["規範"]), rel(OTHER_LABEL, [], [])]}
+    notes = V.drop_cited_ends(v)
+    by = {r["label"]: (r["from_kinds"], r["to_kinds"]) for r in v["relations"]}
+    assert by["具体例"] == (["概念"], ["概念", "規範"])        # 本だけだった側は、人物・本以外の種類に広げる
+    assert by["著す"] == (["人物"], ["概念"])
+    assert by["前提"] == (["概念"], ["規範"])
+    assert len(notes) == 3 and V.find_cited_ends(v) == []
+
+
+def test_drop_cited_ends_noop_for_old_vocab():
+    v = {"kinds": [{"name": "文献"}, {"name": "概念"}], "relations": [rel("出典", ["文献"], ["概念"])]}
+    assert V.drop_cited_ends(v) == [] and v["relations"][0]["from_kinds"] == ["文献"]
+
+
+def test_derive_vocab_retries_once_for_cited_only_ends(monkeypatch):
+    from quizmap.common import Lecture
+    calls = []
+
+    def fake(client, *, model, system, user, schema, max_tokens=32000):
+        calls.append(user)
+        return {"course": "c", "kinds": KINDS3, "relations": [rel("具体例", ["概念"], ["文献"])]}
+    monkeypatch.setattr(V, "call_json", fake)
+    lec = Lecture(number=1, path=None, pages=["甲野は乙説を唱えた。"])
+    out = V.derive_vocab(None, "m", [lec], "c", log=lambda s: None)
+    assert len(calls) == 2 and "出典の文献の種類（文献）だけ" in calls[1]
+    assert out["meta"]["retried_for_kind_gaps"] is True
+    ex = next(r for r in out["relations"] if r["label"] == "具体例")
+    assert ex["to_kinds"] == ["概念", "規範"] and out["meta"]["dropped_cited_ends"]   # 作り直しても残れば広げる
+
+
+def test_prompt_says_cited_kinds_are_not_relation_ends():
+    assert "関係ラベルの from_kinds・to_kinds に cited_work の種類を入れない" in V.USER_TEMPLATE
