@@ -653,3 +653,10 @@ def test_vocab_prompt_asks_for_kinds_by_role_and_wide_contrast_ends():
     assert "1 つの種類に概念の大半が入らないようにする" in vocab.USER_TEMPLATE
     assert "法律・制度・社会の規範の種類に入れず" in vocab.USER_TEMPLATE
     assert "対立・対比のラベルには、資料で対比される両端の種類をすべて含めること" in vocab.USER_TEMPLATE
+
+
+def test_kanji_surname_prefix_merges_when_unique():
+    concepts = {x["id"]: x for x in [P("m1", "宮坂道夫"), P("m2", "宮坂"), P("t1", "高橋和巳"), P("t2", "高橋"),
+                                     P("t3", "高橋源一郎"), P("w", "和辻哲郎"), P("k", "金子"), P("k2", "金子武蔵", kind="学説")]}
+    alias = extraction.person_aliases(concepts, {"人物"}, {"m1": 3, "m2": 1})
+    assert alias == {"m2": "m1"}                     # 高橋は 2 人に合うのでまとめない。種類の違う金子武蔵とは合わせない
