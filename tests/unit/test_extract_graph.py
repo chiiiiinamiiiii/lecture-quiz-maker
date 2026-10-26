@@ -276,6 +276,11 @@ def test_relation_end_resolves_by_any_merged_surface(monkeypatch):
     ("義務の分類u格率を普遍化する", "義務の分類格率を普遍化する", "loose"),       # 全角文字にはさまれた u
     ("Kant uses autonomy", "Kantusesautonomy", "exact"),
     ("you u know", "youknow", None),
+    ("P(x, y) = R(x, y) − C(x, y)", "P(x, y) = R(x, y) - C(x, y)", "loose"),   # マイナスとハイフン（#119）
+    ("ages 20–30 years", "ages 20-30 years", "loose"),                      # en ダッシュ
+    ("Euler’s number e", "Eulers number e", "loose"),                       # アポストロフィ
+    ("Student’s t-distribution", "Student's t-distribution", "loose"),
+    ("R(x, y) − C(x, y)", "R(x, y) + C(x, y)", None),                       # 別の記号は通さない
 ])
 def test_evidence_in(page, evidence, want):
     assert extraction.evidence_in(evidence, page) == want

@@ -138,10 +138,13 @@ _BULLET_RE = re.compile(r"[•▪■□●○◆◇◦‣➢➤✓](?=\s)")
 _DATE_RE = re.compile(r"\d{4}/\d{1,2}/\d{1,2}")                          # スライドの見出しの日付
 _GLOSS_RE = re.compile(r"\([^()]*\)")                                    # 括弧書き（NFKC の後なので半角）
 _QUOTE_RE = re.compile(r"[「」『』\"“”]")
+_DASH_RE = re.compile(r"[\u2010-\u2015\u2212\ufe58\ufe63]")               # ハイフン・ダッシュ・マイナス（#119）
+_APOS_RE = re.compile(r"['‘’`′]")                                       # アポストロフィ（#119。Euler’s と Eulers）
 
 
 def _loose(text: str) -> str:
-    """evidence の照合の第 2 段（#114）: 箇条書きの記号・日付・括弧書き・かぎ括弧を除いて空白を詰める。"""
+    """evidence の照合の第 2 段（#114）: 箇条書きの記号・日付・括弧書き・かぎ括弧を除いて空白を詰める。
+    マイナスと各種のダッシュは「-」にそろえ、アポストロフィは除く（#119）。"""
     t = _BULLET_U_RE.sub(r"\1\2 ", _BULLET_RE.sub(" ", normalize_text(text)))
     t = _DATE_RE.sub("", t)
     t = _SPACE_RE.sub("", t)
@@ -150,7 +153,7 @@ def _loose(text: str) -> str:
         if u == t:
             break
         t = u
-    return _QUOTE_RE.sub("", t)
+    return _APOS_RE.sub("", _DASH_RE.sub("-", _QUOTE_RE.sub("", t)))
 
 
 def evidence_in(evidence: str, text: str) -> str | None:
