@@ -21,6 +21,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from quizmap.common import OTHER_LABEL, Lecture, call_json, normalize_text, write_json
+
+try:                                       # 「関連」は語彙の外の固定ラベル（#127）。common に入るまでの間は同じ値を使う
+    from quizmap.common import RELATED_LABEL
+except ImportError:  # pragma: no cover
+    RELATED_LABEL = "関連"
 from quizmap.vocab import concept_label_kinds, kind_examples, language_name, language_of, language_rule
 
 # ------------------------------------------------------------------ 概念と関係の抽出（かたまりごとに 1 回、#107）
@@ -1280,6 +1285,51 @@ def check_ends_in_evidence(evidence: str, ends: list[dict], person_kinds: set[st
     return "evidence に両端が無い"
 
 
+def verify_judgement(j: dict, pages_allowed: set, wiki_ids: list[str], articles: dict, concepts: dict,
+                     page_text: dict, labels: set[str], rel_by_label: dict, wide: dict,
+                     person_kinds: set[str]) -> tuple[dict, list[str], str | None]:
+    """補完・つなぐ工程の LLM の判定 1 件を照合する（#78・#88・#127）。LLM は呼ばない。
+
+    ラベルが語彙にあるか、端の種類（check_end_kinds）、資料の根拠（ページが pages_allowed にあり、evidence が本文にあり、
+    両端の名前が evidence にある）、通らなければ Wikipedia の根拠（記事が wiki_ids にあり両端の記事のどちらかで、
+    evidence が記事にあり、両端の名前が evidence にある）の順に見る。
+    戻り値: (関係（origin を持てば通った。external の source は呼ぶ側が決める）, 根拠が通らなかった理由,
+             "語彙にないラベル" / "端の種類が合わない"（ここで落とした）/ "swapped" / "widened" / None)
+    """
+    f, t, label = j["from"].strip(), j["to"].strip(), j["label"].strip()
+    if label not in labels:
+        return {}, [], "語彙にないラベル"
+    f, t, label, fix = check_end_kinds(f, t, label, concepts, rel_by_label, wide)
+    if fix == "other":
+        return {}, [], "端の種類が合わない"
+    ends = [concepts[f]["label"], concepts[t]["label"]]
+    end_concepts = [concepts[f], concepts[t]]
+    rel = {"from": f, "to": t, "label": label}
+    reasons = []
+    if j["slide_found"]:
+        page = (j["lecture"], j["page"])
+        reason = "対に付けていないページ" if page not in pages_allowed or page not in page_text else \
+            check_evidence(j["slide_evidence"], ends, page_text[page]) or \
+            check_ends_in_evidence(j["slide_evidence"], end_concepts, person_kinds)
+        if reason:
+            reasons.append(reason)
+        else:
+            rel.update(source={"lecture": page[0], "page": page[1]}, origin="slide",
+                       evidence=j["slide_evidence"].strip())
+    if "origin" not in rel and j["external_found"]:
+        cid = wiki_ids[j["wiki"] - 1] if 1 <= j["wiki"] <= len(wiki_ids) else None
+        reason = ("記事の番号が無い" if cid is None else "対に付けていない記事" if cid not in (f, t)
+                  else check_external_evidence(j["wiki_evidence"], ends, articles[cid])
+                  or check_ends_in_evidence(j["wiki_evidence"], end_concepts, person_kinds))
+        if reason:
+            reasons.append(reason)
+        else:
+            article = articles[cid]
+            rel.update(origin="external", evidence=j["wiki_evidence"].strip(), evidence_url=article.get("url", ""),
+                       evidence_title=article.get("title", ""))
+    return rel, reasons, fix
+
+
 def complete_relations(client, model, vocab, graph, pages, index, wiki, log=print,
                        max_pairs: int = COMPLETION_MAX_PAIRS, workers: int | None = None) -> dict:
     """関係の補完（docs/rag-design.md）。graph に関係を足した新しい graph を返す（ファイルは書かない）。
@@ -1395,53 +1445,26 @@ def complete_relations(client, model, vocab, graph, pages, index, wiki, log=prin
             rec["judgement"] = {"origin": claimed, **{k: j[k] for k in (
                 "label", "from", "to", "slide_found", "lecture", "page", "slide_evidence",
                 "external_found", "wiki", "wiki_evidence")}}
-            f, t, label = j["from"].strip(), j["to"].strip(), j["label"].strip()
-            if claimed == "none" or not label:
+            if claimed == "none" or not j["label"].strip():
                 dropped["関係なし"] += 1
                 rec["result"] = "none"
                 continue
-            if {f, t} != {p["a"], p["b"]}:
+            if {j["from"].strip(), j["to"].strip()} != {p["a"], p["b"]}:
                 reject("対に無い id")
                 continue
-            if label not in labels:
-                reject("語彙にないラベル")
-                continue
-            f, t, label, fix = check_end_kinds(f, t, label, concepts, rel_by_label, wide)
-            if fix == "other":
-                reject("端の種類が合わない")
+            rel, reasons, fix = verify_judgement(j, set(p["pages"]), wiki_ids, articles, concepts, page_text,
+                                                 labels, rel_by_label, wide, person_kinds)
+            if fix in ("語彙にないラベル", "端の種類が合わない"):
+                reject(fix)
                 continue
             if fix == "swapped":
                 adjusted["向きを直した"] += 1
             elif fix == "widened":
                 adjusted["端の種類を広げて残した"] += 1
-            ends = [concepts[f]["label"], concepts[t]["label"]]
-            end_concepts = [concepts[f], concepts[t]]
-            rel = {"from": f, "to": t, "label": label}
-            reasons = []
-            if j["slide_found"]:
-                page = (j["lecture"], j["page"])
-                reason = "対に付けていないページ" if page not in p["pages"] else \
-                    check_evidence(j["slide_evidence"], ends, page_text[page]) or \
-                    check_ends_in_evidence(j["slide_evidence"], end_concepts, person_kinds)
-                if reason:
-                    reasons.append(reason)
-                else:
-                    rel.update(source={"lecture": page[0], "page": page[1]}, origin="slide",
-                               evidence=j["slide_evidence"].strip())
-            if "origin" not in rel and j["external_found"]:
-                cid = wiki_ids[j["wiki"] - 1] if 1 <= j["wiki"] <= len(wiki_ids) else None
-                reason = ("記事の番号が無い" if cid is None else "対に付けていない記事" if cid not in (f, t)
-                          else check_external_evidence(j["wiki_evidence"], ends, articles[cid])
-                          or check_ends_in_evidence(j["wiki_evidence"], end_concepts, person_kinds))
-                if reason:
-                    reasons.append(reason)
-                else:
-                    article = articles[cid]
-                    shared = sorted(_pages_of(concepts[f]) & _pages_of(concepts[t]))
-                    lec, pg = (shared or p["pages"])[0]
-                    rel.update(source={"lecture": lec, "page": pg}, origin="external",
-                               evidence=j["wiki_evidence"].strip(), evidence_url=article.get("url", ""),
-                               evidence_title=article.get("title", ""))
+            if "origin" in rel and rel["origin"] == "external" and not rel.get("source"):
+                shared = sorted(_pages_of(concepts[rel["from"]]) & _pages_of(concepts[rel["to"]]))
+                lec, pg = (shared or p["pages"])[0]
+                rel["source"] = {"lecture": lec, "page": pg}
             if "origin" not in rel:
                 reject(reasons[0])                      # dropped には 1 対 1 件で数える（最初の理由）
                 if len(reasons) > 1:
@@ -1482,6 +1505,318 @@ def complete_relations(client, model, vocab, graph, pages, index, wiki, log=prin
         f"LLM {api_calls} 回・索引の検索 {record['searches']} 回")
     return dict(graph, relations=relations, stats=stats)
 
+
+
+# ------------------------------------------------------------------ つながらない概念をつなぐ（#127）
+#
+# 利用者の指示: すべての概念に必ず 1 本以上の関係を作る。2 段で行う。
+#   1 段目（LLM）: つながらない概念ごとに、資料の位置と索引で選んだ候補から、いちばん確かな相手・ラベル・向き・evidence を
+#                 1 つ答えさせる。照合は補完と同じ（verify_judgement）。
+#   2 段目（コード）: それでも残った概念を、同じページ → 前後のページ → 同じ回 → 索引で近いページの順に選んだ相手と、
+#                 固定ラベル「関連」（RELATED_LABEL、origin: "cooccurrence"）でつなぐ。evidence は持たない。
+
+CONNECT_SYSTEM = """あなたは大学の授業資料の概念どうしの関係を、資料のページと百科事典（Wikipedia）の記事の記述で確かめる専門家です。
+関係の両端には与えられた概念の id だけを使い、関係ラベルには与えられたラベルだけを使います。"""
+
+CONNECT_USER = """授業「{course}」で、まだどの概念とも関係が無い概念があります。各概念について、候補の中から
+いちばん確かな関係を 1 つ選んでください。
+
+関係ラベル（これ以外は使わない。どれにも当てはまらなければ「{other}」）:
+{relations}
+
+=== 資料のページ（[第N回 pM] の形で示す） ===
+{pages}
+
+=== Wikipedia の記事の冒頭（[W番号] の形で示す） ===
+{wiki}
+
+=== つなぐ概念と、相手の候補 ===
+{targets}
+
+各概念について必ず 1 件答える（target にその概念の番号）。
+- partner: 候補の id から 1 つ。資料の記述でいちばん確かに結びつく相手を選ぶ
+- from・to・label: target の概念と partner の関係を、上のラベルの定義で表す。from と to は 2 つの id で、ラベルの定義が決める向きに従う。
+  そのラベルの例（「A → B」の A が from、B が to）と同じ向きで書く。どのラベルにも当てはまらなければ「{other}」にする
+- 資料の根拠: 資料のページに二つの概念を結びつける記述があれば slide_found を true にし、lecture と page にそのページを、
+  slide_evidence にその箇所をページ本文からそのまま 40 字以内で抜き出す。引用には二つの概念の名前を両方入れる
+- Wikipedia の根拠: 記事の本文に二つの概念を結びつける記述があれば external_found を true にし、wiki にその記事の番号を、
+  wiki_evidence にその箇所を記事の本文からそのまま 80 字以内で抜き出す。引用には二つの概念の名前を両方入れる
+- 引用は本文の連続した文字をそのまま写す。離れた箇所をつながない。言い換えない。あなた自身の知識だけで関係を決めない
+- 使わない欄は、文字列なら空、数なら 0、真偽なら false にする
+"""
+
+CONNECT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "answers": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "integer"},
+                    "partner": {"type": "string"},
+                    "from": {"type": "string"},
+                    "to": {"type": "string"},
+                    "label": {"type": "string"},
+                    "slide_found": {"type": "boolean"},
+                    "lecture": {"type": "integer"},
+                    "page": {"type": "integer"},
+                    "slide_evidence": {"type": "string"},
+                    "external_found": {"type": "boolean"},
+                    "wiki": {"type": "integer"},
+                    "wiki_evidence": {"type": "string"},
+                },
+                "required": ["target", "partner", "from", "to", "label", "slide_found", "lecture", "page",
+                             "slide_evidence", "external_found", "wiki", "wiki_evidence"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["answers"],
+    "additionalProperties": False,
+}
+
+CONNECT_BATCH = int(os.environ.get("QUIZMAP_CONNECT_BATCH", "12"))        # 1 回の呼び出しで判定する概念の数
+CONNECT_CANDIDATES = 8          # 1 つの概念に付ける相手の候補の数
+CONNECT_OWN_PAGES = 2           # 1 つの概念に付ける、その概念が出るページの数
+CONNECT_SEARCH_K = 3            # 索引で近いページを取る数（候補の相手と、資料のページに 1 つ）
+COOCCURRENCE = "cooccurrence"   # 2 段目の関係の origin
+CONNECT_VIA = ("same_page", "adjacent_page", "same_lecture", "vector", "fallback")
+
+
+def _degree(relations: list[dict]) -> collections.Counter:
+    deg = collections.Counter()
+    for r in relations:
+        deg[r["from"]] += 1
+        deg[r["to"]] += 1
+    return deg
+
+
+def connect_candidates(cid: str, concepts: dict[str, dict], on_page: dict, deg: collections.Counter,
+                       near_pages: list[dict] | None) -> list[tuple[str, str, tuple[int, int] | None]]:
+    """つながらない概念 cid の相手の候補（#127）。LLM も埋め込みも呼ばない。
+
+    同じページに出る概念 → 前後のページ → 同じ回 → 索引で近いページ（near_pages。search_by_own_pages の結果）に出る概念の順。
+    各段の中は関係の多い順（同じ回は、ページの近い順を先に）、それも同じなら id の順。
+    戻り値: [(相手の id, 段（CONNECT_VIA）, 一緒に出るページ または None)]（重複なし、全件）
+    """
+    own = sorted(_pages_of(concepts[cid]))
+    seen = {cid}
+    out = []
+
+    def push(others, via, page_of):
+        for o in others:
+            if o not in seen:
+                seen.add(o)
+                out.append((o, via, page_of(o)))
+
+    by_deg = lambda ids: sorted(ids, key=lambda o: (-deg[o], o))
+    same = {o: p for p in own for o in on_page.get(p, [])}
+    push(by_deg(same), "same_page", lambda o: same[o])
+    adj = {o: p for (l, n) in own for p in ((l, n - 1), (l, n + 1)) for o in on_page.get(p, [])}
+    push(by_deg(adj), "adjacent_page", lambda o: None)
+    lectures = {l for l, _ in own} or set(concepts[cid].get("lectures") or [])
+    dist = {}
+    for (l, n), ids in on_page.items():
+        if l in lectures:
+            d = min((abs(n - m) for ll, m in own if ll == l), default=0)
+            for o in ids:
+                dist[o] = min(dist.get(o, d), d)
+    push(sorted(dist, key=lambda o: (dist[o], -deg[o], o)), "same_lecture", lambda o: None)
+    for h in near_pages or []:
+        push(by_deg(on_page.get((h["lecture"], h["page"]), [])), "vector", lambda o: None)
+    return out
+
+
+def connect_isolated(client, model, vocab, graph, pages, index, wiki, log=print,
+                     batch_size: int = CONNECT_BATCH, workers: int | None = None, use_llm: bool = True) -> dict:
+    """どの関係にもつながらない概念を、すべて 1 本以上の関係でつなぐ（#127）。新しい graph を返す（ファイルは書かない）。
+
+    1 段目（use_llm かつ client があるとき）: つながらない概念を batch_size 個ずつ LLM に判定させる。各概念に
+      相手の候補（connect_candidates の先頭 CONNECT_CANDIDATES 個）と、その概念のページ・索引で近いページ・Wikipedia の冒頭を
+      付け、相手・ラベル・向き・evidence を 1 つずつ答えさせる。照合は verify_judgement（補完と同じ）。
+      足す関係は origin "slide" / "external"、added_by "connect"。
+    2 段目（コード）: それでも残った概念ごとに、connect_candidates の先頭の相手と RELATED_LABEL でつなぐ。
+      origin "cooccurrence"、added_by "connect"、via に段、source は一緒に出るページ（無ければその概念のページ）。
+      候補が無ければ（ページの無い概念など）、関係のいちばん多い概念とつなぐ（via "fallback"）。
+    概念が 2 つ以上あれば、つながらない概念は必ず 0 になる。stats.connect に数と記録を残す。
+    index（SlideIndex）と wiki（Wiki）は None でもよい。
+    """
+    concepts = {c["id"]: c for c in graph["concepts"]}
+    relations = [dict(r, origin=r.get("origin", "slide")) for r in graph["relations"]]
+    page_text = {(p["lecture"], p["page"]): p["text"] for p in pages}
+    labels = {r["label"] for r in vocab["relations"]} | {OTHER_LABEL}
+    rel_by_label = {r["label"]: r for r in vocab["relations"]}
+    person_kinds = {k["name"] for k in vocab["kinds"] if k.get("person") is True}
+    wide = concept_label_kinds(vocab)
+
+    on_page: dict[tuple[int, int], list[str]] = collections.defaultdict(list)
+    for cid, c in concepts.items():
+        for p in sorted(_pages_of(c)):
+            on_page[p].append(cid)
+
+    def isolated_now() -> list[str]:
+        linked = {x for r in relations for x in (r["from"], r["to"])}
+        return [cid for cid in concepts if cid not in linked]
+
+    isolated = isolated_now()
+    record = {"isolated_before": len(isolated), "stage1": {}, "stage2": {}, "isolated_after": 0}
+    log(f"つながらない概念をつなぐ: {len(isolated)} 個")
+    near: dict[str, list[dict] | None] = {}
+    if index is not None and isolated:
+        found = search_by_own_pages(index, [_pages_of(concepts[cid]) for cid in isolated], k=CONNECT_SEARCH_K)
+        near = dict(zip(isolated, found))
+
+    # ---- 1 段目
+    s1 = {"targets": 0, "api_calls": 0, "added_slide": 0, "added_external": 0, "dropped": {}, "adjusted": {},
+          "records": []}
+    if use_llm and client is not None and isolated:
+        deg = _degree(relations)
+        cands = {cid: connect_candidates(cid, concepts, on_page, deg, near.get(cid))[:CONNECT_CANDIDATES]
+                 for cid in isolated}
+        targets = [cid for cid in isolated if cands[cid]]
+        articles: dict[str, dict | None] = {}
+        if wiki is not None and targets:
+            got = wiki.lookup_many([concepts[cid]["label"] for cid in targets])
+            articles = {cid: got.get(concepts[cid]["label"]) for cid in targets}
+        rel_text = "\n".join(
+            f"- {r['label']}: {r['definition']}{_direction_text(r, wide.get(r['label']))}（例: {r['example']}）"
+            for r in vocab["relations"] if r["label"] != OTHER_LABEL)
+        batches = []
+        for start in range(0, len(targets), max(1, batch_size)):
+            batch = targets[start:start + batch_size]
+            shown: dict[str, list[tuple[int, int]]] = {}
+            for cid in batch:
+                pg = sorted(_pages_of(concepts[cid]))[:CONNECT_OWN_PAGES]
+                pg += [(h["lecture"], h["page"]) for h in (near.get(cid) or [])[:1]]
+                shown[cid] = [x for x in pg if x in page_text]
+            page_keys = sorted({x for v in shown.values() for x in v})
+            wiki_ids = [cid for cid in batch if articles.get(cid)]
+            pages_block = "\n\n".join(f"[第{l}回 p{n}]\n{page_text[(l, n)][:PAGE_CHARS]}" for l, n in page_keys) \
+                or "（なし）"
+            wiki_block = "\n\n".join(f"[W{i + 1}] {articles[cid]['title']}\n{_wiki_text(articles[cid])}"
+                                     for i, cid in enumerate(wiki_ids)) or "（なし）"
+
+            def label_of(o):
+                c = concepts[o]
+                return f"{o}（{c['label']}／種類: {c['kind']}）"
+
+            blocks = []
+            for i, cid in enumerate(batch):
+                c = concepts[cid]
+                w = f"、記事 W{wiki_ids.index(cid) + 1}" if cid in wiki_ids else ""
+                blocks.append(
+                    f"{start + i + 1}. {label_of(cid)}{w}: {c.get('definition', '')}\n"
+                    f"   ページ: {'、'.join(f'第{l}回 p{n}' for l, n in shown[cid]) or 'なし'}\n"
+                    f"   候補: {' / '.join(label_of(o) for o, _, _ in cands[cid])}")
+            batches.append((start, batch, wiki_ids, page_keys, CONNECT_USER.format(
+                course=vocab.get("course", ""), relations=rel_text, other=OTHER_LABEL,
+                pages=pages_block, wiki=wiki_block, targets="\n".join(blocks))))
+
+        def ask(b):
+            return call_json(client, model=model, system=CONNECT_SYSTEM, schema=CONNECT_SCHEMA, user=b[4])
+
+        answers = []
+        if batches:
+            with ThreadPoolExecutor(max_workers=max(1, min(workers or EXTRACT_WORKERS, len(batches)))) as ex:
+                answers = list(ex.map(ask, batches))
+        dropped, adjusted = collections.Counter(), collections.Counter()
+        recs = {cid: {"concept": cid, "candidates": [o for o, _, _ in cands[cid]], "answer": None,
+                      "result": "no_answer", "reason": "", "relation": None} for cid in targets}
+        for (start, batch, wiki_ids, page_keys, _), data in zip(batches, answers):
+            done = set()
+            for a in data["answers"]:
+                n = a["target"] - 1
+                if not start <= n < start + len(batch) or n in done:
+                    dropped["番号が無い・重複"] += 1
+                    continue
+                done.add(n)
+                cid = batch[n - start]
+                rec = recs[cid]
+                rec["answer"] = {k: a[k] for k in CONNECT_SCHEMA["properties"]["answers"]["items"]["properties"]}
+                partner = a["partner"].strip()
+
+                def reject(reason):
+                    dropped[reason] += 1
+                    rec.update(result="rejected", reason=reason)
+
+                if partner not in rec["candidates"]:
+                    reject("候補に無い相手")
+                    continue
+                if {a["from"].strip(), a["to"].strip()} != {cid, partner}:
+                    reject("相手と端が合わない")
+                    continue
+                if not (a["slide_found"] or a["external_found"]):
+                    reject("根拠なし")
+                    continue
+                if any(cid in (r["from"], r["to"]) for r in relations):
+                    rec.update(result="already_linked")        # 同じ組の前の答えで、相手の側としてつながった
+                    continue
+                rel, reasons, fix = verify_judgement(
+                    {**a, "label": a["label"].strip() or OTHER_LABEL}, set(page_keys), wiki_ids, articles,
+                    concepts, page_text, labels, rel_by_label, wide, person_kinds)
+                if fix in ("語彙にないラベル", "端の種類が合わない"):
+                    reject(fix)
+                    continue
+                if fix in ("swapped", "widened"):
+                    adjusted[{"swapped": "向きを直した", "widened": "端の種類を広げて残した"}[fix]] += 1
+                if "origin" not in rel:
+                    reject(reasons[0] if reasons else "根拠なし")
+                    continue
+                if rel["origin"] == "external":
+                    shared = sorted(_pages_of(concepts[rel["from"]]) & _pages_of(concepts[rel["to"]]))
+                    own = sorted(_pages_of(concepts[cid]))
+                    lec, pg = (shared or own or [(0, 0)])[0]
+                    rel["source"] = {"lecture": lec, "page": pg}
+                rel["added_by"] = "connect"
+                relations.append(rel)
+                s1["added_" + rel["origin"]] += 1
+                rec.update(result="added", relation=rel)
+            dropped["答えの無い概念"] += len(batch) - len(done)
+        s1.update(targets=len(targets), api_calls=len(batches), dropped={k: v for k, v in dropped.items() if v},
+                  adjusted=dict(adjusted), records=list(recs.values()))
+        log(f"つなぐ 1 段目: {len(targets)} 個を LLM {len(batches)} 回で判定、"
+            f"slide {s1['added_slide']} / external {s1['added_external']} 本を足した")
+    record["stage1"] = s1
+
+    # ---- 2 段目
+    added2, by_via = [], collections.Counter()
+    for cid in isolated_now():
+        if any(cid in (r["from"], r["to"]) for r in relations):
+            continue                                  # この段で、ほかの概念の相手としてつながった
+        deg = _degree(relations)
+        cands = connect_candidates(cid, concepts, on_page, deg, near.get(cid))
+        if cands:
+            partner, via, page = cands[0]
+        else:
+            others = sorted((o for o in concepts if o != cid), key=lambda o: (-deg[o], o))
+            if not others:
+                continue
+            partner, via, page = others[0], "fallback", None
+        own = sorted(_pages_of(concepts[cid]))
+        src = page or (own[0] if own else (sorted(_pages_of(concepts[partner])) or [(0, 0)])[0])
+        rel = {"from": cid, "to": partner, "label": RELATED_LABEL, "origin": COOCCURRENCE,
+               "source": {"lecture": src[0], "page": src[1]}, "added_by": "connect", "via": via}
+        relations.append(rel)
+        added2.append(rel)
+        by_via[via] += 1
+    record["stage2"] = {"added": len(added2), "by_via": {v: by_via[v] for v in CONNECT_VIA if by_via[v]}}
+    record["isolated_after"] = len(isolated_now())
+    log(f"つなぐ 2 段目: 「{RELATED_LABEL}」で {len(added2)} 本（"
+        + "、".join(f"{v} {n}" for v, n in record["stage2"]["by_via"].items()) + f"）。"
+        f"つながらない概念 {record['isolated_before']} → {record['isolated_after']}")
+
+    n_other = sum(1 for r in relations if r["label"] == OTHER_LABEL)
+    stats = dict(graph.get("stats", {}))
+    stats.update(
+        relations=len(relations),
+        other_count=n_other,
+        other_rate=round(n_other / len(relations), 4) if relations else 0.0,
+        relations_by_label=dict(collections.Counter(r["label"] for r in relations).most_common()),
+        isolated_concepts=record["isolated_after"],
+        connect=record,
+    )
+    return dict(graph, relations=relations, stats=stats)
 
 
 # ------------------------------------------------------------------ 画像

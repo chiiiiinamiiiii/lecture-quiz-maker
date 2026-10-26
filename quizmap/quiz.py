@@ -15,6 +15,10 @@ import unicodedata
 from collections import Counter
 
 from quizmap.common import OTHER_LABEL, call_json
+
+# 関係を問う問題の材料にしない関係の origin（#127）。external は Wikipedia だけが根拠、cooccurrence は資料の上で
+# 近くに出るだけの「関連」で、どちらも答えが資料の記述から導けない
+UNASKED_ORIGINS = {"external", "cooccurrence"}
 from quizmap.vocab import detect_language, language_of, language_rule
 
 ASPECT_RATIO = {"relation": 4, "example": 3, "definition": 3}   # 仕様 §7 の目安
@@ -132,10 +136,11 @@ def build_materials(graph: dict, vocab: dict, pages: list[dict], concept_ids: li
     sel = set(c["id"] for c in selected)
 
     # 囲んだ概念どうしの関係（「その他」は問い方が無いので除く）。
-    # 外部資料（Wikipedia）で補った関係（origin: external）は、答えが資料から導けないので使わない（docs/rag-design.md）
+    # 外部資料（Wikipedia）で補った関係（origin: external、docs/rag-design.md）と、近くに出るだけでつないだ「関連」
+    # （origin: cooccurrence、#127）は、答えが資料から導けないので使わない
     inner = [r for r in graph["relations"]
              if r["from"] in sel and r["to"] in sel and r["label"] != OTHER_LABEL
-             and r.get("origin", "slide") != "external"]
+             and r.get("origin", "slide") not in UNASKED_ORIGINS]
     # 誤答候補: 地図上で隣接する概念（選択の外側も含む）
     neighbors: dict[str, set[str]] = {i: set() for i in sel}
     for r in graph["relations"]:
@@ -561,14 +566,14 @@ def _flat(text: str) -> str:
 
 
 def uses_external_relation(q: dict, graph: dict) -> bool:
-    """関係を問う問題の relation_used が origin: external の関係か（答えが資料から導けないので出さない）。"""
+    """関係を問う問題の relation_used が origin: external・cooccurrence の関係か（答えが資料から導けないので出さない）。"""
     if q.get("aspect") != "relation":
         return False
     used = q.get("relation_used") or {}
     key = tuple(_norm(used.get(k, "")) for k in ("from", "to", "label"))
     labels = {c["id"]: c["label"] for c in graph["concepts"]}
     for r in graph["relations"]:
-        if r.get("origin") != "external":
+        if r.get("origin") not in UNASKED_ORIGINS:
             continue
         a, b = _norm(labels.get(r["from"], "")), _norm(labels.get(r["to"], ""))
         if key in ((a, b, _norm(r["label"])), (b, a, _norm(r["label"]))):
@@ -635,7 +640,7 @@ def verify_uniqueness(client, model, questions, graph, pages, index, wiki) -> tu
     3. 記述式で、模範解答以外に資料から別の正答が成り立つなら外す
     4. 同じ範囲の別の問題と重なる問題は、後のほうを外す。正答が食い違う問題は記録だけ残す（どちらが誤りかは決めない）
     Wikipedia で引くのは、選択肢・正答に出てくる概念の label だけ（concept_terms）。
-    関係を問う問題で origin: external の関係を使ったものは、LLM に見せる前に外す。
+    関係を問う問題で origin: external・cooccurrence の関係を使ったものは、LLM に見せる前に外す。
     index（SlideIndex）と wiki（Wiki）は None でもよい（使える層だけで判定する）。
     戻り値: (残す問題, 検証の記録)。記録は問題ごとに 1 件:
       {"id", "action": "kept" / "replaced" / "dropped", "reasons": [...],

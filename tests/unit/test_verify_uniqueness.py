@@ -228,3 +228,21 @@ def test_concept_terms_skip_label_inside_longer_label():
     graph = {"concepts": [{"label": "尊厳"}, {"label": "尊厳性"}, {"label": "人格"}]}
     assert quiz.concept_terms(["人格の尊厳性"], graph) == ["人格", "尊厳性"]
     assert quiz.concept_terms(["関係の無い文"], graph) == []
+
+
+COOC_GRAPH = {**GRAPH, "relations": GRAPH["relations"] + [
+    {"from": "tei", "to": "hei", "label": "関連", "source": {"lecture": 1, "page": 2}, "origin": "cooccurrence",
+     "added_by": "connect", "via": "same_page"}]}
+
+
+def test_materials_exclude_cooccurrence_relations():
+    """近くに出るだけでつないだ「関連」（origin: cooccurrence、#127）は、関係を問う問題の材料にしない。"""
+    vocab = {"relations": [{"label": "提唱", "definition": "", "question_style": "", "example": ""}]}
+    _, _, inner, _, _, _, _ = quiz.build_materials(COOC_GRAPH, vocab, PAGES, ["hei", "tei"])
+    assert inner == []
+
+
+def test_cooccurrence_relation_is_treated_like_external():
+    q = mcq(aspect="relation", used=("丁説", "丙", "関連"))
+    assert quiz.uses_external_relation(q, COOC_GRAPH)
+    assert not quiz.uses_external_relation(mcq(aspect="relation", used=("甲野", "乙説", "提唱")), COOC_GRAPH)
