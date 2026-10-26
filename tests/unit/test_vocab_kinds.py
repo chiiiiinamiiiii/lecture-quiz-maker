@@ -11,7 +11,8 @@ def kinds(*specs):
 
 
 def rel(label, f, t):
-    return {"label": label, "definition": "", "question_style": "", "example": "", "from_kinds": f, "to_kinds": t}
+    return {"label": label, "definition": "from が A、to が B", "question_style": "", "example": "",
+            "from_kinds": f, "to_kinds": t}
 
 
 KINDS = kinds(("人物", True), ("概念", False), ("立場", False), ("学説", False))
@@ -188,3 +189,20 @@ def test_derive_vocab_retries_for_structure_gaps(monkeypatch):
 def test_schema_has_structure():
     items = V.SCHEMA["properties"]["relations"]["items"]
     assert "structure" in items["required"] and "例題の形" in items["properties"]["structure"]["enum"]
+
+
+# ---------------------------------------------------------------- 定義の向き（#148）
+
+def test_direction_gaps():
+    v = {"kinds": KINDS3, "relations": [
+        {**rel("下位概念", ["概念"], ["概念"]), "definition": "ある上位の概念に含まれる、より具体的な概念。"},
+        {**rel("part_of", ["概念"], ["概念"]), "definition": "from is a component of the whole to."},
+        {**rel("根拠", ["概念"], ["概念"]), "definition": "from が to の根拠になる"},
+        {**rel("x", ["概念"], ["概念"]), "definition": "something taken from somewhere"},     # to が無い
+        rel(OTHER_LABEL, [], [])]}
+    got = V.find_direction_gaps(v)
+    assert len(got) == 2 and "「下位概念」" in got[0] and "「x」" in got[1]
+
+
+def test_prompt_asks_for_direction_words():
+    assert "「from」「to」という語を使って必ず書く" in V.USER_TEMPLATE and "定義に書いた向きと同じ向きで" in V.USER_TEMPLATE

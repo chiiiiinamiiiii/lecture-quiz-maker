@@ -67,9 +67,11 @@ USER_TEMPLATE = """以下は「{course_hint}」という授業の資料です（
 この資料に出てくる概念どうしの関係を分類するラベルを 6〜12 個、提案してください。
 各ラベルについて、
  (a) 名前（短い{language}。日本語の資料なら例えば 提唱、対立、批判、前提）
- (b) 定義（どういうときにこのラベルを付けるか。from が何で to が何かを必ず書くこと。例: from が手段、to が目的）
+ (b) 定義（どういうときにこのラベルを付けるか。from が何で to が何かを、「from」「to」という語を使って必ず書くこと。
+     例: from が手段、to が目的。下位の概念のラベルなら from が下位か上位か、部分と全体のラベルなら from が部分か全体か、
+     具体例のラベルなら from が具体例か抽象的な概念かを書く）
  (c) その関係をクイズにするときの問い方（例: 「AとBの違いを問う」「誰がAを提唱したかを問う」）
- (d) 資料中の実例（「A → B」のように概念名で。from → to の順）
+ (d) 資料中の実例（「A → B」のように概念名で。from → to の順。定義に書いた向きと同じ向きで）
  (e) from 側・to 側になる概念の種類（下で提案する種類の名前で。複数可）。
      from 側・to 側の種類は、そのラベルの実例として資料に出てくる関係の両端の種類をすべて含めること。
      人物・思想家を主語とするラベル（例えば 提唱・批判）の相手には、概念・立場・学説の種類をすべて含めること
@@ -317,6 +319,19 @@ def find_structure_gaps(vocab: dict) -> list[str]:
     return problems
 
 
+_FROM_RE = re.compile(r"(?<![A-Za-z])from(?![A-Za-z])", re.I)
+_TO_RE = re.compile(r"(?<![A-Za-z])to(?![A-Za-z])", re.I)
+
+
+def find_direction_gaps(vocab: dict) -> list[str]:
+    """定義に from と to の両方が書かれていないラベル（#148）。作り直しの不足として文で返す。LLM は呼ばない。
+    向きの書かれていない定義（「ある上位の概念に含まれる、より具体的な概念」）では、抽出で逆向きに付くことがあった。"""
+    return [f"関係「{r['label']}」の定義に、from と to がそれぞれ何かが書かれていない（例: from が下位の概念、to が上位の概念）"
+            for r in vocab["relations"]
+            if r["label"] != OTHER_LABEL and not (_FROM_RE.search(r.get("definition", ""))
+                                                   and _TO_RE.search(r.get("definition", "")))]
+
+
 def find_cited_ends(vocab: dict) -> list[str]:
     """from_kinds か to_kinds が cited_work の種類だけのラベル（#141）。作り直しの不足として文で返す。"""
     cited = {k["name"] for k in vocab["kinds"] if k.get("cited_work") is True}
@@ -386,10 +401,11 @@ def derive_vocab(client, model: str, lectures, course_hint: str, log=print) -> d
     )
     vocab = call_json(client, model=model, system=system, schema=SCHEMA, user=user, max_tokens=16000)
 
-    # 関係の端になる種類が kinds に無い、端が出典の文献の種類だけ（#141）、ラベルの組み合わせが例題向けに偏る（#143）なら、
+    # 関係の端になる種類が kinds に無い、端が出典の文献の種類だけ（#141）、ラベルの組み合わせが例題向けに偏る（#143）、
+    # 定義に from・to の向きが無い（#148）なら、
     # 不足を伝えて 1 回だけ作り直させる
     # （人間の確認は挟まない）
-    gaps = find_kind_gaps(vocab) + find_cited_ends(vocab) + find_structure_gaps(vocab)
+    gaps = find_kind_gaps(vocab) + find_cited_ends(vocab) + find_structure_gaps(vocab) + find_direction_gaps(vocab)
     retried = False
     if gaps:
         log("関係の端になる種類が足りない。1 回だけ作り直す: " + " / ".join(gaps))
@@ -401,7 +417,7 @@ def derive_vocab(client, model: str, lectures, course_hint: str, log=print) -> d
                 problems="\n".join(f"- {g}" for g in gaps),
             ),
         )
-        gaps = find_kind_gaps(vocab) + find_cited_ends(vocab) + find_structure_gaps(vocab)
+        gaps = find_kind_gaps(vocab) + find_cited_ends(vocab) + find_structure_gaps(vocab) + find_direction_gaps(vocab)
         if gaps:
             log("警告: 作り直しても関係の端になる種類が足りない: " + " / ".join(gaps))
     cited_ends = drop_cited_ends(vocab)
