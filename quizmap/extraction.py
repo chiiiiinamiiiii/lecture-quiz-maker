@@ -1236,6 +1236,20 @@ def resolve_pair_conflicts(candidates: list[dict]) -> tuple[list[dict], collecti
     return [{k2: v for k2, v in first[k].items() if k2 != "_rank"} for k in kept], dropped
 
 
+KIND_DOMINANCE_SHARE = 0.6    # 1 つの種類が概念のこれより多くを占めたら、語彙の種類が粗いとみなす（#150）
+
+
+def kind_dominance(kind_counts: collections.Counter, share: float = KIND_DOMINANCE_SHARE) -> dict:
+    """いちばん多い種類と、その割合（#150）。share を超えたら warning を真にする（語彙の作り直しの目安。作り直しはしない）。
+    「その他」の種類は数えない。"""
+    counts = {k: n for k, n in kind_counts.items() if k != OTHER_LABEL}
+    total = sum(counts.values())
+    if not total:
+        return {"kind": "", "share": 0.0, "warning": False}
+    kind, n = max(counts.items(), key=lambda kv: kv[1])
+    return {"kind": kind, "share": round(n / total, 4), "warning": n / total > share}
+
+
 def remove_cited_works(concepts: dict[str, dict], vocab: dict) -> tuple[dict[str, dict], list[str]]:
     """cited_work が true の種類（資料が出典・参考として挙げた文献・作品）の概念を落とす（#50）。
 
@@ -2252,6 +2266,9 @@ def run_extraction(client, model: str, vocab: dict, lectures: list[Lecture], out
     linked = {x for r in relations for x in (r["from"], r["to"])}
     n_isolated = sum(1 for cid in concepts if cid not in linked)
     kind_counts = collections.Counter(c["kind"] for c in concepts.values())
+    dom = kind_dominance(kind_counts)
+    if dom["warning"]:
+        log(f"警告: 概念の {dom['share']:.0%} が種類「{dom['kind']}」に入っている。語彙の種類が粗い（語彙を作り直すと直る見込み）")
     stats = {
         "lectures": [l.number for l in lectures],
         "pages": total_pages,
@@ -2293,6 +2310,7 @@ def run_extraction(client, model: str, vocab: dict, lectures: list[Lecture], out
         "isolated_concepts": n_isolated,
         "relations_by_label": dict(label_counts.most_common()),
         "concepts_by_kind": dict(kind_counts.most_common()),
+        "kind_dominance": kind_dominance(kind_counts),                  # 1 つの種類に概念が偏っているか（#150）
         "dropped": dropped,
         "dropped_relations": concept_info["dropped_relations"],   # 落とした関係（理由・端の名前・ページ、#114）
         "loose_evidence": concept_info["loose_evidence"],         # 括弧書き・記号を除いて照合が通った関係の数
