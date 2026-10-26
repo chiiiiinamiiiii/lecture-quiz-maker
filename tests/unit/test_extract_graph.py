@@ -508,3 +508,58 @@ def test_direction_text_mentions_wide_kinds(monkeypatch):
                              pages_per_call=1, overlap=0, chunk_chars=0)
     assert "【向き: from は モデル・統計、to は モデル。両端とも モデル・統計・手法 のどれでもよい（向きは定義に従う）】" in seen[0]
     assert "【向き: from は 人物、to は モデル・手法】" in seen[0]
+
+
+# ---------------------------------------------------------------- 関係の端の名前（#119 のつづき）
+
+def test_merge_key_ignores_english_plural_article_hyphen_and_apostrophe():
+    mk = extraction.merge_key
+    assert mk("singular points") == mk("singular point") == mk("Singular Points")
+    assert mk("Eigenvalues") == mk("eigenvalue")
+    assert mk("system of linear equations") == mk("system of linear equation")
+    assert mk("A Predator–Prey System") == mk("predator-prey system") == mk("Predator Prey System")
+    assert mk("Student’s t-Distribution") == mk("Students t distribution")
+    assert mk("statistics") != mk("statistic")                          # ics は複数形の s として除かない
+    assert mk("analysis") == "analysis" and mk("class") == "class"
+    assert mk("A") != mk("a")                                           # 1 語だけの冠詞らしい語は除かない・記号は区別
+    assert mk("幸福(エウダイモニアー)") == mk("幸福")                    # 日本語は今までどおり
+
+
+def test_relation_ends_written_as_ids_are_resolved(monkeypatch):
+    """LLM が関係の端に label ではなく id（snake_case）を書いても、そのかたまりの概念につなぐ（#119）。"""
+    lectures = [lec(1, "Kono proposed the Otsu theory.", "Otsu theory again. Kono.")]
+    answers = {
+        (1, 1, 1): ([c("kono", "Kono", "人物", 1), c("otsu_theory", "Otsu theory", "学説", 1)],
+                    [rel("kono", "otsu_theory", 1, "Kono proposed the Otsu theory")]),
+        (1, 2, 2): ([], [rel("kono", "otsu_theory", 2, "Otsu theory again. Kono")]),   # ほかのかたまりの id、本文に名前あり
+    }
+    _, relations, info, dropped, _, _ = run(monkeypatch, lectures, answers, size=1)
+    assert [(r["from"], r["to"], r["source"]["page"]) for r in relations] == [("kono", "otsu_theory", 1)]
+    assert "存在しない概念" not in dropped and dropped["重複"] == 1
+
+
+def test_id_from_other_chunk_needs_name_in_this_chunk(monkeypatch):
+    lectures = [lec(1, "Kono proposed the Otsu theory.", "Nothing here about them.")]
+    answers = {
+        (1, 1, 1): ([c("kono", "Kono", "人物", 1), c("otsu_theory", "Otsu theory", "学説", 1)], []),
+        (1, 2, 2): ([], [rel("kono", "otsu_theory", 2, "Nothing here about them")]),
+    }
+    _, relations, _, dropped, _, _ = run(monkeypatch, lectures, answers, size=1)
+    assert relations == [] and dropped["存在しない概念"] == 1
+
+
+def test_plural_variants_merge_into_one_concept(monkeypatch):
+    lectures = [lec(1, "boundary points are checked.", "a boundary point here.", "boundary point again.")]
+    answers = {
+        (1, 1, 1): ([c("boundary_points", "boundary points", "学説", 1)], []),
+        (1, 2, 2): ([c("boundary_point", "boundary point", "学説", 2)], []),
+        (1, 3, 3): ([c("boundary_point", "boundary point", "学説", 3)], []),
+    }
+    concepts, *_ = run(monkeypatch, lectures, answers, size=1)
+    assert labels(concepts) == ["boundary point"]                       # 多く挙がった表記
+    (bp,) = concepts.values()
+    assert bp["id"] == "boundary_points" and [s["page"] for s in bp["sources"]] == [1, 2, 3]
+
+
+def test_prompt_says_relation_ends_are_labels_not_ids():
+    assert "label をそのまま書く（id ではなく label）" in extraction.EXTRACT_USER
