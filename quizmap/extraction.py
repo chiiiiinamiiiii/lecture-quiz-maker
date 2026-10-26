@@ -760,6 +760,16 @@ def person_aliases(concepts: dict[str, dict], person_kinds: set[str],
         if not ambiguous(cid, others):
             for o in others:
                 parent[find(cid)] = find(o)
+    # 1b) 区切りの無い漢字の名前（宮坂 と 宮坂道夫）: 短い名前（2 字以上）が長い名前の先頭と同じで、
+    #     合う長い名前が 1 人だけのときに合わせる（日本語の人名は姓が先で、区切りが無い）
+    kanji_names = {cid: n[0] for cid, n in people if not n[2] and not n[1] and _KANJI_RE.search(n[0])}
+    for cid, short in kanji_names.items():
+        if len(short) < 2:
+            continue
+        longer = [o for o, name in kanji_names.items() if o != cid and len(name) > len(short) and name.startswith(short)]
+        if len(longer) == 1 and not any(o != cid and name.startswith(short) and len(name) == len(short)
+                                        for o, name in kanji_names.items()):
+            parent[find(cid)] = find(longer[0])
     # 2) 姓だけの名前は、合う相手がみな 1 つの組（同じ人）にまとまっているときだけ、その組に合わせる
     for cid, n in people:
         if n[1] or not matches[cid]:
