@@ -1581,7 +1581,8 @@ CONNECT_CANDIDATES = 8          # 1 つの概念に付ける相手の候補の�
 CONNECT_OWN_PAGES = 2           # 1 つの概念に付ける、その概念が出るページの数
 CONNECT_SEARCH_K = 3            # 索引で近いページを取る数（候補の相手と、資料のページに 1 つ）
 COOCCURRENCE = "cooccurrence"   # 2 段目の関係の origin
-CONNECT_VIA = ("same_page", "adjacent_page", "same_lecture", "vector", "fallback")
+CONNECT_VIA = ("same_page", "adjacent_page", "same_lecture", "vector", "fallback", "over_cap")
+CONNECT_MAX_RECEIVED = int(os.environ.get("QUIZMAP_CONNECT_MAX_RECEIVED", "3"))   # 1 つの概念が受ける「関連」の上限
 
 
 def _degree(relations: list[dict]) -> collections.Counter:
@@ -1592,12 +1593,42 @@ def _degree(relations: list[dict]) -> collections.Counter:
     return deg
 
 
+def concept_vectors(index, concepts: dict[str, dict]) -> dict:
+    """概念ごとの、その概念が出るページの索引ベクトルの平均（長さ 1）。埋め込みは呼ばない（#127）。
+    索引が無ければ空。索引に無いページだけの概念は入れない。"""
+    import numpy as np
+
+    if index is None:
+        return {}
+    pos = {(p["lecture"], p["page"]): i for i, p in enumerate(index.pages)}
+    vectors = np.asarray(index.vectors, dtype=np.float32)
+    out = {}
+    for cid, c in concepts.items():
+        rows = [pos[p] for p in sorted(_pages_of(c)) if p in pos]
+        if rows:
+            q = vectors[rows].mean(axis=0)
+            n = float(np.linalg.norm(q))
+            if n:
+                out[cid] = q / n
+    return out
+
+
+def similarities(cid: str, vecs: dict) -> dict[str, float] | None:
+    """cid と各概念の内容の近さ（concept_vectors のコサイン類似度）。cid のベクトルが無ければ None。"""
+    if cid not in vecs:
+        return None
+    v = vecs[cid]
+    return {o: float(w @ v) for o, w in vecs.items() if o != cid}
+
+
 def connect_candidates(cid: str, concepts: dict[str, dict], on_page: dict, deg: collections.Counter,
-                       near_pages: list[dict] | None) -> list[tuple[str, str, tuple[int, int] | None]]:
+                       near_pages: list[dict] | None,
+                       sim: dict[str, float] | None = None) -> list[tuple[str, str, tuple[int, int] | None]]:
     """つながらない概念 cid の相手の候補（#127）。LLM も埋め込みも呼ばない。
 
     同じページに出る概念 → 前後のページ → 同じ回 → 索引で近いページ（near_pages。search_by_own_pages の結果）に出る概念の順。
-    各段の中は関係の多い順（同じ回は、ページの近い順を先に）、それも同じなら id の順。
+    各段の中は、sim（similarities）があれば内容の近い順。無ければ関係の少ない順（同じ回は、ページの近い順を先に）。
+    それも同じなら id の順。関係の多い順にしないのは、相手が一部の概念に集まって星形になるのを避けるため。
     戻り値: [(相手の id, 段（CONNECT_VIA）, 一緒に出るページ または None)]（重複なし、全件）
     """
     own = sorted(_pages_of(concepts[cid]))
@@ -1610,7 +1641,10 @@ def connect_candidates(cid: str, concepts: dict[str, dict], on_page: dict, deg: 
                 seen.add(o)
                 out.append((o, via, page_of(o)))
 
-    by_deg = lambda ids: sorted(ids, key=lambda o: (-deg[o], o))
+    def by_deg(ids):
+        if sim is not None:
+            return sorted(ids, key=lambda o: (-sim.get(o, -2.0), deg[o], o))
+        return sorted(ids, key=lambda o: (deg[o], o))
     same = {o: p for p in own for o in on_page.get(p, [])}
     push(by_deg(same), "same_page", lambda o: same[o])
     adj = {o: p for (l, n) in own for p in ((l, n - 1), (l, n + 1)) for o in on_page.get(p, [])}
@@ -1622,23 +1656,26 @@ def connect_candidates(cid: str, concepts: dict[str, dict], on_page: dict, deg: 
             d = min((abs(n - m) for ll, m in own if ll == l), default=0)
             for o in ids:
                 dist[o] = min(dist.get(o, d), d)
-    push(sorted(dist, key=lambda o: (dist[o], -deg[o], o)), "same_lecture", lambda o: None)
+    push(by_deg(dist) if sim is not None else sorted(dist, key=lambda o: (dist[o], deg[o], o)),
+         "same_lecture", lambda o: None)
     for h in near_pages or []:
         push(by_deg(on_page.get((h["lecture"], h["page"]), [])), "vector", lambda o: None)
     return out
 
 
 def connect_isolated(client, model, vocab, graph, pages, index, wiki, log=print,
-                     batch_size: int = CONNECT_BATCH, workers: int | None = None, use_llm: bool = True) -> dict:
+                     batch_size: int = CONNECT_BATCH, workers: int | None = None, use_llm: bool = True,
+                     max_received: int = CONNECT_MAX_RECEIVED) -> dict:
     """どの関係にもつながらない概念を、すべて 1 本以上の関係でつなぐ（#127）。新しい graph を返す（ファイルは書かない）。
 
     1 段目（use_llm かつ client があるとき）: つながらない概念を batch_size 個ずつ LLM に判定させる。各概念に
       相手の候補（connect_candidates の先頭 CONNECT_CANDIDATES 個）と、その概念のページ・索引で近いページ・Wikipedia の冒頭を
       付け、相手・ラベル・向き・evidence を 1 つずつ答えさせる。照合は verify_judgement（補完と同じ）。
       足す関係は origin "slide" / "external"、added_by "connect"。
-    2 段目（コード）: それでも残った概念ごとに、connect_candidates の先頭の相手と RELATED_LABEL でつなぐ。
+    2 段目（コード）: それでも残った概念ごとに、connect_candidates の順（段の中は内容の近い順）で、受けた「関連」が
+      max_received 本未満の先頭の相手と RELATED_LABEL でつなぐ（星形を避ける）。
       origin "cooccurrence"、added_by "connect"、via に段、source は一緒に出るページ（無ければその概念のページ）。
-      候補が無ければ（ページの無い概念など）、関係のいちばん多い概念とつなぐ（via "fallback"）。
+      候補が尽きたら、ほかのすべての概念を内容の近い順（索引が無ければ関係の少ない順）に見る（via "fallback"）。
     概念が 2 つ以上あれば、つながらない概念は必ず 0 になる。stats.connect に数と記録を残す。
     index（SlideIndex）と wiki（Wiki）は None でもよい。
     """
@@ -1663,6 +1700,7 @@ def connect_isolated(client, model, vocab, graph, pages, index, wiki, log=print,
     record = {"isolated_before": len(isolated), "stage1": {}, "stage2": {}, "isolated_after": 0}
     log(f"つながらない概念をつなぐ: {len(isolated)} 個")
     near: dict[str, list[dict] | None] = {}
+    vecs = concept_vectors(index, concepts)
     if index is not None and isolated:
         found = search_by_own_pages(index, [_pages_of(concepts[cid]) for cid in isolated], k=CONNECT_SEARCH_K)
         near = dict(zip(isolated, found))
@@ -1672,7 +1710,8 @@ def connect_isolated(client, model, vocab, graph, pages, index, wiki, log=print,
           "records": []}
     if use_llm and client is not None and isolated:
         deg = _degree(relations)
-        cands = {cid: connect_candidates(cid, concepts, on_page, deg, near.get(cid))[:CONNECT_CANDIDATES]
+        cands = {cid: connect_candidates(cid, concepts, on_page, deg, near.get(cid),
+                                         similarities(cid, vecs))[:CONNECT_CANDIDATES]
                  for cid in isolated}
         targets = [cid for cid in isolated if cands[cid]]
         articles: dict[str, dict | None] = {}
@@ -1780,19 +1819,28 @@ def connect_isolated(client, model, vocab, graph, pages, index, wiki, log=print,
     record["stage1"] = s1
 
     # ---- 2 段目
+    # 相手は候補の順（内容の近い順）。1 つの概念が受ける「関連」は max_received 本までで、達した概念は次の候補に回す。
+    # 候補が尽きたら、ほかのすべての概念を同じ順（内容の近い順、索引が無ければ関係の少ない順）で見る（fallback）。
+    # それでも上限で選べないとき（概念がとても少ない）だけ、上限を超えて受けの少ない概念とつなぐ（over_cap）
     added2, by_via = [], collections.Counter()
+    received = collections.Counter()
     for cid in isolated_now():
         if any(cid in (r["from"], r["to"]) for r in relations):
             continue                                  # この段で、ほかの概念の相手としてつながった
         deg = _degree(relations)
-        cands = connect_candidates(cid, concepts, on_page, deg, near.get(cid))
-        if cands:
-            partner, via, page = cands[0]
-        else:
-            others = sorted((o for o in concepts if o != cid), key=lambda o: (-deg[o], o))
-            if not others:
-                continue
-            partner, via, page = others[0], "fallback", None
+        sim = similarities(cid, vecs)
+        cands = connect_candidates(cid, concepts, on_page, deg, near.get(cid), sim)
+        listed = {o for o, _, _ in cands}
+        key = (lambda o: (-sim.get(o, -2.0), deg[o], o)) if sim is not None else (lambda o: (deg[o], o))
+        cands += [(o, "fallback", None) for o in sorted((o for o in concepts if o != cid and o not in listed), key=key)]
+        if not cands:
+            continue
+        pick = next((c for c in cands if received[c[0]] < max_received), None)
+        if pick is None:
+            o = min(cands, key=lambda c: (received[c[0]], cands.index(c)))[0]
+            pick = (o, "over_cap", None)
+        partner, via, page = pick
+        received[partner] += 1
         own = sorted(_pages_of(concepts[cid]))
         src = page or (own[0] if own else (sorted(_pages_of(concepts[partner])) or [(0, 0)])[0])
         rel = {"from": cid, "to": partner, "label": RELATED_LABEL, "origin": COOCCURRENCE,
@@ -1800,7 +1848,9 @@ def connect_isolated(client, model, vocab, graph, pages, index, wiki, log=print,
         relations.append(rel)
         added2.append(rel)
         by_via[via] += 1
-    record["stage2"] = {"added": len(added2), "by_via": {v: by_via[v] for v in CONNECT_VIA if by_via[v]}}
+    record["stage2"] = {"added": len(added2), "by_via": {v: by_via[v] for v in CONNECT_VIA if by_via[v]},
+                        "max_received": max(received.values(), default=0), "partners": len(received),
+                        "similarity": bool(vecs)}
     record["isolated_after"] = len(isolated_now())
     log(f"つなぐ 2 段目: 「{RELATED_LABEL}」で {len(added2)} 本（"
         + "、".join(f"{v} {n}" for v, n in record["stage2"]["by_via"].items()) + f"）。"
