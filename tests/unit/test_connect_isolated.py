@@ -312,3 +312,11 @@ def test_longer_names_skip_variants_of_the_same_concept():
     names = ["critical point", "Critical Points", "critical point of f", "Disease Rate (罹患率)"]
     assert extraction.longer_names("critical point", names) == ("critical point of f",)
     assert extraction.longer_names("Disease Rate", names) == ()
+
+
+def test_structure_rules_are_in_all_three_prompts():
+    for prompt in (extraction.EXTRACT_USER, extraction.COMPLETION_USER, extraction.CONNECT_USER):
+        assert "{structure_rules}" not in prompt
+        assert "部分と全体を表すラベルは、資料が全体をその部分から成るものとして書いているときだけ使う" in prompt
+        assert "一方が他方から計算されるだけのもの（1 − x、〜の確率）" in prompt
+        assert "書こうとしている関係の向きと合っているときだけ書く" in prompt
