@@ -138,3 +138,53 @@ def test_derive_vocab_retries_once_for_cited_only_ends(monkeypatch):
 
 def test_prompt_says_cited_kinds_are_not_relation_ends():
     assert "関係ラベルの from_kinds・to_kinds に cited_work の種類を入れない" in V.USER_TEMPLATE
+
+
+# ---------------------------------------------------------------- ラベルの組み合わせの偏り（#143）
+
+def srel(label, f, t, structure):
+    return {**rel(label, f, t), "structure": structure}
+
+
+def test_structure_gaps_for_example_only_labels():
+    v = {"kinds": KINDS3, "relations": [srel("Models", ["概念"], ["概念"], "例題の形"),
+                                        srel("Optimizes", ["概念"], ["概念"], "例題の形"),
+                                        srel("Tests", ["規範"], ["規範"], "用いる・適用"),
+                                        srel("Authored", ["人物"], ["概念"], "人物の主張・批判"), rel(OTHER_LABEL, [], [])]}
+    got = V.find_structure_gaps(v)
+    assert len(got) == 1 and "1 種類（用いる・適用）だけ" in got[0]        # 例題の形は 2 / 4 で半分を超えない
+    v["relations"][2]["structure"] = "例題の形"
+    got = V.find_structure_gaps(v)
+    assert any("例題の形だけのラベルが 3 / 4 個" in g for g in got)
+
+
+def test_structure_gaps_ok_and_same_kind_rule():
+    good = [srel("一種", ["概念"], ["概念"], "一種・下位概念"), srel("部分", ["概念"], ["概念"], "部分と全体"),
+            srel("前提", ["概念"], ["規範"], "前提・根拠"), srel("提唱", ["人物"], ["概念"], "人物の主張・批判")]
+    assert V.find_structure_gaps({"kinds": KINDS3, "relations": good}) == []
+    bad = [srel("一種", ["概念"], ["規範"], "一種・下位概念"), srel("部分", ["概念"], ["規範"], "部分と全体"),
+           srel("前提", ["概念"], ["規範"], "前提・根拠")]
+    assert "両端が同じ種類の概念どうしで使えるラベルが 0 / 3 個" in V.find_structure_gaps({"kinds": KINDS3, "relations": bad})[0]
+    assert V.find_structure_gaps({"kinds": KINDS3, "relations": [rel("前提", ["概念"], ["規範"])]}) == []   # 型の無い古い形
+
+
+def test_derive_vocab_retries_for_structure_gaps(monkeypatch):
+    from quizmap.common import Lecture
+    calls = []
+    first = [srel("Models", ["概念"], ["概念"], "例題の形"), srel("Optimizes", ["概念"], ["概念"], "例題の形")]
+    second = [srel("一種", ["概念"], ["概念"], "一種・下位概念"), srel("部分", ["概念"], ["概念"], "部分と全体"),
+              srel("用いる", ["概念"], ["概念"], "用いる・適用")]
+
+    def fake(client, *, model, system, user, schema, max_tokens=32000):
+        calls.append(user)
+        return {"course": "c", "kinds": KINDS3, "relations": first if len(calls) == 1 else second}
+    monkeypatch.setattr(V, "call_json", fake)
+    out = V.derive_vocab(None, "m", [Lecture(number=1, path=None, pages=["x"])], "c", log=lambda s: None)
+    assert len(calls) == 2 and "例題の形だけのラベル" in calls[1] and out["meta"]["kind_gaps"] == []
+    assert [r["label"] for r in out["relations"]] == ["一種", "部分", "用いる", OTHER_LABEL]
+    assert "一種・下位概念・部分と全体・対立・対比・具体例・前提・根拠・用いる・適用" in calls[0]
+
+
+def test_schema_has_structure():
+    items = V.SCHEMA["properties"]["relations"]["items"]
+    assert "structure" in items["required"] and "例題の形" in items["properties"]["structure"]["enum"]
