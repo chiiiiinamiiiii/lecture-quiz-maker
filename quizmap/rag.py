@@ -53,8 +53,27 @@ INDEX_VERSION = 1
 WIKI_CACHE_FILE = "wiki_cache.json"
 WIKI_USER_AGENT = ("LectureQuizMaker/0.1 (ICU LNG302 student project; "
                    "https://github.com/chiiiiinamiiiii/lecture-quiz-maker) python-requests")
-WIKI_TIMEOUT = 20.0
+WIKI_TIMEOUT = 20.0            # 応答を待つ秒数
+WIKI_CONNECT_TIMEOUT = 5.0     # 接続を待つ秒数。つながらないときに 20 秒待たず、すぐ 1 度だけやり直す（#107）
+WIKI_RETRIES = 1               # 接続の失敗・時間切れのとき、やり直す回数
 WIKI_MAX_EXTRACT = 3000        # 冒頭が長い記事はここで切る（キャッシュを小さく保つ）
+
+
+_http_local = threading.local()
+
+
+def _http_get(url: str, **kwargs):
+    """Wikipedia への GET。スレッドごとに Session を持ち、接続を使い回す（#107）。
+
+    1 回ごとに接続し直すと、85 語（GET 約 140 回）で 49 秒、使い回すと 26 秒だった（2026-10-26、数学のコース）。
+    テストはこの関数を差し替える。
+    """
+    import requests
+
+    session = getattr(_http_local, "session", None)
+    if session is None:
+        session = _http_local.session = requests.Session()
+    return session.get(url, **kwargs)
 
 
 # ---------------------------------------------------------------- embed
@@ -483,8 +502,15 @@ class Wiki:
     def _get(self, params: dict) -> dict:
         import requests
 
-        resp = requests.get(self.api, params={**params, "format": "json", "formatversion": 2},
-                            headers={"User-Agent": WIKI_USER_AGENT}, timeout=WIKI_TIMEOUT)
+        for attempt in range(WIKI_RETRIES + 1):
+            try:
+                resp = _http_get(self.api, params={**params, "format": "json", "formatversion": 2},
+                                 headers={"User-Agent": WIKI_USER_AGENT},
+                                 timeout=(WIKI_CONNECT_TIMEOUT, WIKI_TIMEOUT))
+                break
+            except (requests.ConnectionError, requests.Timeout):
+                if attempt == WIKI_RETRIES:
+                    raise
         resp.raise_for_status()
         return resp.json()
 

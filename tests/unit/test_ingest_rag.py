@@ -502,3 +502,42 @@ def test_generate_daily_quota_fails_ingest_with_reason(rag_fakes, monkeypatch):
     assert "Quota exceeded" not in job.error                       # API の生の本文は画面に出さない
     assert not any("Traceback" in m for m in job.log)               # traceback はサーバーのログだけ
     assert read_json(d / "job.json")["error"] == job.error
+
+
+# ------------------------------------------------------------------ 補完の内訳の秒数（#107）
+
+def test_rag_rebuild_logs_completion_breakdown(rag_fakes, monkeypatch):
+    """あとからの索引づくりでも、補完の段階の秒数と、候補選び・Wikipedia・判定の内訳を出す。"""
+    d = _ingested_course(rag_fakes)
+    looked = []
+
+    def lookup_many(self, terms, workers=None):
+        looked.append(list(terms))
+        return {t: None for t in terms}
+
+    monkeypatch.setattr(sys.modules["quizmap.rag"].Wiki, "lookup_many", lookup_many, raising=False)
+    inner = extraction.complete_relations
+
+    def complete_relations(client, model, vocab_, graph, pages, index, wiki, log=print):
+        wiki.lookup_many(["a", "b", "a"])
+        return inner(client, model, vocab_, graph, pages, index, wiki, log=log)
+
+    monkeypatch.setattr(extraction, "complete_relations", complete_relations)
+    job = _rebuild(d)
+    assert job.status == "done", job.log
+    assert looked == [["a", "b", "a"]]
+    assert any(m.startswith("   Wikipedia: 2 語を ") for m in job.log), job.log
+    assert any(m.startswith("   補完の内訳: 候補選び・検索 ") and "判定（LLM）" in m for m in job.log), job.log
+    assert any(m.startswith("   索引づくり: ") for m in job.log)
+    assert any(m.startswith("   関係の補完: ") and m.endswith(" 秒") for m in job.log), job.log
+    assert job.log[-1].startswith("完了（全体 ")
+    wiki = rag_fakes["complete_args"][3]
+    assert "lookup_many" not in wiki.__dict__                        # 包んだのは補完の間だけ
+
+
+def test_completion_breakdown_without_lookup_many(rag_fakes):
+    """Wikipedia の検索をしない補完でも内訳を出して止まらない。"""
+    d = _ingested_course(rag_fakes)
+    job = _rebuild(d)
+    assert job.status == "done", job.log
+    assert any("補完の内訳" in m and "Wikipedia 0 秒" in m for m in job.log), job.log

@@ -39,6 +39,11 @@ MAX_CALL_INTERVAL = float(os.environ.get("QUIZMAP_MAX_INTERVAL", "12"))
 INTERVAL_BACKOFF = 1.5
 INTERVAL_RECOVER_AFTER = 60.0   # 秒。この間 429 が無ければ、間隔を 1 段戻す
 MAX_RETRIES = 6
+# 1 回の呼び出しで応答を待つ秒数（#107）。前は 300 秒で、止まった 1 本が関係の補完を約 5 分止めた。
+# 実測の 362 回（取り込み 6 回分、2026-10-25〜26）では最長 62 秒。その 2 倍を超えたら打ち切って送り直す
+LLM_TIMEOUT = float(os.environ.get("QUIZMAP_LLM_TIMEOUT", "130"))
+LLM_CONNECT_TIMEOUT = 10.0     # 接続を待つ秒数
+SLOW_CALL_SEC = 60.0           # これより長くかかった呼び出しは記録に残す
 OTHER_LABEL = "その他"  # 仕様 §3: 当てはまらない関係のためのラベル。常に 1 つ用意する
 
 # ファイル名から講義回を読む。上から順に試す（「2026A GEH032 … 第10回」の 2026 を拾わないよう、
@@ -73,7 +78,7 @@ class LLMClient:
     """プロバイダ依存の情報をまとめた薄いクライアント。中身は他モジュールから触らない。"""
     api_key: str
     base_url: str = GEMINI_BASE_URL
-    timeout: float = 300.0
+    timeout: float = LLM_TIMEOUT          # 応答を待つ秒数（接続は LLM_CONNECT_TIMEOUT）
 
     def _headers(self) -> dict:
         return {"x-goog-api-key": self.api_key, "Content-Type": "application/json"}
@@ -400,16 +405,21 @@ def _post_with_retry(client: LLMClient, url: str, body: dict, retry_on_429: bool
     bucket = _bucket(url)
     for attempt in range(MAX_RETRIES + 1):
         _wait_for_slot(bucket)
+        t0 = time.monotonic()
         try:
-            resp = requests.post(url, headers=client._headers(), json=body, timeout=client.timeout)
+            resp = requests.post(url, headers=client._headers(), json=body,
+                                 timeout=(LLM_CONNECT_TIMEOUT, client.timeout))
         except requests.RequestException as e:
             if attempt == MAX_RETRIES:
                 raise
             delay = _retry_delay("", attempt)
-            print(f"  [retry] 通信エラー {type(e).__name__}: {delay:.0f} 秒待って再試行 ({attempt + 1}/{MAX_RETRIES})",
-                  file=sys.stderr)
+            print(f"  [retry] 通信エラー {type(e).__name__}（{time.monotonic() - t0:.0f} 秒で打ち切り）: "
+                  f"{delay:.0f} 秒待って再試行 ({attempt + 1}/{MAX_RETRIES})", file=sys.stderr)
             time.sleep(delay)
             continue
+        took = time.monotonic() - t0
+        if took > SLOW_CALL_SEC:
+            print(f"  [slow] {bucket} の呼び出しに {took:.0f} 秒かかった（HTTP {resp.status_code}）", file=sys.stderr)
         if resp.status_code == 200:
             if bucket == "generate":
                 _note_success()
@@ -481,7 +491,7 @@ def list_models(client: LLMClient) -> list[dict]:
         if token:
             params["pageToken"] = token
         resp = requests.get(f"{client.base_url}/models", headers=client._headers(), params=params,
-                            timeout=client.timeout)
+                            timeout=(LLM_CONNECT_TIMEOUT, client.timeout))
         if resp.status_code != 200:
             raise LLMError(resp.status_code, resp.text[:300])
         data = resp.json()
