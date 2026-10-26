@@ -62,6 +62,12 @@ Only the map drawing and the selection are plain code.
 
 **Map words are copied from the slides.** The user's rule is that every word on the map appears in the uploaded material. The model is told to copy each concept name exactly as written on the page. Code then checks the name against the page text. If it is not there, code looks for the nearest spelling on the page (spacing, middle dots, brackets, okurigana, a shorter part of the name), and if that fails, the model is asked once more to copy it from the page. A concept is never silently deleted: one whose name cannot be found is kept in the data, left off the map, and reported. A first version dropped such concepts; the user rejected that, and the design was changed.
 
+**Every concept gets at least one relation.** The user's rule is that no concept may stand alone on the map. After extraction and relation completion, a connect step takes every concept that still has no relation. First the model looks at it together with up to eight candidates (concepts on the same page, the neighbouring pages, the same lecture, and pages the search index finds similar), the slide text and Wikipedia, and returns the most certain relation with a quote, which is checked like any other relation. Whatever is still alone is then linked by code to a concept on the same page (or the nearest page) with a fixed label *Related*, drawn as a faint dotted line. One concept receives at most three such links, so no hub forms. *Related* links and Wikipedia-only links are never used as material for questions.
+
+**Each relation label carries a sentence template.** The vocabulary is derived per course, so the direction of a label (which end is the part, which end is the reason) used to be left to the model's reading, and direction errors reached the questions. Each label now has a template such as "{from} is a type of {to}". Extraction checks a relation by filling in the template, questions are generated from the filled-in sentences, and a question whose answer contradicts the sentence is removed. The vocabulary is re-derived once if it lacks structural labels (type, part, contrast, example, basis, application), if a label can only connect cited works, or if it has fewer than three content kinds.
+
+**Text that repeats on every page is removed before extraction.** The instructor's name in a slide footer was extracted as a concept and became the centre of 54 wrong relations. Strings that appear at the top or bottom of most pages, and page numbers, are now removed from the text given to the model. The text shown with slides and used for checking quotes is unchanged.
+
 
 **Every concept and relation keeps its page.** Hints, explanations and the slide shown after grading all depend on it.
 
@@ -204,12 +210,29 @@ Measured twice on Ethics imports with RAG on (flash-lite): round 1 with main `13
 - Round 1's check removed only good questions, because the model's quotes did not match the page text verbatim. After the fix (#91) a failed quote match is recorded instead of removing the question, and round 2 removed no good question. The check still rarely catches a bad question: the one bad question in round 2 was kept even though the model's own reasons named the other options as examples from the slides.
 - The only Wikipedia-backed relation (Kant → maxim) is correct, and the slides support it too; it was marked as external only because the model quoted a page without Kant's name.
 - Of 15 sampled "Other" relations in round 2, 6 could have taken a vocabulary label. Half of these were blocked because a concept had kind "Other": five book titles escaped the book filter that way.
+
+#### 6. Relation direction and two new courses (2026-10-26, `3309a4e`)
+
+Each relation label now has a sentence template and an "answer end", and relation questions whose answer is the wrong end are removed. Re-imported Mathematics (English slides) and Ethics; 6 ranges × 5 questions each, with the uniqueness check.
+
+| | Ethics, previous (RAG round 2) | Mathematics | Ethics |
+|---|---|---|---|
+| Questions (before → after checks) | 30 → 29 | 30 → 27 | 30 → 23 |
+| Usable / usable after a fix / not usable | 22 / 6 / 1 | 19 / 6 / 2 | 18 / 4 / 1 |
+| A distractor is actually correct (MCQ) | 1 / 24 | 1 / 22 | 1 / 18 |
+| Relation question reversed against the slides | 1 / 29 | 0 / 27 | 0 / 23 |
+| Removed by the direction check (actually reversed) | – | 0 | 3 (0) |
+| Random extracted relations: correct / ambiguous / wrong | – | 15 / 3 / 2 (of 20) | 14 / 5 / 1 (of 20) |
+
+- No question asked a relation against the slides. But all 3 questions the direction check removed were correct: two asked "which concept did Aristotle propose" (the answer end of *proposes* is the person), and one asked for the opposite of a concept (opposition holds both ways).
+- Ethics "grounds" relations: reversed 7 / 22 → 0 / 14 after the label definitions were aligned with the natural reading.
+- Mathematics uses "Part" for 65 / 179 relations; 38 of them are clearly correct.
 <!-- EVAL:END -->
 
 ## Known limitations
 
 - **Run-to-run variation.** Extraction runs once per import, and the derived vocabulary changes between runs (one ethics run had *opposes*, the next had *paraphrase* instead). The numbers in the evaluation are single runs; see the evaluation for the size of the variation.
-- **Many concepts have no relation.** After the chunked extraction, about 30% of the concepts on the ethics map (65 of 192 in the latest run) are not connected to any other concept. They can be selected but give no relation questions.
+- **Many concepts are connected only by *Related*.** Every concept has a relation, but on the newest imports 15–20% of relations are *Related* links that only say two concepts share a slide. They are not used for questions.
 - **Removing cited books can remove ideas with the same name.** *Social Contract* or *Escape from Freedom* were extracted only as book titles and were removed with them (issue #69). The removed titles are logged so this can be checked.
 - **Some relations are labelled "Other".** The share fell from 49–69% to 14–24% after the vocabulary fixes and the chunked extraction, and it still varies with the vocabulary each run derives.
 - **Some books escape the book filter.** A book whose kind is "Other" is not removed before relation extraction (issue #99).
