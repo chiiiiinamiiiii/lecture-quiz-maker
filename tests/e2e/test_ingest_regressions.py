@@ -103,4 +103,8 @@ def test_rag_phase_labels():
         st.session_state["lang"] = lang
         assert _phase_label("index") == idx
         assert _phase_label("completion") == comp
+    st.session_state["lang"] = "en"
+    assert _phase_label("connect") == "Connecting isolated concepts"      # #127 の段階
+    st.session_state["lang"] = "ja"
+    assert _phase_label("connect") == "つながらない概念をつなぐ"
     st.session_state["lang"] = "ja"

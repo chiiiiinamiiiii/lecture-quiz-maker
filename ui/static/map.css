@@ -55,12 +55,14 @@
 /* 地図下の帯: 左に操作の説明、右に凡例。幅が足りなければ説明の方を省略し、凡例は必ず全部見せる */
 .qm-band { position: absolute; z-index: 2; left: 12px; right: 12px; bottom: 58px; display: flex; align-items: flex-end; justify-content: space-between; gap: 8px; pointer-events: none; }
 .qm-band > .qm-glass { position: static; pointer-events: auto; }
-.qm-legend { flex: 0 0 auto; display: flex; gap: 12px; padding: 7px 11px; font-size: 11px; color: rgba(226, 224, 236, 0.75); white-space: nowrap; }
-.qm-legend span { display: inline-flex; align-items: center; gap: 6px; }
+/* 凡例の項目が増えても切れないよう、幅が足りなければ折り返す（#127 で線の種類が 2 つ増えた） */
+.qm-legend { flex: 0 1 auto; max-width: 70%; display: flex; flex-wrap: wrap; justify-content: flex-end; column-gap: 12px; row-gap: 3px; padding: 7px 11px; font-size: 11px; color: rgba(226, 224, 236, 0.75); }
+.qm-legend span { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
 .qm-legend i { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
 .qm-legend i.ring { background: transparent; border: 2px solid #ff7aac; width: 7px; height: 7px; box-shadow: 0 0 6px rgba(255, 122, 172, 0.7); }
+.qm-legend i.dots { width: 16px; height: 0; border-radius: 0; background: transparent; border-top: 1.5px dotted rgba(170, 170, 196, 0.6); }
 .qm-legend i.dash { width: 16px; height: 0; border-radius: 0; background: transparent; border-top: 1.5px dashed rgba(170, 170, 196, 0.9); }
-.qm-hint { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 5px 10px; font-size: 11px; color: rgba(226, 224, 236, 0.5); background: rgba(30, 29, 38, 0.45); }
+.qm-hint { flex: 0 1 auto; min-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 5px 10px; font-size: 11px; color: rgba(226, 224, 236, 0.5); background: rgba(30, 29, 38, 0.45); }
 
 /* 講義回ボタン（下端） */
 .qm-lectures {
@@ -89,5 +91,6 @@
 .qm-tooltip small { display: block; margin-top: 5px; color: rgba(226, 224, 236, 0.5); }
 .qm-tooltip .tag { margin-left: 6px; font-size: 10px; padding: 1px 6px; border-radius: 8px; background: rgba(16, 170, 156, 0.3); color: #7ff0e3; }
 .qm-tooltip .ext { font-size: 11px; color: #ffd38a; }
+.qm-tooltip .cooccur { font-size: 11px; color: rgba(226, 224, 236, 0.6); }
 .qm-tooltip small.ext-src { margin-top: 2px; color: rgba(255, 211, 138, 0.75); }
 .qm-tooltip .rel { color: #ff9cc2; margin: 0 4px; }
