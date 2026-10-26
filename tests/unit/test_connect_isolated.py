@@ -163,6 +163,24 @@ def test_fragment_names_missing_from_page():
     assert extraction.check_fragment_evidence("丙は丁説を唱えた", ends, PAGES[1]["text"], set()) == "両端の概念名が本文に無い"
 
 
+def test_name_matching_uses_whole_words_and_skips_longer_names():
+    assert not extraction.name_in("mean", "it was meant to be")
+    assert extraction.name_in("mean", "the sample mean.")
+    longer = extraction.longer_names("Exponential", ["exponential function", "Exponential", "Logarithm"])
+    assert longer == ("exponential function",)
+    assert not extraction.name_in("Exponential", "an exponential function.", longer)
+    assert extraction.name_in("Exponential", "Exponential decay and an exponential function.", longer)
+    assert not extraction.name_in("徳", "徳倫理学", ("徳倫理学",))
+    assert extraction.name_in("徳", "徳とは", ("徳倫理学",))
+
+
+def test_fragment_does_not_pass_on_part_of_a_longer_name():
+    ends = [concept("e", "Exponential", "学説", (1, 1)), concept("f", "exponential function", "学説", (1, 1))]
+    page = "The function describing the data is y = 2x, an exponential function."
+    assert extraction.check_fragment_evidence("an exponential function", ends, page, set(),
+                                              ("Exponential", "exponential function")) == "両端の概念名が本文に無い"
+
+
 def test_name_matching_ignores_case_plural_and_hyphen():
     assert extraction.name_in("Normal Distribution", "follows a normal distribution")
     assert extraction.name_in("Vectors", "Multiplication of Matrix and Vector")
@@ -179,7 +197,7 @@ def test_stage1_relation_passes_the_same_checks_as_completion(llm):
         num = targets(user)
         if "bo" not in num:
             return []
-        return [A(num["bo"], "hei", "bo", "hei", lecture=1, page=2, evidence="丙は戊説を唱えた"),   # 向きは直す
+        return [A(num["bo"], "hei", "hei", "bo", lecture=1, page=2, evidence="丙は戊説を唱えた"),
                 A(num["ki"], "nobody", "ki", "nobody", lecture=1, page=3, evidence="己説の話")]   # 候補に無い
     llm["answer"] = answer
     g = extraction.connect_isolated(object(), "m", VOCAB, graph(), pages, page_index(VEC), None, log=lambda *_: None,
@@ -191,10 +209,31 @@ def test_stage1_relation_passes_the_same_checks_as_completion(llm):
     st = g["stats"]["connect"]
     assert st["stage1"]["api_calls"] == 2 and st["stage1"]["added_slide"] == 1
     assert st["stage1"]["dropped"]["候補に無い相手"] == 1
-    assert st["stage1"]["adjusted"] == {"向きを直した": 1}
+    assert st["stage1"]["adjusted"] == {}
     assert st["isolated_after"] == 0 and st["stage2"]["added"] == 3
     prompt = llm["users"][0]
-    assert "候補:" in prompt and "必ず 1 件答える" in prompt and "[第1回 p2]" in prompt
+    assert "候補:" in prompt and "各概念について 1 件答える" in prompt and "[第1回 p2]" in prompt
+    assert "向きを入れ替えて種類に合わせない" in prompt and "部分と全体" in prompt and "題材を相手にした関係を作らない" in prompt
+
+
+def test_stage1_does_not_swap_direction_and_drops_reversed(llm):
+    """答えの向きで端の種類が合わなければ、入れ替えずに落とす（#135。その概念は 2 段目でつなぐ）。"""
+    pages = [dict(p) for p in PAGES]
+    pages[1]["text"] = "丙は戊説を唱えた。丁説もある。"
+    llm["answer"] = lambda user: [A(targets(user)["bo"], "hei", "bo", "hei", lecture=1, page=2,
+                                    evidence="丙は戊説を唱えた")] if "bo" in targets(user) else []
+    g = extraction.connect_isolated(object(), "m", VOCAB, graph(), pages, page_index(VEC), None, log=lambda *_: None)
+    st = g["stats"]["connect"]
+    assert st["stage1"]["added_slide"] == 0, st
+    assert st["stage1"]["dropped"].get("端の種類が逆向き") == 1, st["stage1"]["dropped"]
+    assert st["stage1"]["adjusted"] == {} and st["isolated_after"] == 0
+
+
+def test_stage1_empty_label_is_no_relation(llm):
+    llm["answer"] = lambda user: [{**A(n, "", "", "", label=""), "slide_found": False} for n in targets(user).values()]
+    g = extraction.connect_isolated(object(), "m", VOCAB, graph(), PAGES, page_index(VEC), None, log=lambda *_: None)
+    st = g["stats"]["connect"]
+    assert st["stage1"]["dropped"] == {"関係なし": 4} and st["stage2"]["added"] == 4
 
 
 def test_candidates_order():
@@ -265,3 +304,9 @@ def test_prefers_main_component_over_isolated_in_the_same_tier():
     assert rels["iso2"] in ("c", "iso1")            # iso1 はもう最大の連結成分に入っている
     concepts = {c["id"]: c for c in g["concepts"]}
     assert set(extraction.link_groups(concepts, g["relations"]).values()) == {0}   # 島が残らない
+
+
+def test_longer_names_skip_variants_of_the_same_concept():
+    names = ["critical point", "Critical Points", "critical point of f", "Disease Rate (罹患率)"]
+    assert extraction.longer_names("critical point", names) == ("critical point of f",)
+    assert extraction.longer_names("Disease Rate", names) == ()

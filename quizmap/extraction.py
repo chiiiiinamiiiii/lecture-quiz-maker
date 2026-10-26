@@ -132,6 +132,11 @@ def _squash(text: str) -> str:
     return _SPACE_RE.sub("", normalize_text(text))
 
 
+def _name_head(label: str) -> str:
+    """name_in で探す名前: 括弧の前。空白は残す（英語の名前を語の区切りで探すため、#135）。"""
+    return normalize_text(label).split("(")[0].strip()
+
+
 def _label_head(label: str) -> str:
     """概念名の照合用。括弧より前（例: 「理（ロゴス）を伴う活動」→「理」）。"""
     return _squash(label).split("(")[0]
@@ -195,17 +200,63 @@ def _name_keys(name: str) -> list[str]:
     return out
 
 
-def name_in(name: str, text: str) -> bool:
-    """概念名 name が text にあるか（_name_keys のどれかが _name_fold(text) に含まれる）。"""
+_WORD_SEP_RE = re.compile(r"[\s\u2010-\u2015\u2212_-]+")
+
+
+def _latin_name_re(name: str) -> re.Pattern | None:
+    """英語などの名前を、語の区切りで探す正規表現（#135）。大文字・小文字、語の間の空白・ハイフン、
+    最後の語の複数形の s・es を区別しない。日本語などを含む名前は None。"""
+    s = _APOS_RE.sub("", normalize_text(name))
+    if not _LATIN_RE.search(s) or _CJK_RE.search(s):
+        return None
+    words = [w for w in _WORD_SEP_RE.split(s) if w]
+    if not words:
+        return None
+    last = words[-1]
+    if len(last) >= 4 and last.lower().endswith("s") and not _KEEP_FINAL_S_RE.search(last.lower()):
+        last = last[:-1]
+    body = r"[\s\-]*".join(re.escape(w) for w in words[:-1] + [last])
+    return re.compile(r"(?<![A-Za-z0-9])" + body + r"(?:e?s)?(?![A-Za-z0-9])", re.I)
+
+
+def _latin_text(text: str) -> str:
+    return _WORD_SEP_RE.sub(" ", _APOS_RE.sub("", _DASH_RE.sub("-", normalize_text(text))))
+
+
+def name_in(name: str, text: str, longer: tuple[str, ...] = ()) -> bool:
+    """概念名 name が text にあるか。英語などの名前は語の区切りで探し（mean は meant に当たらない）、
+    日本語などは _name_keys のどれかが _name_fold(text) に含まれるか。
+    longer（name を含む、より長いほかの概念名）の中に出るだけの name は数えない（#135。
+    「exponential function」の中の「Exponential」）。"""
+    pat = _latin_name_re(name)
+    if pat is not None:
+        t = _latin_text(text)
+        for other in longer:
+            op = _latin_name_re(other)
+            if op is not None:
+                t = op.sub(" ", t)
+        return bool(pat.search(t))
     t = _name_fold(text)
+    for other in longer:
+        for k in _name_keys(other):
+            t = t.replace(k, "\0")
     return any(k in t for k in _name_keys(name))
+
+
+def longer_names(name: str, names) -> tuple[str, ...]:
+    """names のうち、name を含むより長い、別の概念の名前（name_in の longer に渡す）。
+    統合の鍵（merge_key）が同じ名前（複数形・大文字小文字・括弧書きの違い）は別の概念ではないので除く。"""
+    keys, own = _name_keys(name), merge_key(name)
+    return tuple(n for n in dict.fromkeys(names)
+                 if merge_key(n) != own and len(_name_fold(n)) > len(_name_fold(name))
+                 and any(k in _name_fold(n) for k in keys))
 
 
 def check_evidence(evidence: str, end_labels: list[str], page_text: str) -> str | None:
     """関係が出典ページに根拠を持つか（Issue #11）。落とす理由、または None を返す。"""
     if not evidence_in(evidence, page_text):
         return "evidence が本文に無い"
-    heads = [_label_head(l) for l in end_labels]
+    heads = [_name_head(l) for l in end_labels]
     if not any(h and name_in(h, page_text) for h in heads):
         return "両端の概念名が本文に無い"
     return None
@@ -478,10 +529,12 @@ END_KIND_MISMATCH_DEFAULT = os.environ.get("QUIZMAP_END_KIND_MISMATCH", "other")
 
 def check_end_kinds(f: str, t: str, label: str, concepts: dict[str, dict],
                     rel_by_label: dict[str, dict],
-                    wide: dict[str, list[str]] | None = None) -> tuple[str, str, str, str | None]:
+                    wide: dict[str, list[str]] | None = None,
+                    allow_swap: bool = True) -> tuple[str, str, str, str | None]:
     """関係の両端の概念の種類が、ラベルの from_kinds・to_kinds に合うか（Issue #49）。LLM は呼ばない。
 
     合えばそのまま。合わなければ逆向きで合うかを見て、合えば from と to を入れ替える（"swapped"）。
+    allow_swap が偽なら入れ替えない（つなぐ工程の 1 段目、#135。入れ替えると意味が逆になる例が多かった）。
     それでも合わず、ラベルが概念系の種類どうしのラベル（wide、concept_label_kinds）で両端がその種類なら、
     向きはそのままで残す（"widened"、#119）。
     それでも合わなければラベルを「その他」にする（"other"）。関係そのものは資料にあるかもしれないので落とさない。
@@ -497,7 +550,7 @@ def check_end_kinds(f: str, t: str, label: str, concepts: dict[str, dict],
     kf, kt = concepts[f]["kind"], concepts[t]["kind"]
     if kf in fk and kt in tk:
         return f, t, label, None
-    if kt in fk and kf in tk:
+    if allow_swap and kt in fk and kf in tk:
         return t, f, label, "swapped"
     allowed = (wide or {}).get(label)
     if allowed and kf in allowed and kt in allowed:
@@ -1279,7 +1332,7 @@ def check_external_evidence(evidence: str, end_labels: list[str], article: dict)
     if not evidence_in(evidence, _wiki_text(article)):
         return "evidence が記事に無い"
     where = article.get("title", "") + " " + _wiki_text(article)
-    if not all(h and name_in(h, where) for h in (_label_head(l) for l in end_labels)):
+    if not all(h and name_in(h, where) for h in (_name_head(l) for l in end_labels)):
         return "両端の概念名が記事に無い"
     return None
 
@@ -1290,7 +1343,7 @@ _NAME_SPLIT_RE = re.compile(r"[・･=＝\s]+")
 def _name_variants(concept: dict, person_kinds: set[str]) -> list[str]:
     """evidence の中で概念を見つけるための名前。括弧の前（_label_head）。人物の種類なら「・」などで区切った各部分も
     （「イマヌエル・カント」は「カント」でもよい。区切りの無い名前は全体だけ）。2 字未満の部分は使わない。"""
-    names = [_label_head(concept["label"])]
+    names = [_name_head(concept["label"])]
     if concept.get("kind") in person_kinds:
         head = normalize_text(concept["label"]).split("(")[0]
         names += [_squash(x) for x in _NAME_SPLIT_RE.split(head) if len(_squash(x)) >= 2]
@@ -1311,12 +1364,14 @@ _FRAGMENT_SEP_RE = re.compile(r"\s*(?:\.{3,}|…+|・・・|‥)\s*")
 FRAGMENTS_MAX = 2
 
 
-def check_fragment_evidence(evidence: str, ends: list[dict], page_text: str, person_kinds: set[str]) -> str | None:
+def check_fragment_evidence(evidence: str, ends: list[dict], page_text: str, person_kinds: set[str],
+                            all_labels: tuple[str, ...] = ()) -> str | None:
     """つなぐ工程の 1 段目の資料の根拠（#127）。落とす理由、または None を返す。
 
     evidence は同じページの本文から写した 1〜FRAGMENTS_MAX 個の断片（「...」「…」で区切る）でよい。
     断片はそれぞれ本文にそのまま有ること（evidence_in）。両端の名前は、それぞれ断片のどれかか同じページの本文に有り、
     少なくとも一方は断片の中に有ること（どちらの概念にも触れない断片を根拠にしない）。
+    名前は名前全体で探し、all_labels のうちその名前を含むより長い概念名の中に出るだけのものは数えない（#135）。
     """
     frags = [f for f in _FRAGMENT_SEP_RE.split(evidence or "") if _squash(f)]
     if not frags:
@@ -1326,8 +1381,9 @@ def check_fragment_evidence(evidence: str, ends: list[dict], page_text: str, per
     if not all(len(_squash(f)) >= 4 and evidence_in(f, page_text) for f in frags):
         return "evidence が本文に無い"
     names = [_name_variants(c, person_kinds) for c in ends]
-    in_frag = [any(name_in(n, f) for n in ns for f in frags) for ns in names]
-    if not all(hit or any(name_in(n, page_text) for n in ns) for hit, ns in zip(in_frag, names)):
+    longer = {n: longer_names(n, all_labels) for ns in names for n in ns}
+    in_frag = [any(name_in(n, f, longer[n]) for n in ns for f in frags) for ns in names]
+    if not all(hit or any(name_in(n, page_text, longer[n]) for n in ns) for hit, ns in zip(in_frag, names)):
         return "両端の概念名が本文に無い"
     if not any(in_frag):
         return "evidence にどちらの端も無い"
@@ -1343,14 +1399,18 @@ def verify_judgement(j: dict, pages_allowed: set, wiki_ids: list[str], articles:
     両端の名前が evidence にある）、通らなければ Wikipedia の根拠（記事が wiki_ids にあり両端の記事のどちらかで、
     evidence が記事にあり、両端の名前が evidence にある）の順に見る。
     fragments が真なら、資料の根拠は check_fragment_evidence で見る（つなぐ工程の 1 段目、#127）。
+    そのときは向きを入れ替えず、答えの向きで端の種類が合わなければ落とす（#135）。
     戻り値: (関係（origin を持てば通った。external の source は呼ぶ側が決める）, 根拠が通らなかった理由,
              "語彙にないラベル" / "端の種類が合わない"（ここで落とした）/ "swapped" / "widened" / None)
     """
     f, t, label = j["from"].strip(), j["to"].strip(), j["label"].strip()
     if label not in labels:
         return {}, [], "語彙にないラベル"
-    f, t, label, fix = check_end_kinds(f, t, label, concepts, rel_by_label, wide)
+    asked = label
+    f, t, label, fix = check_end_kinds(f, t, label, concepts, rel_by_label, wide, allow_swap=not fragments)
     if fix == "other":
+        if fragments and check_end_kinds(f, t, asked, concepts, rel_by_label, wide)[3] == "swapped":
+            return {}, [], "端の種類が逆向き"
         return {}, [], "端の種類が合わない"
     ends = [concepts[f]["label"], concepts[t]["label"]]
     end_concepts = [concepts[f], concepts[t]]
@@ -1361,7 +1421,8 @@ def verify_judgement(j: dict, pages_allowed: set, wiki_ids: list[str], articles:
         if page not in pages_allowed or page not in page_text:
             reason = "対に付けていないページ"
         elif fragments:
-            reason = check_fragment_evidence(j["slide_evidence"], end_concepts, page_text[page], person_kinds)
+            reason = check_fragment_evidence(j["slide_evidence"], end_concepts, page_text[page], person_kinds,
+                                             tuple(c["label"] for c in concepts.values()))
         else:
             reason = check_evidence(j["slide_evidence"], ends, page_text[page]) or \
                 check_ends_in_evidence(j["slide_evidence"], end_concepts, person_kinds)
@@ -1575,7 +1636,7 @@ CONNECT_SYSTEM = """あなたは大学の授業資料の概念どうしの関係
 CONNECT_USER = """授業「{course}」で、まだどの概念とも関係が無い概念があります。各概念について、候補の中から
 いちばん確かな関係を 1 つ選んでください。
 
-関係ラベル（これ以外は使わない。どれにも当てはまらなければ「{other}」）:
+関係ラベル（これ以外は使わない）:
 {relations}
 
 === 資料のページ（[第N回 pM] の形で示す） ===
@@ -1587,10 +1648,16 @@ CONNECT_USER = """授業「{course}」で、まだどの概念とも関係が無
 === つなぐ概念と、相手の候補 ===
 {targets}
 
-各概念について必ず 1 件答える（target にその概念の番号）。
+各概念について 1 件答える（target にその概念の番号）。確かな関係が無い概念は、label を空にし、
+slide_found と external_found を false にする（その概念は別の方法でつなぐので、無理に関係を作らない）。
 - partner: 候補の id から 1 つ。資料の記述でいちばん確かに結びつく相手を選ぶ
 - from・to・label: target の概念と partner の関係を、上のラベルの定義で表す。from と to は 2 つの id で、ラベルの定義が決める向きに従う。
-  そのラベルの例（「A → B」の A が from、B が to）と同じ向きで書く。どのラベルにも当てはまらなければ「{other}」にする
+  そのラベルの例（「A → B」の A が from、B が to）と同じ向きで書く。どのラベルにも当てはまらなければ label を空にする
+- 「〜の一種」「下位概念」を表すラベルは、from が to の一種であるときだけ使う。部分と全体（ネットワークとその枝など）、
+  並んだ別々の項目（候補として並べられた別の種類）、同じものの言い換え・同一視には使わない
+- ラベルの【向き】に合う向きで書けない関係は答えない（向きを入れ替えて種類に合わせない）
+- 例題・練習問題の題材（数値の例に出てくる人・物・病気・データなど）は、手法の具体例であって、手法が使う概念ではない。
+  題材を相手にした関係を作らない
 - 相手を選ぶ前に、各候補について、二つの概念の関係を書いた文が資料のページにあるかを確かめる。
   文が無い候補は選ばず、文がある別の候補を選ぶ（資料にある候補を、Wikipedia だけにある候補より先にする）
 - 資料の根拠: 資料のページに二つの概念を結びつける記述があれば slide_found を true にし、lecture と page にそのページを書く。
@@ -1869,22 +1936,23 @@ def connect_isolated(client, model, vocab, graph, pages, index, wiki, log=print,
                     dropped[reason] += 1
                     rec.update(result="rejected", reason=reason)
 
+                if not a["label"].strip() or not (a["slide_found"] or a["external_found"]):
+                    dropped["関係なし"] += 1                 # 確かな関係が無いと答えた（#135。2 段目でつなぐ）
+                    rec["result"] = "none"
+                    continue
                 if partner not in rec["candidates"]:
                     reject("候補に無い相手")
                     continue
                 if {a["from"].strip(), a["to"].strip()} != {cid, partner}:
                     reject("相手と端が合わない")
                     continue
-                if not (a["slide_found"] or a["external_found"]):
-                    reject("根拠なし")
-                    continue
                 if any(cid in (r["from"], r["to"]) for r in relations):
                     rec.update(result="already_linked")        # 同じ組の前の答えで、相手の側としてつながった
                     continue
                 rel, reasons, fix = verify_judgement(
-                    {**a, "label": a["label"].strip() or OTHER_LABEL}, set(page_keys), wiki_ids, articles,
+                    a, set(page_keys), wiki_ids, articles,
                     concepts, page_text, labels, rel_by_label, wide, person_kinds, fragments=True)
-                if fix in ("語彙にないラベル", "端の種類が合わない"):
+                if fix in ("語彙にないラベル", "端の種類が合わない", "端の種類が逆向き"):
                     reject(fix)
                     continue
                 if fix in ("swapped", "widened"):
