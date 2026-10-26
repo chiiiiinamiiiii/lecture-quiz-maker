@@ -647,6 +647,7 @@ def merge_key(label: str) -> str:
     return _ASCII_UPPER_RE.sub(lambda c: c.group().lower(), key) if len(key) >= 3 else key
 
 
+_TITLE_RE = re.compile(r"『[^『』]+』")
 _PERSON_SPLIT_RE = re.compile(r"[・･=＝\s]+")
 _LATIN_NAME_SPLIT_RE = re.compile(r"[\s.]+")
 _TITLES = {"dr", "prof", "mr", "mrs", "ms", "sir"}
@@ -664,10 +665,39 @@ def _person_name(label: str) -> tuple[str, list[str], bool] | None:
     surname = parts[-1].lower() if latin else _squash(parts[-1])
     if len(surname) < 2:
         return None
-    given = [p.lower() if latin else _squash(p) for p in parts[:-1]]
+    given = [p.lower() if latin else _squash(p).rstrip(".") for p in parts[:-1]]
+    given = [g for g in given if g]
     if latin:
         given = [g for g in given if g not in _TITLES]
     return surname, given, latin
+
+
+# 片仮名の名の最初の字から考えられるラテン文字の頭文字（G. W. ヘーゲル と ゲオルク・ヴィルヘルム・ヘーゲル を比べるため）
+_KANA_INITIALS = {}
+for _kana, _letters in {
+    "アァ": "A", "イィ": "IEY", "ウゥ": "UWO", "エェ": "EA", "オォ": "OA",
+    "カキクケコ": "KC", "ガギグゲゴ": "G", "サスセソ": "SC", "シ": "S", "ザズゼゾ": "Z", "ジ": "JGZ",
+    "タテト": "T", "チ": "CT", "ツ": "TZ", "ダデド": "D", "ヂヅ": "DZ", "ナニヌネノ": "N",
+    "ハヒヘホ": "H", "フ": "FH", "バビブベボ": "BV", "パピプペポ": "P", "マミムメモ": "M",
+    "ヤユヨャュョ": "YJ", "ラリルレロ": "RL", "ワ": "WV", "ヲ": "O", "ヴ": "VW",
+}.items():
+    for _k in _kana:
+        _KANA_INITIALS[_k] = set(_letters)
+_INITIAL_RE = re.compile(r"[A-Za-z]{1,2}")
+
+
+def _given_compatible(x: str, y: str) -> bool:
+    """名の 1 語どうしが食い違わないか（日本語などの表記の人名）。同じ語、またはラテン文字の頭文字と片仮名の名で
+    片仮名の最初の字の音が頭文字に合うもの（G と ゲオルク、W と ヴィルヘルム）。"""
+    if x == y:
+        return True
+    xi, yi = bool(_INITIAL_RE.fullmatch(x)), bool(_INITIAL_RE.fullmatch(y))
+    if xi and yi:
+        return x[0].upper() == y[0].upper()
+    if xi != yi:
+        initial, kana = (x, y) if xi else (y, x)
+        return initial[0].upper() in _KANA_INITIALS.get(kana[:1], set())
+    return False
 
 
 def _same_person(a: tuple, b: tuple) -> bool:
@@ -680,7 +710,7 @@ def _same_person(a: tuple, b: tuple) -> bool:
     if not ga or not gb:
         return True                                  # 片方が姓だけ
     if not a[2]:
-        return ga == gb
+        return all(_given_compatible(x, y) for x, y in zip(ga, gb))
     return all(x[0] == y[0] and (len(x) == 1 or len(y) == 1 or x == y) for x, y in zip(ga, gb))
 
 
@@ -703,15 +733,25 @@ def person_aliases(concepts: dict[str, dict], person_kinds: set[str],
         return x
 
     named = dict(people)
-    # 合う相手どうしが別人なら（姓だけの名前が、同じ姓の 2 人に合う）、その概念はどれともまとめない
-    ambiguous = {cid for cid, others in matches.items()
-                 if any(not _same_person(named[x], named[y]) for i, x in enumerate(others) for y in others[i + 1:])}
-    for cid, others in matches.items():
-        if cid in ambiguous:
-            continue
-        for o in others:
-            if o not in ambiguous:
+    # 1) 名が両方に書かれた組どうしを先にまとめる（G. W. ヘーゲル と ゲオルク・ヴィルヘルム・フリードリヒ・ヘーゲル）。
+    #    ある名前が、互いに別人の 2 人と合うときは、その名前はまとめない
+    full = {cid for cid, n in people if n[1]}
+
+    def ambiguous(cid, others):
+        return any(not _same_person(named[x], named[y]) for i, x in enumerate(others) for y in others[i + 1:])
+
+    for cid in full:
+        others = [o for o in matches[cid] if o in full]
+        if not ambiguous(cid, others):
+            for o in others:
                 parent[find(cid)] = find(o)
+    # 2) 姓だけの名前は、合う相手がみな 1 つの組（同じ人）にまとまっているときだけ、その組に合わせる
+    for cid, n in people:
+        if n[1] or not matches[cid]:
+            continue
+        roots = {find(o) for o in matches[cid] if o in full} or {find(o) for o in matches[cid]}
+        if len(roots) == 1:
+            parent[find(cid)] = roots.pop()
     groups: dict[str, list[str]] = collections.defaultdict(list)
     for cid, _ in people:
         groups[find(cid)].append(cid)
@@ -977,6 +1017,12 @@ def extract_graph(client, model: str, course: str, vocab: dict, lectures: list[L
         c["lectures"].sort()
         c["label"] = _display_label(surface_count[cid], surface_order[cid])
         c["kind"] = _majority_kind(kind_order[cid])
+    # 『』で囲まれた名前（作品の題名）は人物ではない（#127 のつづき。作品が人物の種類になっていた）。
+    # 地図からは消さず、種類を「その他」にする（本の種類にすると出典として落ちるので）
+    titled = [cid for cid, c in concepts.items() if c["kind"] in person_kinds and _TITLE_RE.fullmatch(c["label"].strip())]
+    for cid in titled:
+        concepts[cid]["kind"] = OTHER_LABEL
+    info["titles_not_person"] = [concepts[cid]["label"] for cid in titled]
     # 同じ人物の別の書き方（姓だけ・頭文字。カント / イマヌエル・カント、L.M.Sullivan / Lisa M. Sullivan）をまとめる
     alias = person_aliases(concepts, person_kinds, {cid: sum(v.values()) for cid, v in surface_count.items()})
     merged_people = collections.defaultdict(list)
@@ -2215,7 +2261,8 @@ def run_extraction(client, model: str, vocab: dict, lectures: list[Lecture], out
         "merged_mentions": concept_info["merged_mentions"],
         "merged_variants": concept_info["merged_variants"],
         "merged_variant_examples": concept_info["merged_variant_examples"],
-        "merged_people": concept_info.get("merged_people", []),       # 同じ人物の別の書き方をまとめた組（姓だけ・頭文字）
+        "merged_people": concept_info.get("merged_people", []),
+        "titles_not_person": concept_info.get("titles_not_person", []),  # 『』の名前で人物の種類だったもの（その他にした）       # 同じ人物の別の書き方をまとめた組（姓だけ・頭文字）
         "concepts_listed_by_lecture": concept_info["listed_by_lecture"],
         "new_concepts_by_lecture": concept_info["new_by_lecture"],
         "label_fixed_count": len(concept_info["label_fixes"]),

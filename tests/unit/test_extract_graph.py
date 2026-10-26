@@ -610,3 +610,31 @@ def test_extract_graph_merges_people_and_their_relations(monkeypatch):
     assert k["id"] == "kant" and [s["page"] for s in k["sources"]] == [1, 2, 3]   # id も多く挙がったほう
     assert sorted((r["from"], r["to"]) for r in relations) == [("kant", "hei"), ("kant", "otsu")]
     assert info["merged_people"] == [["イマヌエル・カント", "カント"]]
+
+
+@pytest.mark.parametrize("a, b, same", [
+    ("G. W. ヘーゲル", "ゲオルク・ヴィルヘルム・フリードリヒ・ヘーゲル", True),    # 頭文字と片仮名の名
+    ("R. G. コリングウッド", "ロビン・ジョージ・コリングウッド", True),
+    ("G. E. ムーア", "ジョージ・エドワード・ムーア", True),
+    ("G. W. ヘーゲル", "ヨハン・ヘーゲル", False),                                  # G と ヨ は合わない
+    ("ジョン・ミル", "ジョン・スチュアート・ミル", True),
+])
+def test_same_person_initials_and_katakana(a, b, same):
+    assert extraction._same_person(extraction._person_name(a), extraction._person_name(b)) is same
+
+
+def test_surname_only_joins_after_full_names_are_merged():
+    concepts = {x["id"]: x for x in [P("g1", "ゲオルク・ヴィルヘルム・フリードリヒ・ヘーゲル"), P("g2", "ヘーゲル"),
+                                     P("g3", "G. W. ヘーゲル"), P("mill", "ミル"), P("jm", "ジョン・ミル"),
+                                     P("jam", "ジェームズ・ミル")]}
+    alias = extraction.person_aliases(concepts, {"人物"}, {"g2": 5})
+    assert alias == {"g1": "g2", "g3": "g2"}          # 3 つが 1 つに。ミルは別人 2 人なのでまとめない
+
+
+def test_title_in_double_brackets_is_not_a_person(monkeypatch):
+    lectures = [lec(1, "エンデの『モモ』を読む。")]
+    answers = {(1, 1, 1): ([c("momo", "『モモ』", "人物", 1), c("ende", "エンデ", "人物", 1)], [])}
+    concepts, _, info, *_ = run(monkeypatch, lectures, answers, size=1)
+    kinds = {x["label"]: x["kind"] for x in concepts.values()}
+    assert kinds == {"『モモ』": OTHER_LABEL, "エンデ": "人物"}
+    assert info["titles_not_person"] == ["『モモ』"]
