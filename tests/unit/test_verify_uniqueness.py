@@ -246,3 +246,21 @@ def test_cooccurrence_relation_is_treated_like_external():
     q = mcq(aspect="relation", used=("丁説", "丙", "関連"))
     assert quiz.uses_external_relation(q, COOC_GRAPH)
     assert not quiz.uses_external_relation(mcq(aspect="relation", used=("甲野", "乙説", "提唱")), COOC_GRAPH)
+
+
+def test_generate_quiz_drops_relation_question_with_reversed_answer(monkeypatch):
+    """正答になる端（answer_end、#156）と正答が逆の関係の問題は外し、数を meta に残す。"""
+    style = {"label": "提唱", "definition": "from が人物、to が学説", "question_style": "A（to）を唱えた人物（from）を問う",
+             "example": "", "template": "{from}は{to}を唱えた", "answer_end": "from"}
+    right = mcq(aspect="relation", used=("甲野", "乙説", "提唱"))                     # 正答は 甲野（from）
+    wrong = {**mcq(qid="q_02", choices=("乙説", "丙", "戊", "己"), aspect="relation", used=("甲野", "乙説", "提唱"))}
+
+    def fake(client, *, model, system, user, schema, max_tokens=32000):
+        assert "「甲野は乙説を唱えた」" in user and "正答は「甲野」" in user
+        return {"questions": [{**right, "distractor_reasons": []}, {**wrong, "distractor_reasons": []}]}
+    monkeypatch.setattr(quiz, "call_json", fake)
+    vocab = {"meta": {"language": "ja"}, "relations": [style]}
+    out = quiz.generate_quiz(None, "m", GRAPH, vocab, PAGES, ["kouno", "otsu"], 2, verify=False)
+    assert [x["id"] for x in out["questions"]] == ["q_01"]
+    assert out["meta"]["dropped_relation_direction"] == 1
+    assert any("q_02" in w and "外した" in w for w in out["warnings"])

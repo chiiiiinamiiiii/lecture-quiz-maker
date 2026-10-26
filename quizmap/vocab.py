@@ -71,7 +71,8 @@ USER_TEMPLATE = """以下は「{course_hint}」という授業の資料です（
  (b) 定義（どういうときにこのラベルを付けるか。from が何で to が何かを、「from」「to」という語を使って必ず書くこと。
      例: from が手段、to が目的。下位の概念のラベルなら from が下位か上位か、部分と全体のラベルなら from が部分か全体か、
      具体例のラベルなら from が具体例か抽象的な概念かを書く）
- (c) その関係をクイズにするときの問い方（例: 「AとBの違いを問う」「誰がAを提唱したかを問う」）
+ (c) その関係をクイズにするときの問い方（例: 「AとBの違いを問う」「誰がAを提唱したかを問う」）。
+     A・B を使うときは、A が from か to かを書く（例: 「A（to）の根拠になる概念（from）を問う」）
  (d) 資料中の実例（「A → B」のように概念名で。from → to の順。定義に書いた向きと同じ向きで）
  (e) from 側・to 側になる概念の種類（下で提案する種類の名前で。複数可）。
      from 側・to 側の種類は、そのラベルの実例として資料に出てくる関係の両端の種類をすべて含めること。
@@ -79,6 +80,11 @@ USER_TEMPLATE = """以下は「{course_hint}」という授業の資料です（
      対立・対比のラベルには、資料で対比される両端の種類をすべて含めること（学説どうしだけでなく、概念どうし、制度と意思など）
  (f) そのラベルの関係の型 structure（次から 1 つ）: {structures}
      どれにも当たらず、特定の例題・練習問題の形（関数が現象を記述する、関数を最大化する など）だけを表すなら「例題の形」
+ (g) 文の型 template: 「{{from}}」「{{to}}」を必ず 1 つずつ含み、二つの概念の名前を入れるとそのまま関係を述べる文になる型
+     （例: 「{{from}}は{{to}}の根拠である」「{{from}}は{{to}}の一種である」「{{from}} is a part of {{to}}」）。
+     ふつうの読み方の向きにする（根拠なら from が理由、to が判断・結果。一種なら from が下位、to が上位）。
+     定義・実例・問い方は、この文の型と同じ向きで書く（実例「A → B」の A・B を型に入れると、資料どおりの文になること）
+ (h) answer_end: その関係を問う問題で正答になる端（"from" か "to"）。問い方 (c) と合わせる
 を書いてください。
 
 ラベルの組み合わせについて:
@@ -151,9 +157,11 @@ SCHEMA = {
                     "from_kinds": {"type": "array", "items": {"type": "string"}},
                     "to_kinds": {"type": "array", "items": {"type": "string"}},
                     "structure": {"type": "string", "enum": list(STRUCTURES)},
+                    "template": {"type": "string"},
+                    "answer_end": {"type": "string", "enum": ["from", "to"]},
                 },
                 "required": ["label", "definition", "question_style", "example", "from_kinds", "to_kinds",
-                             "structure"],
+                             "structure", "template", "answer_end"],
                 "additionalProperties": False,
             },
         },
@@ -360,6 +368,28 @@ def find_content_kind_gaps(vocab: dict) -> list[str]:
     return problems
 
 
+def relation_sentence(rel: dict, a: str, b: str) -> str | None:
+    """ラベルの文の型 template に、from の名前 a と to の名前 b を入れた文（#155）。型が無い・使えない（古い vocab）なら None。"""
+    t = (rel or {}).get("template") or ""
+    if t.count("{from}") != 1 or t.count("{to}") != 1:
+        return None
+    return t.replace("{from}", a).replace("{to}", b)
+
+
+def find_template_gaps(vocab: dict) -> list[str]:
+    """文の型 template が使えないラベル（#155）。作り直しの不足として文で返す。型の無い古い形の答えでは確かめない。"""
+    rels = [r for r in vocab["relations"] if r["label"] != OTHER_LABEL]
+    if not any("template" in r for r in rels):
+        return []
+    problems = []
+    for r in rels:
+        if relation_sentence(r, "A", "B") is None:
+            problems.append(f"関係「{r['label']}」の文の型 template に「{{from}}」と「{{to}}」が 1 つずつ入っていない")
+        if r.get("answer_end") not in ("from", "to"):
+            problems.append(f"関係「{r['label']}」の answer_end が from でも to でもない")
+    return problems
+
+
 def find_cited_ends(vocab: dict) -> list[str]:
     """from_kinds か to_kinds が cited_work の種類だけのラベル（#141）。作り直しの不足として文で返す。"""
     cited = {k["name"] for k in vocab["kinds"] if k.get("cited_work") is True}
@@ -434,7 +464,7 @@ def derive_vocab(client, model: str, lectures, course_hint: str, log=print) -> d
     # 不足を伝えて 1 回だけ作り直させる
     # （人間の確認は挟まない）
     gaps = find_kind_gaps(vocab) + find_cited_ends(vocab) + find_structure_gaps(vocab) + find_direction_gaps(vocab) \
-        + find_content_kind_gaps(vocab)
+        + find_content_kind_gaps(vocab) + find_template_gaps(vocab)
     retried = False
     if gaps:
         log("関係の端になる種類が足りない。1 回だけ作り直す: " + " / ".join(gaps))
@@ -447,7 +477,7 @@ def derive_vocab(client, model: str, lectures, course_hint: str, log=print) -> d
             ),
         )
         gaps = find_kind_gaps(vocab) + find_cited_ends(vocab) + find_structure_gaps(vocab) + find_direction_gaps(vocab) \
-        + find_content_kind_gaps(vocab)
+        + find_content_kind_gaps(vocab) + find_template_gaps(vocab)
         if gaps:
             log("警告: 作り直しても関係の端になる種類が足りない: " + " / ".join(gaps))
     cited_ends = drop_cited_ends(vocab)
@@ -467,6 +497,8 @@ def derive_vocab(client, model: str, lectures, course_hint: str, log=print) -> d
         "example": "",
         "from_kinds": [],
         "to_kinds": [],
+        "template": "",
+        "answer_end": "",
     })
     vocab["meta"] = {
         "generated_at": dt.datetime.now().isoformat(timespec="seconds"),

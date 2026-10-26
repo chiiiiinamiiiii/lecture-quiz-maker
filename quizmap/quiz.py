@@ -15,6 +15,7 @@ import unicodedata
 from collections import Counter
 
 from quizmap.common import OTHER_LABEL, call_json
+from quizmap.vocab import relation_sentence
 
 # 関係を問う問題の材料にしない関係の origin（#127）。external は Wikipedia だけが根拠、cooccurrence は資料の上で
 # 近くに出るだけの「関連」で、どちらも答えが資料の記述から導けない
@@ -170,16 +171,26 @@ def materials_text(concepts, selected, inner, neighbors, needed, page_text, styl
     parts.append("\n## 出題範囲の概念どうしの関係（関係を問う問題はここから作る）")
     if inner:
         definition = {v["label"]: v["definition"] for v in styles}
+        style_of = {v["label"]: v for v in styles}
         for r in inner:
             a, b = concepts[r["from"]]["label"], concepts[r["to"]]["label"]
-            # 向きを言葉にする（#32）。ラベルの定義に from / to の説明があればそれで A・B のどちらが何かが決まる
-            parts.append(f"- {a} —{r['label']}→ {b}（from は「{a}」、to は「{b}」。{r['label']}の意味: {definition.get(r['label'], '')}）"
-                         f" [第{r['source']['lecture']}回p.{r['source']['page']}]")
+            src = f" [第{r['source']['lecture']}回p.{r['source']['page']}]"
+            sentence = relation_sentence(style_of.get(r["label"]), a, b)
+            if sentence:
+                # 文の型に名前を入れた文で渡し、問うときに示す概念と正答の概念も書く（#155・#156。LLM に向きを読み解かせない）
+                ask = relation_answer(style_of[r["label"]], a, b)
+                how = f"この関係を問うときは「{ask[0]}」を示し、正答は「{ask[1]}」" if ask else ""
+                parts.append(f"- 「{sentence}」（{r['label']}。from は「{a}」、to は「{b}」。{how}）{src}")
+            else:
+                # 向きを言葉にする（#32）。ラベルの定義に from / to の説明があればそれで A・B のどちらが何かが決まる
+                parts.append(f"- {a} —{r['label']}→ {b}（from は「{a}」、to は「{b}」。{r['label']}の意味: "
+                             f"{definition.get(r['label'], '')}）{src}")
     else:
         parts.append("- （なし）")
     parts.append("\n## 関係ラベルごとの出題の方針（出題者向け。この文を問題文に書き写さない）")
     for v in styles:
-        parts.append(f"- {v['label']}: 定義「{v['definition']}」／出題の方針「{v['question_style']}」／例: {v['example']}")
+        form = f"／文の型「{v['template']}」／正答になる端: {v['answer_end']}" if relation_sentence(v, "A", "B") else ""
+        parts.append(f"- {v['label']}: 定義「{v['definition']}」／出題の方針「{v['question_style']}」{form}／例: {v['example']}")
     parts.append("\n## 誤答に使ってよい隣接概念（地図上で隣り合う概念。紛らわしい誤答にする。concept_labels には書かない）")
     for cid, ns in neighbors.items():
         if ns:
@@ -203,6 +214,7 @@ def gen_user(materials: str, n: int, counts: dict[str, int], n_short: int) -> st
 - 問題文に、正答に当たる関係ラベルの名前（「関係ラベルごとの出題の方針」にあるラベル名）を書かない
 - 1 つの問題で問うラベルは 1 つだけ
 - 関係を問う問題では、材料の関係の from と to を入れ替えない。出題の方針の A・B がどちらに当たるかは、関係の行の括弧の説明で決める
+- 関係の行に「この関係を問うときは「X」を示し、正答は「Y」」とあれば、問題文で X を示し、正答を Y にする（逆にしない）
 - relation_used には、関係を問う問題で根拠にした関係の行の from・to・label を、概念の表記そのままで書く。関係を問う問題でなければ 3 つとも空文字列にする
 - 具体例を問う問題は、資料が概念の例として挙げている事例・比喩・身近な例（例: 第◯回で概念 X の例として挙げられている事柄）と概念の対応を問う。概念の定義文を言い換えて語を当てさせる問題は、具体例ではなく定義の問題として数える
 - 資料に具体例が見つからない概念で、具体例の問題を作らない。具体例の枠が埋まらなければ、その分を定義の問題にして、aspect を definition にする
@@ -350,6 +362,52 @@ def fix_answer_index(q: dict, before: dict | None) -> tuple[dict | None, list[st
 
 
 # ------------------------------------------------------------------ 関係の向き（#32）
+
+def relation_answer(style: dict | None, a: str, b: str) -> tuple[str, str] | None:
+    """ラベルの answer_end から、(問題で示す概念, 正答の概念)（#156）。a は from、b は to の名前。決まらなければ None。"""
+    end = (style or {}).get("answer_end")
+    if end == "from":
+        return b, a
+    if end == "to":
+        return a, b
+    return None
+
+
+RELATION_DIRECTION_REASON = "関係を問う問題の向き・正答が、材料の関係と逆"
+
+
+def relation_direction_problem(q: dict, inner: list[dict], concepts: dict[str, dict], styles: list[dict]) -> str | None:
+    """関係を問う問題を外す理由（#156）。LLM は呼ばない。外さないなら None。
+
+    - relation_used が材料の関係と逆向き
+    - ラベルに answer_end があり、正答（answer_text）が正答になるべき端の概念ではなく、もう一方の端の概念
+    relation_used が材料に無い問題は、ここでは外さない（check_relation_direction の警告のまま）。
+    """
+    if q.get("aspect") != "relation":
+        return None
+    used = q.get("relation_used") or {}
+    f, t, label = (_norm(used.get(k, "")) for k in ("from", "to", "label"))
+    if not (f and t and label):
+        return None
+    style_of = {_norm(v["label"]): v for v in styles}
+    for r in inner:
+        a, b = concepts[r["from"]]["label"], concepts[r["to"]]["label"]
+        if _norm(r["label"]) != label:
+            continue
+        if (_norm(b), _norm(a)) == (f, t) and (_norm(a), _norm(b)) != (f, t):
+            return RELATION_DIRECTION_REASON
+        if (_norm(a), _norm(b)) != (f, t):
+            continue
+        ask = relation_answer(style_of.get(label), a, b)
+        if ask is None:
+            return None
+        answer = _norm(q.get("answer_text", ""))
+        right, wrong = _norm(ask[1]), _norm(ask[0])
+        if answer and right not in answer and wrong in answer:
+            return RELATION_DIRECTION_REASON
+        return None
+    return None
+
 
 def check_relation_direction(q: dict, inner: list[dict], concepts: dict[str, dict]) -> list[str]:
     """関係を問う問題の relation_used が、材料の関係と同じ向きかを確かめる。警告だけ出す（LLM は呼ばない）。"""
@@ -908,6 +966,10 @@ def generate_quiz(client, model: str, graph: dict, vocab: dict, pages: list[dict
 
     # (3) 自動検証
     direction_warnings = [w for q in final for w in check_relation_direction(q, inner, concepts)]
+    # 関係の向き・正答が材料と逆の問題は外す（#156。逆の模範解答で採点されるのを防ぐ）
+    dropped_direction = [q.get("id", "?") for q in final if relation_direction_problem(q, inner, concepts, styles)]
+    final = [q for q in final if q.get("id", "?") not in dropped_direction]
+    direction_warnings += [f"{qid}: {RELATION_DIRECTION_REASON}ので外した" for qid in dropped_direction]
     style_warnings = [w for q in final for w in check_prompt_style(q, styles)]
     warnings = (["aspect を自己確認で直した: " + c for c in aspect_changes] + answer_warnings + resolve_warnings + direction_warnings + style_warnings
                 + validate(final, confirmed_ids, pages))
@@ -928,6 +990,7 @@ def generate_quiz(client, model: str, graph: dict, vocab: dict, pages: list[dict
         "source_pages": len(needed),
         "materials_chars": len(materials),
         "distractors_replaced": n_replaced,
+        "dropped_relation_direction": len(dropped_direction),
         "api_calls": calls,
         "seconds": round(time.monotonic() - t0, 1),
     }
