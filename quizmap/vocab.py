@@ -79,6 +79,7 @@ USER_TEMPLATE = """以下は「{course_hint}」という授業の資料です（
 - 資料に、ある概念を別の概念の具体例として挙げる記述や、ある概念を別の語で言い換える記述があれば、それを表すラベルも検討すること。ただし数合わせでラベルを足さないこと
 
 同様に、概念の「種類」も 4〜8 個提案してください。各種類について、名前・定義・資料中の実例（3 つ以上）を書いてください。
+- 実例は概念の名前で書く。数式・等式、変数や記号、数値の例、ソフトやウェブツールの名前は実例にしない
 - 種類は授業全体を通して使える分類の軸に限る。特定の回や特定の人物・話題でしか使わない種類は作らない
 - 各種類について、その種類に属する概念が、資料が出典・参考・引用元として挙げた文献・作品（本・論文・報告書・記事・作品など）であれば cited_work を true、そうでなければ false にする。
   文献・作品と、授業の内容の概念・人物を同じ種類に混ぜない
@@ -249,6 +250,27 @@ def widen_person_targets(vocab: dict) -> list[str]:
         r["to_kinds"] = to_kinds + added
         notes.append(f"関係「{r['label']}」の to_kinds に {'・'.join(added)} を足した（人物を主語とするラベルの相手が狭かったため）")
     return notes
+
+
+def concept_label_kinds(vocab: dict) -> dict[str, list[str]]:
+    """概念系の種類どうしのラベルと、その端に許す種類（#119）。vocab は書き換えない。LLM は呼ばない。
+
+    語彙の from_kinds・to_kinds が狭く、意味の上では合う関係まで端の種類の照合で「その他」になっていた
+    （#98 で人物を主語とするラベルに行ったのと同じ問題）。
+    規則: from_kinds・to_kinds がどちらも空でなく、どちらにも人物（person）・出典の文献（cited_work）の種類が無いラベルは、
+    両端に「人物以外かつ cited_work 以外」の種類をすべて許す。種類は名前ではなく旗で決めるので分野に依らない。
+    旗の無い古い vocab.json では何も返さない。
+    """
+    if not any("person" in k or "cited_work" in k for k in vocab["kinds"]):
+        return {}
+    content = [k["name"] for k in vocab["kinds"] if k.get("person") is not True and k.get("cited_work") is not True]
+    out = {}
+    for r in vocab["relations"]:
+        fk, tk = set(r.get("from_kinds") or []), set(r.get("to_kinds") or [])
+        if r["label"] == OTHER_LABEL or not fk or not tk or not (fk | tk) <= set(content):
+            continue
+        out[r["label"]] = content
+    return out
 
 
 def derive_vocab(client, model: str, lectures, course_hint: str, log=print) -> dict:
