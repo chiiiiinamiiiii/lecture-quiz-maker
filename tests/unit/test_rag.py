@@ -201,7 +201,7 @@ def fake_wiki(monkeypatch):
             "fullurl": f"https://ja.wikipedia.org/wiki/{title}",
         }]}})
 
-    monkeypatch.setattr(requests, "get", get)
+    monkeypatch.setattr(rag, "_http_get", get)
     return calls
 
 
@@ -234,7 +234,7 @@ def test_wiki_network_error_returns_none_and_is_not_cached(tmp_path, fake_wiki):
     wiki = rag.Wiki(tmp_path, "ja")
     assert wiki.lookup("落ちる語") is None
     assert wiki.lookup("落ちる語") is None
-    assert len(fake_wiki) == 2                   # 失敗は覚えず、次も試す
+    assert len(fake_wiki) == 2 * (rag.WIKI_RETRIES + 1)   # 失敗は覚えず、次も試す（1 回ごとに 1 度やり直す）
     assert not (tmp_path / "wiki_cache.json").exists()
 
 
@@ -355,7 +355,7 @@ def wiki_titles(monkeypatch):
         return FakeResponse(200, {"query": {"pages": [{
             "title": params["titles"], "extract": "冒頭。", "fullurl": "https://ja.wikipedia.org/wiki/x"}]}})
 
-    monkeypatch.setattr(requests, "get", get)
+    monkeypatch.setattr(rag, "_http_get", get)
     return state
 
 

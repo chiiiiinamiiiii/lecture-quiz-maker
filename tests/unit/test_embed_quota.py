@@ -187,7 +187,7 @@ def wiki_api(monkeypatch):
         return Resp(200, {"query": {"pages": [{"title": title, "extract": f"{title} の説明",
                                                "fullurl": f"https://ja.wikipedia.org/wiki/{title}"}]}})
 
-    monkeypatch.setattr(requests, "get", get)
+    monkeypatch.setattr(rag, "_http_get", get)
     return state
 
 

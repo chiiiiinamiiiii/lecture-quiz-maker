@@ -450,7 +450,7 @@ def _extract_with_rag(job: Job, d: Path, client, model: str, vocab: dict, lectur
     else:
         try:
             wiki = rag.Wiki(d, language_of(vocab, [p["text"] for p in pages]))
-            graph = extraction.complete_relations(client, model, vocab, graph, pages, index, wiki, log=job.add)
+            graph = _complete_timed(job, client, model, vocab, graph, pages, index, wiki)
             write_json(d / "graph.json", graph)
         except Exception as e:  # noqa: BLE001  抽出だけの地図を残す
             job.add(f"関係の補完に失敗した（抽出だけの地図を使う）: {error_text(e)}")
@@ -482,9 +482,10 @@ def start_rag_rebuild(d: Path, model: str = DEFAULT_MODEL) -> Job:
 
 
 def _run_rag_rebuild(job: Job, d: Path, model: str) -> None:
-    from quizmap import extraction, rag
+    from quizmap import rag
     from quizmap.vocab import language_of
 
+    t_start = time.monotonic()
     try:
         pages = read_json(d / "pages.json")
         vocab = read_json(d / "vocab.json")
@@ -501,12 +502,13 @@ def _run_rag_rebuild(job: Job, d: Path, model: str) -> None:
         job.set_phase("completion")
         write_json(before, graph)
         wiki = rag.Wiki(d, language_of(vocab, [p["text"] for p in pages]))
-        graph = extraction.complete_relations(client, model, vocab, graph, pages, index, wiki, log=job.add)
+        graph = _complete_timed(job, client, model, vocab, graph, pages, index, wiki)
         write_json(d / "graph.json", graph)
         rename_course(d, vocab["course"])
+        job.end_phase()                          # 「関係の補完: N 秒」
         job.progress = 1.0
         job.status = "done"
-        job.add("完了")
+        job.add(f"完了（全体 {time.monotonic() - t_start:.0f} 秒）")
     except Exception as e:  # noqa: BLE001  画面に理由を出す。graph.json はそのまま残る
         job.status = "error"
         job.error = error_text(e)
@@ -515,6 +517,40 @@ def _run_rag_rebuild(job: Job, d: Path, model: str) -> None:
     finally:
         job.finished_at = now()
         job.save()
+
+
+def _complete_timed(job: Job, client, model: str, vocab: dict, graph: dict, pages: list[dict], index, wiki) -> dict:
+    """関係の補完を走らせ、内訳の秒数をログに出す（#107）。取り込みと、あとからの索引づくりの両方で使う。
+
+    「候補選び・検索」（索引で近いページを探す）、「Wikipedia」（記事を引く）、「判定」（LLM）に分ける。
+    Wikipedia の検索の前後は wiki.lookup_many を包んで測る。
+    """
+    from quizmap import extraction
+
+    t: dict[str, float] = {"start": time.monotonic()}
+    lookup_many = getattr(wiki, "lookup_many", None)
+
+    def timed_lookup(terms, *args, **kwargs):
+        t["wiki_start"] = time.monotonic()
+        try:
+            return lookup_many(terms, *args, **kwargs)
+        finally:
+            t["wiki_end"] = time.monotonic()
+            n = len(set(terms))
+            job.add(f"   Wikipedia: {n} 語を {t['wiki_end'] - t['wiki_start']:.0f} 秒で引いた")
+
+    if lookup_many is not None:
+        wiki.lookup_many = timed_lookup          # このインスタンスだけ包む（クラスは変えない）
+    try:
+        graph = extraction.complete_relations(client, model, vocab, graph, pages, index, wiki, log=job.add)
+    finally:
+        if lookup_many is not None:
+            wiki.__dict__.pop("lookup_many", None)
+    end = time.monotonic()
+    ws, we = t.get("wiki_start", end), t.get("wiki_end", end)
+    job.add(f"   補完の内訳: 候補選び・検索 {ws - t['start']:.0f} 秒、Wikipedia {we - ws:.0f} 秒、"
+            f"判定（LLM）{end - we:.0f} 秒")
+    return graph
 
 
 def _index_progress(job: Job):
