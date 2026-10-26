@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -116,7 +117,7 @@ def test_strip_boilerplate_changes_only_prompt_pages():
     assert lecs[0].prompt_page(2).startswith(TOPICS[1])
     assert report["chars_removed"] > 0
     lines = boilerplate.report_lines(report)
-    assert "Tomoo Matsumura" in lines[0] and "24 ページ" in lines[0] and "ページ番号" in lines[1]
+    assert "Tomoo Matsumura" in lines[0] and "24 ページ" in lines[0] and any("ページ番号" in line for line in lines)
 
 
 def test_prompt_page_falls_back_to_pages():
@@ -193,3 +194,45 @@ def test_frequent_subject_word_in_body_is_kept():
 def test_word_once_per_page_in_the_middle_is_kept():
     pages = [f"{filler(i, 25)} probability {filler(i + 40, 25)}" for i in range(12)]
     assert boilerplate.find_repeated(pages) == []
+
+
+# ------------------------------------------------------------------ 決まり文句の残り（講師名の間に別の字が入ったもの）
+
+def _with_name_remnants():
+    lecs = [math_lecture(n) for n in range(1, 7)]           # 48 ページ。名前の残りは 3 ページ
+    lecs[0].pages[3] += " impact on you Tomoo We Matsumura can begin"
+    lecs[1].pages[2] += " file:///Users/tomoomatsumura/Downloads/board.png"
+    lecs[2].pages[4] += " 1 −oo Matsumura 2 4"
+    return lecs
+
+
+def test_name_remnants_are_removed_from_prompts():
+    lecs = _with_name_remnants()
+    report = boilerplate.strip_boilerplate(lecs)
+    assert [w["text"] for w in report["words"]] == ["Tomoo", "Matsumura", "TomooMatsumura"]
+    joined = " ".join(p for l in lecs for p in l.prompt_pages)
+    assert not re.search(r"(?i)tomoo|matsumura", joined)
+    assert "impact on you We can begin" in joined and "file:///Users/ /Downloads/board.png" in joined
+    assert any("ほとんど出ない語" in line and "Matsumura" in line for line in boilerplate.report_lines(report))
+
+
+def test_ordinary_header_words_are_kept_in_body():
+    """見出しの帯 'NATURAL LANGUAGE PROCESSING · ICU' を除いても、本文の表の見出し 'NATURAL LANGUAGE' や
+    'Natural language' は残す（小文字の natural・language がふつうの語として出るため）。"""
+    pages = [f"{filler(i)} NATURAL LANGUAGE PROCESSING · ICU" for i in range(10)]
+    pages[3] = "Natural language (vs. artificial language) NATURAL LANGUAGEARTIFICIAL LANGUAGE " + pages[3]
+    pages[5] = "language processing pipelines " + pages[5]
+    lecs = [Lecture(1, Path("1.pdf"), pages)]
+    report = boilerplate.strip_boilerplate(lecs)
+    assert report["repeated"] == [{"text": "NATURAL LANGUAGE PROCESSING · ICU", "pages": 10}]
+    assert report["words"] == []
+    assert lecs[0].prompt_pages[3].startswith("Natural language (vs. artificial language) NATURAL LANGUAGEARTIFICIAL")
+
+
+def test_word_often_outside_the_boilerplate_is_kept():
+    lecs = _with_name_remnants()
+    for i in range(1, 7):                                  # 名前の外にも何度も出る語は、決まり文句の残りとはみなさない
+        lecs[0].pages[i] += " Matsumura theorem"
+    report = boilerplate.strip_boilerplate(lecs)
+    assert "Matsumura" not in [w["text"] for w in report["words"]]
+    assert "Matsumura theorem" in " ".join(lecs[0].prompt_pages)
