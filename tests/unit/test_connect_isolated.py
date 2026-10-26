@@ -214,6 +214,8 @@ def test_stage1_relation_passes_the_same_checks_as_completion(llm):
     prompt = llm["users"][0]
     assert "候補:" in prompt and "各概念について 1 件答える" in prompt and "[第1回 p2]" in prompt
     assert "向きを入れ替えて種類に合わせない" in prompt and "部分と全体" in prompt and "題材を相手にした関係を作らない" in prompt
+    assert "資料が二つを同じものとして書いているときだけ使う" in prompt and "総称とその中身" in prompt   # #142
+    assert "種類と意味の両方に合うときだけ" in prompt and "作品や登場人物を論じた人" in prompt
 
 
 def test_stage1_does_not_swap_direction_and_drops_reversed(llm):
