@@ -21,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from quizmap.common import OTHER_LABEL, Lecture, call_json, normalize_text, write_json
-from quizmap.vocab import kind_examples, language_name, language_of, language_rule
+from quizmap.vocab import concept_label_kinds, kind_examples, language_name, language_of, language_rule
 
 # ------------------------------------------------------------------ 概念と関係の抽出（かたまりごとに 1 回、#107）
 
@@ -47,6 +47,8 @@ EXTRACT_USER = """授業「{course}」の第{lecture}回の資料のうち、p.{
 - 授業の中で筋や内容が論じられている作品（劇・小説・報告書など）は、出典として挙がっているだけの本と区別する。
   作品そのものを【出典の文献】ではない種類で挙げ、内容を表す概念（その作品の中の対立や原則など）も挙げる
 - 一方で、資料に書かれていない概念を足さない
+- 数式・等式そのもの、変数や記号の名前、数値の例（計算の途中や答え）、ソフト・ウェブツール・計算サイトの名前は、
+  概念として挙げない。数式や記号が表す概念の名前（その式が何のモデル・法則・量か）が本文に書かれていれば、その名前を挙げる
 - label は、そのページの本文に書かれている表記を、そのまま写す（言い換え・要約・表記の統一・送り仮名の変更をしない）。
   短い{language}の語句にする（文にしない）
 - id は label をローマ字にした snake_case の ASCII（例: kant, gimu_ron）
@@ -418,12 +420,22 @@ def _chunk_as_prompt_text(lec: Lecture, pages: list[int]) -> str:
     return "\n".join(parts)
 
 
-def _direction_text(rel: dict) -> str:
-    """関係ラベルの向き（from 側・to 側の種類）。旧形式の vocab.json には無いので空にする。"""
+def _direction_text(rel: dict, wide: list[str] | None = None) -> str:
+    """関係ラベルの向き（from 側・to 側の種類）。旧形式の vocab.json には無いので空にする。
+    wide（concept_label_kinds）があれば、両端にその種類のどれでもよいことを添える（#119）。"""
     f, t = rel.get("from_kinds") or [], rel.get("to_kinds") or []
     if not f and not t:
         return ""
-    return f"【向き: from は {'・'.join(f) or '指定なし'}、to は {'・'.join(t) or '指定なし'}】"
+    extra = f"。両端とも {'・'.join(wide)} のどれでもよい（向きは定義に従う）" if wide else ""
+    return f"【向き: from は {'・'.join(f) or '指定なし'}、to は {'・'.join(t) or '指定なし'}{extra}】"
+
+
+_FORMULA_RE = re.compile(r"[=<>≤≥→]")
+
+
+def prompt_kind_examples(kind: dict) -> list[str]:
+    """プロンプトに載せる種類の実例（#119）。数式・等式の実例は載せない（概念として数式を挙げさせないため）。"""
+    return [e for e in kind_examples(kind) if not _FORMULA_RE.search(e)]
 
 
 # 端の種類が合わない関係の扱い（#49）。"other" はラベルを「その他」にして残す、"drop" は関係を落とす。
@@ -433,10 +445,13 @@ END_KIND_MISMATCH_DEFAULT = os.environ.get("QUIZMAP_END_KIND_MISMATCH", "other")
 
 
 def check_end_kinds(f: str, t: str, label: str, concepts: dict[str, dict],
-                    rel_by_label: dict[str, dict]) -> tuple[str, str, str, str | None]:
+                    rel_by_label: dict[str, dict],
+                    wide: dict[str, list[str]] | None = None) -> tuple[str, str, str, str | None]:
     """関係の両端の概念の種類が、ラベルの from_kinds・to_kinds に合うか（Issue #49）。LLM は呼ばない。
 
     合えばそのまま。合わなければ逆向きで合うかを見て、合えば from と to を入れ替える（"swapped"）。
+    それでも合わず、ラベルが概念系の種類どうしのラベル（wide、concept_label_kinds）で両端がその種類なら、
+    向きはそのままで残す（"widened"、#119）。
     それでも合わなければラベルを「その他」にする（"other"）。関係そのものは資料にあるかもしれないので落とさない。
     from_kinds・to_kinds が空のラベル（旧形式の vocab）と「その他」は照合しない。
     戻り値: (from, to, label, 直した内容 または None)
@@ -452,6 +467,9 @@ def check_end_kinds(f: str, t: str, label: str, concepts: dict[str, dict],
         return f, t, label, None
     if kt in fk and kf in tk:
         return t, f, label, "swapped"
+    allowed = (wide or {}).get(label)
+    if allowed and kf in allowed and kt in allowed:
+        return f, t, label, "widened"
     return f, t, OTHER_LABEL, "other"
 
 
@@ -507,15 +525,24 @@ def extraction_chunks(n_pages: int, size: int = CONCEPT_PAGES, overlap: int = CH
 
 _MERGE_QUOTES = set("「」\"“”")
 _TRAILING_GLOSS_RE = re.compile(r"^(.+?)\([^()]*\)$")
+_ASCII_UPPER_RE = re.compile(r"[A-Z]")
 
 
 def merge_key(label: str) -> str:
     """概念を同じものとしてまとめる鍵（#107・#114）: NFKC にし、空白・中黒・イコールの違いを無視する。
     かぎ括弧（「」）の有無と、末尾の括弧書き（「幸福(エウダイモニアー)」の訳語・原語）の有無も無視する。
-    『』は無視しない（書名と、同じ名前の学説を分けるため）。括弧の中の語（ロゴス）とは別の概念のまま。"""
+    『』は無視しない（書名と、同じ名前の学説を分けるため）。括弧の中の語（ロゴス）とは別の概念のまま。
+    ラテン文字の大文字・小文字は区別しない（#119。Derivative / derivative）。ただし 3 字未満の鍵（変数名など。P と p）は区別する。"""
     key = _folded(label, _MERGE_DROP | _MERGE_QUOTES)[0]
     m = _TRAILING_GLOSS_RE.match(key)
-    return m.group(1) if m else key
+    key = m.group(1) if m else key
+    return _ASCII_UPPER_RE.sub(lambda c: c.group().lower(), key) if len(key) >= 3 else key
+
+
+def _majority_kind(kinds: list[str]) -> str:
+    """まとめた概念の種類（#119）: 多く挙がった種類。「その他」より vocab の種類を先にし、同じなら先に出たほう。"""
+    counts = collections.Counter(kinds)
+    return min(dict.fromkeys(kinds), key=lambda k: (k == OTHER_LABEL, -counts[k], kinds.index(k)))
 
 
 def _display_label(counts: collections.Counter, first: list[str]) -> str:
@@ -543,10 +570,11 @@ def extract_graph(client, model: str, course: str, vocab: dict, lectures: list[L
     system = EXTRACT_SYSTEM.replace("{language_rule}", language_rule(lang))
     kinds_text = "\n".join(
         f"- {k['name']}{'【出典の文献】' if k.get('cited_work') is True else ''}: {k['definition']}"
-        f"（例: {'、'.join(kind_examples(k))}）" for k in vocab["kinds"]
+        + (f"（例: {'、'.join(ex)}）" if (ex := prompt_kind_examples(k)) else "") for k in vocab["kinds"]
     )
+    wide = concept_label_kinds(vocab)
     rel_text = "\n".join(
-        f"- {r['label']}: {r['definition']}{_direction_text(r)}（例: {r['example']}）"
+        f"- {r['label']}: {r['definition']}{_direction_text(r, wide.get(r['label']))}（例: {r['example']}）"
         for r in vocab["relations"] if r["label"] != OTHER_LABEL
     )
     kind_names = {k["name"] for k in vocab["kinds"]}
@@ -713,6 +741,7 @@ def extract_graph(client, model: str, course: str, vocab: dict, lectures: list[L
     first_label_of: dict[str, set[str]] = collections.defaultdict(set)
     surface_count: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
     surface_order: dict[str, list[str]] = collections.defaultdict(list)
+    kind_order: dict[str, list[str]] = collections.defaultdict(list)    # まとめた挙げ方の種類（出た順、重複あり）
     new_of = collections.Counter()
     for m in mentions:
         lec, first, last = jobs[m["job"]]
@@ -739,6 +768,7 @@ def extract_graph(client, model: str, course: str, vocab: dict, lectures: list[L
             new_of[lec.number] += 1
         first_label_of[cid].add(m["surface"])
         surface_count[cid][m["surface"]] += 1
+        kind_order[cid].append(m["kind"])
         if m["surface"] not in surface_order[cid]:
             surface_order[cid].append(m["surface"])
         chunk_texts = m.get("ask_pages") and {p: lec.pages[p - 1] for p in m["ask_pages"]} \
@@ -756,6 +786,7 @@ def extract_graph(client, model: str, course: str, vocab: dict, lectures: list[L
         c["sources"].sort(key=lambda s: (s["lecture"], s["page"]))
         c["lectures"].sort()
         c["label"] = _display_label(surface_count[cid], surface_order[cid])
+        c["kind"] = _majority_kind(kind_order[cid])
     n_mentions = sum(1 for m in mentions if m["surface"])
     info.update({
         "mentions": n_mentions,
@@ -824,9 +855,11 @@ def extract_graph(client, model: str, course: str, vocab: dict, lectures: list[L
             if label not in labels:
                 dropped["vocab にないラベル→その他"] += 1
                 label = OTHER_LABEL
-            f, t, label, fix = check_end_kinds(f, t, label, concepts, rel_by_label)
+            f, t, label, fix = check_end_kinds(f, t, label, concepts, rel_by_label, wide)
             if fix == "swapped":
                 adjusted["向きを直した"] += 1
+            elif fix == "widened":
+                adjusted["端の種類を広げて残した"] += 1
             elif fix == "other" and end_kind_mismatch == "drop":
                 drop("端の種類が合わない", r, lec.number)
                 continue
@@ -837,7 +870,11 @@ def extract_graph(client, model: str, course: str, vocab: dict, lectures: list[L
                 continue
             page = r["page"]
             ends = [concepts[f]["label"], concepts[t]["label"]]
-            reason = check_evidence(r.get("evidence", ""), ends, lec.pages[page - 1])
+            r["evidence"] = r.get("evidence") or ""
+            if not _squash(r["evidence"]):
+                drop("evidence が空", r, lec.number)
+                continue
+            reason = check_evidence(r["evidence"], ends, lec.pages[page - 1])
             if reason:
                 drop(reason, r, lec.number)
                 continue
@@ -1253,8 +1290,9 @@ def complete_relations(client, model, vocab, graph, pages, index, wiki, log=prin
          "judgement": None, "result": "no_answer", "reason": "", "relation": None}
         for p in pairs
     ]
+    wide = concept_label_kinds(vocab)
     rel_text = "\n".join(
-        f"- {r['label']}: {r['definition']}{_direction_text(r)}（例: {r['example']}）"
+        f"- {r['label']}: {r['definition']}{_direction_text(r, wide.get(r['label']))}（例: {r['example']}）"
         for r in vocab["relations"] if r["label"] in labels
     )
     dropped = collections.Counter()
@@ -1331,12 +1369,14 @@ def complete_relations(client, model, vocab, graph, pages, index, wiki, log=prin
             if label not in labels:
                 reject("語彙にないラベル")
                 continue
-            f, t, label, fix = check_end_kinds(f, t, label, concepts, rel_by_label)
+            f, t, label, fix = check_end_kinds(f, t, label, concepts, rel_by_label, wide)
             if fix == "other":
                 reject("端の種類が合わない")
                 continue
             if fix == "swapped":
                 adjusted["向きを直した"] += 1
+            elif fix == "widened":
+                adjusted["端の種類を広げて残した"] += 1
             ends = [concepts[f]["label"], concepts[t]["label"]]
             end_concepts = [concepts[f], concepts[t]]
             rel = {"from": f, "to": t, "label": label}

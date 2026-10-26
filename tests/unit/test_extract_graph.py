@@ -386,3 +386,120 @@ def test_extract_graph_chunks_by_chars(monkeypatch):
                                               overlap=1, chunk_chars=100, max_pages=8)
     assert sorted(fake.chunks) == [(1, 1, 2), (1, 2, 4), (1, 4, 5)]
     assert info["chunks"] == 3 and info["chunk_chars"] == 100 and info["max_pages"] == 8
+
+
+# ---------------------------------------------------------------- 数学の資料（#119）
+
+def test_merge_key_ignores_latin_case_but_not_for_short_symbols():
+    assert extraction.merge_key("Derivative") == extraction.merge_key("derivative")
+    assert extraction.merge_key("Critical Points") == extraction.merge_key("Critical points")
+    assert extraction.merge_key("CLT") == extraction.merge_key("clt")
+    assert extraction.merge_key("P") != extraction.merge_key("p")           # 3 字未満（記号）は区別する
+    assert extraction.merge_key("H0") != extraction.merge_key("h0")
+
+
+def test_case_variants_merge_with_most_listed_label_and_kind(monkeypatch):
+    lectures = [lec(1, "The Normal Distribution.", "normal distribution here", "normal distribution again")]
+    answers = {
+        (1, 1, 1): ([c("nd", "Normal Distribution", OTHER_LABEL, 1)], []),
+        (1, 2, 2): ([c("nd2", "normal distribution", "学説", 2)], []),
+        (1, 3, 3): ([c("nd3", "normal distribution", "学説", 3)], []),
+    }
+    concepts, _, info, _, _, _ = run(monkeypatch, lectures, answers, size=1)
+    assert labels(concepts) == ["normal distribution"]
+    (nd,) = concepts.values()
+    assert nd["id"] == "nd" and nd["kind"] == "学説"                       # 種類も多く挙がったほう
+    assert [s["page"] for s in nd["sources"]] == [1, 2, 3]
+
+
+def test_majority_kind_prefers_vocab_kind_over_other_and_first_on_tie():
+    assert extraction._majority_kind([OTHER_LABEL, OTHER_LABEL, "学説"]) == "学説"
+    assert extraction._majority_kind(["人物", "学説"]) == "人物"
+    assert extraction._majority_kind(["学説", "人物", "人物"]) == "人物"
+
+
+@pytest.mark.parametrize("evidence", ["", "   ", None])
+def test_relation_with_empty_evidence_is_dropped(monkeypatch, evidence):
+    lectures = [lec(1, "甲野は乙説を唱えた。甲野")]
+    answers = {(1, 1, 1): ([c("kouno", "甲野", "人物", 1), c("otsu", "乙説", "学説", 1)],
+                           [rel("甲野", "乙説", 1, evidence)])}
+    _, relations, info, dropped, _, _ = run(monkeypatch, lectures, answers, size=1)
+    assert relations == []
+    assert dropped["evidence が空"] == 1
+    assert info["dropped_relations"][0]["reason"] == "evidence が空"
+
+
+def test_prompt_excludes_formulas_variables_and_software():
+    user = extraction.EXTRACT_USER
+    assert "数式・等式そのもの、変数や記号の名前、数値の例" in user
+    assert "ソフト・ウェブツール・計算サイトの名前は" in user
+    assert "数式や記号が表す概念の名前" in user
+
+
+def test_formula_examples_are_left_out_of_the_prompt(monkeypatch):
+    vocab = {**VOCAB, "kinds": VOCAB["kinds"] + [
+        {"name": "モデル", "definition": "数理モデル", "examples": ["y = mx + b", "線形モデル", "f(x) → g(x)"]},
+        {"name": "式", "definition": "式だけ", "examples": ["a = b"]}]}
+    fake = FakeLLM({})
+    monkeypatch.setattr(extraction, "call_json", fake)
+    seen = []
+    orig = fake.__call__
+
+    def spy(client, **kw):
+        seen.append(kw["user"])
+        return orig(client, **kw)
+    monkeypatch.setattr(extraction, "call_json", spy)
+    extraction.extract_graph(None, "m", "テスト", vocab, [lec(1, "甲野")], log=lambda *_: None,
+                             pages_per_call=1, overlap=0, chunk_chars=0)
+    assert "- モデル: 数理モデル（例: 線形モデル）" in seen[0]
+    assert "- 式: 式だけ\n" in seen[0] and "a = b" not in seen[0]
+
+
+WIDE_VOCAB = {
+    "course": "数学", "language": "ja",
+    "kinds": [
+        {"name": "人物", "definition": "人", "examples": ["甲野"], "person": True, "cited_work": False},
+        {"name": "モデル", "definition": "m", "examples": ["線形モデル"], "person": False, "cited_work": False},
+        {"name": "統計", "definition": "s", "examples": ["平均"], "person": False, "cited_work": False},
+        {"name": "手法", "definition": "t", "examples": ["回帰"], "person": False, "cited_work": False},
+        {"name": "文献", "definition": "本", "examples": ["本"], "person": False, "cited_work": True},
+    ],
+    "relations": [
+        {"label": "導出", "definition": "条件からモデルを導く", "example": "A → B",
+         "from_kinds": ["モデル", "統計"], "to_kinds": ["モデル"]},
+        {"label": "提唱", "definition": "人物が唱えた", "example": "A → B",
+         "from_kinds": ["人物"], "to_kinds": ["モデル", "手法"]},
+        {"label": "出典", "definition": "本に書かれている", "example": "A → B",
+         "from_kinds": ["文献"], "to_kinds": ["手法"]},
+        {"label": OTHER_LABEL, "definition": "", "example": ""},
+    ],
+}
+
+
+def test_concept_labels_allow_all_content_kinds_on_both_ends(monkeypatch):
+    lectures = [lec(1, "回帰から平均を導く。甲野は平均を唱えた。")]
+    answers = {(1, 1, 1): ([c("kaiki", "回帰", "手法", 1), c("heikin", "平均", "統計", 1), c("kouno", "甲野", "人物", 1)],
+                           [rel("回帰", "平均", 1, "回帰から平均を導く", label="導出"),
+                            rel("甲野", "平均", 1, "甲野は平均を唱えた", label="提唱")])}
+    _, relations, info, dropped, _, _ = run(monkeypatch, lectures, answers, size=1, vocab=WIDE_VOCAB)
+    by = {(r["from"], r["to"]): r["label"] for r in relations}
+    assert by[("kaiki", "heikin")] == "導出"                # 概念系のラベル: 両端とも概念系の種類なら残す（向きはそのまま）
+    assert by[("kouno", "heikin")] == OTHER_LABEL           # 人物のラベルは広げない（#98 の規則のまま）
+
+
+def test_concept_label_kinds_rule():
+    from quizmap.vocab import concept_label_kinds
+    assert concept_label_kinds(WIDE_VOCAB) == {"導出": ["モデル", "統計", "手法"]}
+    old = {"kinds": [{"name": "a"}, {"name": "b"}],
+           "relations": [{"label": "x", "from_kinds": ["a"], "to_kinds": ["b"]}]}
+    assert concept_label_kinds(old) == {}                   # 旗の無い古い vocab では広げない
+
+
+def test_direction_text_mentions_wide_kinds(monkeypatch):
+    seen = []
+    monkeypatch.setattr(extraction, "call_json",
+                        lambda client, **kw: seen.append(kw["user"]) or {"concepts": [], "relations": []})
+    extraction.extract_graph(None, "m", "数学", WIDE_VOCAB, [lec(1, "x")], log=lambda *_: None,
+                             pages_per_call=1, overlap=0, chunk_chars=0)
+    assert "【向き: from は モデル・統計、to は モデル。両端とも モデル・統計・手法 のどれでもよい（向きは定義に従う）】" in seen[0]
+    assert "【向き: from は 人物、to は モデル・手法】" in seen[0]
