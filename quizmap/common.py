@@ -107,11 +107,66 @@ RADICAL_SUPPLEMENT_MAP = str.maketrans({
 })
 
 
+# 日本語・中国語の文字（かな・漢字・全角の記号・句読点）。改行の前後のどちらかがこれなら、空白を入れずに詰める
+_CJK_CHAR_RE = re.compile(r"[\u2E80-\u9FFF\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFFEF]")
+# 行末のハイフンで分けた語（exam-\nple）。小文字が続くときだけ、ハイフンを除いて詰める
+_HYPHEN_BREAK_RE = re.compile(r"([A-Za-z\u00C0-\u024F])-[ \t]*\n\s*(?=[a-z\u00DF-\u024F])")
+_LINE_BREAK_RE = re.compile(r"\n+")   # 前後の空白は残す（今までどおり。空白はあとで 1 つにまとめる）
+_CLAUSE_END = set(",.;:!?)]\"'’”")
+JA_PAGE_SHARE = 0.1   # 日本語・中国語の文字がこの割合以上のページを日本語のページとみなす
+
+
+def _is_latin_alnum(c: str) -> bool:
+    return c.isascii() and c.isalnum() or "\u00C0" <= c <= "\u024F"
+
+
+def _latin_word(text: str, i: int, step: int) -> bool:
+    """text の i から step の向き（-1 なら i の手前から左、1 なら i から右）に、2 字以上のラテン文字が続くか。"""
+    j, n = (i - 1, 0) if step < 0 else (i, 0)
+    while 0 <= j < len(text) and text[j].isalpha() and _is_latin_alnum(text[j]):
+        n += 1
+        j += step
+    return n >= 2
+
+
+def _join_lines(text: str) -> str:
+    """§9-2: 改行を除く。日本語は行の途中で語が切れるので詰め、英語などは語の区切りなので空白にする（#119）。
+
+    - 前後のどちらかが日本語・中国語の文字なら詰める（今までどおり）
+    - 行末のハイフンで分けた語は、小文字が続くならハイフンを除いて詰める（exam-\nple → example）。
+      大文字が続くならハイフンを残して詰める（Smith-\nJones → Smith-Jones）
+    - 前後がどちらもラテン文字・数字なら空白を 1 つ入れる（significance\nlevel → significance level）
+    - 前が句読点・閉じ括弧で後ろがラテン文字・数字のとき（rate,\nand）は、日本語のページでなければ空白を入れる
+    - 日本語のページ（日本語・中国語の文字が JA_PAGE_SHARE 以上）では、前後がどちらも 2 字以上のラテン文字の語の
+      ときだけ空白を入れる（Carol\nGilligan）。数字どうし（ページ番号）や、箇条書きの記号が化けた 1 字の「u」は
+      今までどおり詰める（日本語の本文を変えないため）
+    - それ以外は詰める
+    """
+    text = _HYPHEN_BREAK_RE.sub(r"\1", text)
+    letters = sum(1 for c in text if not c.isspace())
+    ja_page = letters > 0 and len(_CJK_CHAR_RE.findall(text)) >= JA_PAGE_SHARE * letters
+
+    def repl(m: re.Match) -> str:
+        a = text[m.start() - 1] if m.start() > 0 else ""
+        b = text[m.end()] if m.end() < len(text) else ""
+        if not a or not b or a.isspace() or b.isspace() or _CJK_CHAR_RE.match(a) or _CJK_CHAR_RE.match(b):
+            return ""
+        if _is_latin_alnum(a) and _is_latin_alnum(b):
+            if ja_page and not (_latin_word(text, m.start(), -1) and _latin_word(text, m.end(), 1)):
+                return ""
+            return " "
+        if a in _CLAUSE_END and _is_latin_alnum(b) and not ja_page:
+            return " "
+        return ""
+
+    return _LINE_BREAK_RE.sub(repl, text)
+
+
 def normalize_text(text: str) -> str:
-    """§9-1: NFKC 正規化（康熙部首 → 常用漢字）。§9-2: 改行除去（語の分断を直す）。"""
+    """§9-1: NFKC 正規化（康熙部首 → 常用漢字）。§9-2: 改行除去（語の分断を直す。英語などの語の区切りは空白にする）。"""
     text = unicodedata.normalize("NFKC", text)
     text = text.translate(RADICAL_SUPPLEMENT_MAP)
-    text = text.replace("\r", "").replace("\n", "")
+    text = _join_lines(text.replace("\r", ""))
     text = re.sub(r"[ \t　]+", " ", text)
     return text.strip()
 
