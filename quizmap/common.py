@@ -121,10 +121,19 @@ class Lecture:
     number: int
     path: Path
     pages: list[str] = field(default_factory=list)  # pages[0] が 1 ページ目（正規化済み）
+    # LLM に渡す本文。どのページにも出る決まり文句とページ番号を除いたもの（#119、boilerplate.py）。
+    # None なら pages をそのまま渡す。pages.json・照合・スライド画像は pages を使う
+    prompt_pages: list[str] | None = None
 
     @property
     def page_count(self) -> int:
         return len(self.pages)
+
+    def prompt_page(self, i: int) -> str:
+        """LLM に渡す i ページ目（1 から）の本文。"""
+        if self.prompt_pages is not None and len(self.prompt_pages) == len(self.pages):
+            return self.prompt_pages[i - 1]
+        return self.pages[i - 1]
 
 
 def lecture_number_of(path: Path) -> int | None:
@@ -190,8 +199,8 @@ def load_lecture_files(pairs: list[tuple[Path, int]]) -> list[Lecture]:
 def lecture_as_prompt_text(lec: Lecture) -> str:
     """LLM に渡す形。ページ番号を必ず付ける（出典に使わせる）。"""
     parts = [f"=== 第{lec.number}回 ==="]
-    for i, page in enumerate(lec.pages, start=1):
-        parts.append(f"[第{lec.number}回 p.{i}] {page}")
+    for i in range(1, lec.page_count + 1):
+        parts.append(f"[第{lec.number}回 p.{i}] {lec.prompt_page(i)}")
     return "\n".join(parts)
 
 

@@ -33,6 +33,7 @@ import traceback
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from quizmap.boilerplate import report_lines, strip_boilerplate
 from quizmap.common import DATA_DIR, DEFAULT_MODEL, load_lecture_files, make_client, read_json, write_json
 
 COURSES_DIR = DATA_DIR / "courses"
@@ -318,6 +319,9 @@ def _run(job: Job, d: Path, rebuild_vocab: bool, model: str) -> None:
         job.set_phase("read")
         lectures = load_lecture_files(pairs)
         job.add(f"{len(lectures)} 回 {sum(l.page_count for l in lectures)} ページを読み込んだ")
+        boiler = strip_boilerplate(lectures)            # 抽出に渡す本文だけから除く（#119）
+        for line in report_lines(boiler):
+            job.add(line)
         client = make_client()
 
         job.set_phase("vocab")
@@ -335,6 +339,7 @@ def _run(job: Job, d: Path, rebuild_vocab: bool, model: str) -> None:
         else:
             job.add("RAG は使わない（QUIZMAP_RAG=off）")
             extraction.run_extraction(client, model, vocab, lectures, d, log=job.add, step=job.set_phase)
+        _record_boilerplate(d, boiler)
         rename_course(d, info["name"])
         job.end_phase()
         job.progress = 1.0
@@ -349,6 +354,16 @@ def _run(job: Job, d: Path, rebuild_vocab: bool, model: str) -> None:
     finally:
         job.finished_at = now()
         job.save()
+
+
+def _record_boilerplate(d: Path, report: dict) -> None:
+    """抽出に渡す本文から除いた決まり文句・ページ番号を、graph.json（と補完の前の graph）の stats.boilerplate に残す。"""
+    for name in ("graph.json", "graph_before_completion.json"):
+        path = d / name
+        if path.exists():
+            graph = read_json(path)
+            graph.setdefault("stats", {})["boilerplate"] = report
+            write_json(path, graph)
 
 
 def quota_reset_jst() -> str:

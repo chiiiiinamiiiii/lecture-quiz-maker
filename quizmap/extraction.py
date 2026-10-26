@@ -414,7 +414,7 @@ def pages_with_text(surface: str, page_texts: dict[int, str]) -> list[int]:
 def _chunk_as_prompt_text(lec: Lecture, pages: list[int]) -> str:
     parts = [f"=== 第{lec.number}回 ==="]
     for i in pages:
-        parts.append(f"[第{lec.number}回 p.{i}] {lec.pages[i - 1]}")
+        parts.append(f"[第{lec.number}回 p.{i}] {lec.prompt_page(i)}")
     return "\n".join(parts)
 
 
