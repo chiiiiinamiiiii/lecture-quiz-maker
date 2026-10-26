@@ -55,27 +55,41 @@ INNER = [{"from": "jiritsu", "to": "songen", "label": "根拠", "source": {"lect
 
 def test_materials_use_sentence_and_answer():
     text = quiz.materials_text(CONCEPTS, [], INNER, {}, [], {}, [GROUND])
-    assert "- 「自律は尊厳の根拠である」（根拠。from は「自律」、to は「尊厳」。この関係を問うときは「尊厳」を示し、正答は「自律」）" in text
+    assert "- 「自律は尊厳の根拠である」（根拠。from は「自律」、to は「尊厳」。既定の問い方は「尊厳」を示して「自律」を答えさせる。" in text
+    assert "文の向き（自律 が from、尊厳 が to）は変えない" in text
+    sym = quiz.materials_text(CONCEPTS, [], INNER, {}, [], {}, [{**GROUND, "symmetric": True}])
+    assert "入れ替えても成り立つ関係" in sym
     assert "文の型「{from}は{to}の根拠である」／正答になる端: from" in text
 
 
-def q(answer_text, used=("自律", "尊厳", "根拠")):
-    return {"id": "q1", "aspect": "relation", "answer_text": answer_text,
+def q(answer_text, used=("自律", "尊厳", "根拠"), prompt=""):
+    return {"id": "q1", "aspect": "relation", "answer_text": answer_text, "prompt": prompt,
             "relation_used": dict(zip(("from", "to", "label"), used))}
 
 
+REV = ("尊厳", "自律", "根拠")
+
+
 @pytest.mark.parametrize("question, dropped", [
-    (q("自律"), False),                                   # 正答は from（自律）
-    (q("尊厳"), True),                                    # 正答がもう一方の端
-    (q("自律", used=("尊厳", "自律", "根拠")), True),      # relation_used が逆向き
-    (q("自由"), False),                                   # どちらの端でもない（ほかの検証に任せる）
-    ({**q("尊厳"), "aspect": "definition"}, False),
+    (q("自律", prompt="尊厳の根拠は？"), False),               # 既定の問い方（正答は from）
+    (q("尊厳", prompt="自律が根拠となるものは？"), False),     # もう一方の端を答えさせる問題も、向きが合えば残す（#160）
+    (q("自律", used=REV, prompt="尊厳が根拠となるものは？"), True),   # relation_used も問題も逆向きを主張
+    (q("自律", used=REV, prompt="どれか？"), False),           # relation_used だけ逆で、問題文に相手の端が無い
+    (q("自由"), False),                                       # どちらの端でもない（ほかの検証に任せる）
+    ({**q("自律", used=REV, prompt="尊厳が根拠となるものは？"), "aspect": "definition"}, False),
 ])
 def test_relation_direction_problem(question, dropped):
     got = quiz.relation_direction_problem(question, INNER, CONCEPTS, [GROUND])
     assert (got == quiz.RELATION_DIRECTION_REASON) is dropped
 
 
-def test_no_answer_end_keeps_question():
-    style = {k: v for k, v in GROUND.items() if k != "answer_end"}
-    assert quiz.relation_direction_problem(q("尊厳"), INNER, CONCEPTS, [style]) is None
+def test_symmetric_label_is_never_reversed():
+    rev = q("自律", used=REV, prompt="尊厳と対立するものは？")
+    assert quiz.relation_direction_problem(rev, INNER, CONCEPTS, [{**GROUND, "symmetric": True}]) is None
+    assert quiz.relation_direction_problem(rev, INNER, CONCEPTS, [{**GROUND, "structure": "対立・対比"}]) is None
+
+
+def test_vocab_asks_symmetric():
+    assert "symmetric" in V.SCHEMA["properties"]["relations"]["items"]["required"]
+    assert V.is_symmetric({"symmetric": True}) and V.is_symmetric({"structure": "対立・対比"})
+    assert not V.is_symmetric({"structure": "前提・根拠"}) and not V.is_symmetric(None)
