@@ -4,7 +4,6 @@ Streamlit の components v2 は、キーを付けるとデータが変わって�
 そのため表示位置・ツール・選択はブラウザ側に残り、Python には選択が変わったときだけ届く。
 """
 from pathlib import Path
-from urllib.parse import unquote, urlparse
 
 import streamlit as st
 
@@ -42,26 +41,6 @@ def rel_label(label: str) -> str:
     return label
 
 
-def origin_of(rel: dict) -> str:
-    """関係の出どころ: "slide"（資料の記述）/ "external"（Wikipedia）/ "cooccurrence"（同じスライドに出るだけ、#127）。
-    origin の無い関係（RAG より前の graph）は slide。"""
-    return rel.get("origin") or "slide"
-
-
-def is_external(rel: dict) -> bool:
-    """外部資料（Wikipedia）で補った関係か。origin の無い関係（RAG より前の graph）はスライド由来とみなす。"""
-    return rel.get("origin", "slide") == "external"
-
-
-def article_title(rel: dict) -> str:
-    """外部資料の出典の記事名。evidence_url（…/wiki/<記事名>）から読む。読めなければ URL をそのまま返す。"""
-    url = rel.get("evidence_url") or ""
-    path = urlparse(url).path
-    if "/wiki/" in path:
-        return unquote(path.split("/wiki/", 1)[1]).replace("_", " ")
-    return url
-
-
 def concept_map(graph, asked: set[str], selected: list[str], sel_version: int, course_id: str,
                 height: int | str = 760, hide_definitions: bool = False) -> dict | None:
     """地図を描き、ブラウザ側の選択 {"ids", "via_edge", "version", "n"} を返す（まだ無ければ None）。
@@ -76,8 +55,6 @@ def concept_map(graph, asked: set[str], selected: list[str], sel_version: int, c
     edges = [{
         "id": f"e{i}", "s": r["from"], "t": r["to"], "label": rel_label(r["label"]),
         "lecture": r["source"]["lecture"], "page": r["source"]["page"],
-        "external": is_external(r), "article": article_title(r) if is_external(r) else "",
-        "cooccur": origin_of(r) == "cooccurrence",
     } for i, r in enumerate(graph["relations"])]
     data = {
         "course_id": course_id,

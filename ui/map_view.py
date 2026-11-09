@@ -54,7 +54,7 @@ def _selection_panel(graph, concepts, weights, asked) -> None:
         st.caption(t("sel_empty"))
         return
     ordered = sorted(ids, key=lambda i: (i in via, -weights[i]))
-    st.caption(t("sel_caption", n=len(ordered), m=sum(1 for i in ordered if i in via)))
+    st.caption(t("sel_caption", n=len(ordered)))
     with st.form("confirm", border=False):
         box = st.container(height=min(260, 40 * len(ordered) + 16), border=True)
         checked = {}
@@ -62,8 +62,6 @@ def _selection_panel(graph, concepts, weights, asked) -> None:
             for cid in ordered:
                 c = concepts[cid]
                 label = c["label"]
-                if cid in via:
-                    label += f"  ·  {t('via_edge')}"
                 if cid in asked:
                     label += f"  ·  {t('asked_mark')}"
                 checked[cid] = st.checkbox(label, value=True, key=f"chk-{cid}")

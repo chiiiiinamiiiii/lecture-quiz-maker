@@ -60,8 +60,6 @@
 .qm-legend span { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
 .qm-legend i { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
 .qm-legend i.ring { background: transparent; border: 2px solid #ff7aac; width: 7px; height: 7px; box-shadow: 0 0 6px rgba(255, 122, 172, 0.7); }
-.qm-legend i.dots { width: 16px; height: 0; border-radius: 0; background: transparent; border-top: 1.5px dotted rgba(170, 170, 196, 0.6); }
-.qm-legend i.dash { width: 16px; height: 0; border-radius: 0; background: transparent; border-top: 1.5px dashed rgba(170, 170, 196, 0.9); }
 .qm-hint { flex: 0 1 auto; min-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 5px 10px; font-size: 11px; color: rgba(226, 224, 236, 0.5); background: rgba(30, 29, 38, 0.45); }
 
 /* 講義回ボタン（下端） */
@@ -90,7 +88,4 @@
 .qm-tooltip .hidden-def { font-size: 11px; font-style: italic; color: rgba(226, 224, 236, 0.5); }
 .qm-tooltip small { display: block; margin-top: 5px; color: rgba(226, 224, 236, 0.5); }
 .qm-tooltip .tag { margin-left: 6px; font-size: 10px; padding: 1px 6px; border-radius: 8px; background: rgba(16, 170, 156, 0.3); color: #7ff0e3; }
-.qm-tooltip .ext { font-size: 11px; color: #ffd38a; }
-.qm-tooltip .cooccur { font-size: 11px; color: rgba(226, 224, 236, 0.6); }
-.qm-tooltip small.ext-src { margin-top: 2px; color: rgba(255, 211, 138, 0.75); }
 .qm-tooltip .rel { color: #ff9cc2; margin: 0 4px; }

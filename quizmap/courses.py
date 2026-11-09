@@ -100,6 +100,20 @@ def rename_course(d: Path, name: str) -> None:
         write_json(d / "graph.json", g)
 
 
+def delete_course(d: Path) -> None:
+    """コースのフォルダを丸ごと消す。元に戻せない。
+
+    コース置き場の直下にあるコース以外は消さない。取り込み中のコースは、処理が書き込み続けるので消さない。
+    """
+    d = Path(d)
+    if d.parent.resolve() != COURSES_DIR.resolve() or not (d / "course.json").is_file():
+        raise ValueError(f"コースのフォルダではない: {d}")
+    job = _jobs.get(str(d))
+    if job and job.status == "running":
+        raise RuntimeError("取り込み中のコースは削除できない")
+    shutil.rmtree(d)
+
+
 _SAFE = re.compile(r"[^\w\-. ()（）【】『』「」]+")
 
 

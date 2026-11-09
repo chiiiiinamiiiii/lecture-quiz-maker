@@ -337,3 +337,29 @@ def test_assign_keeps_existing_unique_numbers_stable():
     assert {f["name"]: f["lecture"] for f in out} == {"a.pdf": 4, "b.pdf": 1}
     assert courses.assign_lecture_numbers(out) == out
     assert courses.assign_lecture_numbers([]) == []
+
+
+# ------------------------------------------------------------------ delete_course
+
+def test_delete_course_removes_only_that_course(courses_dir):
+    a, b = courses.create_course("A"), courses.create_course("B")
+    courses.delete_course(a)
+    assert not a.exists() and b.exists()
+    assert [c["name"] for c in courses.list_courses()] == ["B"]
+
+
+def test_delete_course_refuses_other_folders(courses_dir, tmp_path):
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "course.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError):
+        courses.delete_course(other)
+    assert other.exists()
+
+
+def test_delete_course_refuses_running_job(courses_dir, monkeypatch):
+    d = courses.create_course("A")
+    monkeypatch.setitem(courses._jobs, str(d), courses.Job(course_dir=str(d), status="running"))
+    with pytest.raises(RuntimeError):
+        courses.delete_course(d)
+    assert d.exists()

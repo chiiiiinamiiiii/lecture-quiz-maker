@@ -26,7 +26,7 @@ ASPECT_RATIO = {"relation": 4, "example": 3, "definition": 3}   # 仕様 §7 の
 
 QUESTION_PROPS = {
     "id": {"type": "string"},
-    "type": {"type": "string", "enum": ["mcq", "short"]},
+    "type": {"type": "string", "enum": ["mcq"]},
     "aspect": {"type": "string", "enum": ["relation", "example", "definition"]},
     "prompt": {"type": "string"},
     "choices": {"type": "array", "items": {"type": "string"}},
@@ -207,12 +207,11 @@ def materials_text(concepts, selected, inner, neighbors, needed, page_text, styl
     return "\n".join(parts)
 
 
-def gen_user(materials: str, n: int, counts: dict[str, int], n_short: int) -> str:
+def gen_user(materials: str, n: int, counts: dict[str, int]) -> str:
     return f"""次の材料から、学習用のクイズを {n} 問作ってください。
 
 内訳: 関係を問う問題 {counts['relation']} 問 / 具体例を問う問題 {counts['example']} 問 / 定義を問う問題 {counts['definition']} 問
-形式: 4 択（type=mcq, choices は 4 つ, answer は正答の添字 0〜3, answer_text は正答の文字列）を基本とし、
-      記述式（type=short, choices は空配列, answer は 0, answer_text は模範解答）を {n_short} 問まで混ぜてよい
+形式: すべて 4 択（type=mcq, choices は 4 つ, answer は正答の添字 0〜3, answer_text は正答の文字列）。記述式の問題は作らない
       answer は 0 始まりの添字（0〜3）。answer_text は choices[answer] と同じ文字列にする
 
 守ること:
@@ -228,6 +227,13 @@ def gen_user(materials: str, n: int, counts: dict[str, int], n_short: int) -> st
 - 「出題範囲の概念どうしの関係」に、ある概念を別の概念の具体例として結ぶラベル（ラベルの意味で判断する）の関係があれば、具体例の問題はその対を優先して使う
 - 定義を問う問題は、資料の記述に基づく定義を問う
 - 誤答には「誤答に使ってよい隣接概念」や出題範囲内の別の概念を使い、紛らわしくする
+- 学習者は解答中に資料を見ていない。問題文だけを読めば、何を聞かれているか分かり、解けるように書く
+- 「スライドの例」「資料の図」「上の式」「この問題」「先生の挙げた例」「例題 3」のように、資料の中のものを指すだけの書き方をしない。「第◯回」「p.◯」などの場所も問題文・選択肢に書かない
+- 資料の具体例・数値・式・図の内容・例題を問題に使うときは、解くのに必要な前提（登場するものの設定、与えられた条件、数値、式）を問題文の中に省かず書く。図や表は、必要な内容を文章で説明する
+- 資料だけに出てくる題材の名前（例: 「家具職人の問題」「箱の例」）をそのまま出さない。名前で呼ぶ代わりに、どんな状況か、何を求めるのかを問題文で説明する
+- 記号（例: c(x)、V(x)、x）を問題文・選択肢に使うときは、何を表す記号かを問題文で定義する
+- 「資料では」「提供された資料における」「授業では」「in the provided material」「according to the slides」のように資料に触れる書き方をしない。誰の説かを限る必要があるときは、その人物名や理論名で限る
+- ただし前提を書くときも、正答そのものを問題文に書かない
 - 問題文・選択肢・解説は資料に書かれていることだけを根拠にする
 - concept_labels には、問題の根拠となる概念を「出題範囲の概念」の表記そのままで 1 つ以上書く。
   問題文・正答に出てくる概念を書き、名前の似た別の概念（例: 「X」と「X性」）と取り違えない。誤答にだけ使った概念は書かない
@@ -250,9 +256,9 @@ def verify_user(questions: list[dict], materials: str) -> str:
 正答そのものが資料と食い違っていれば、問題文・選択肢・answer・explanation を資料に合わせて直してください。
 関係を問う問題（aspect=relation）は、正答が材料の「出題範囲の概念どうしの関係」のどの行に当たるかを確かめ、向きが逆なら問題文か正答を直してください。
 どの行にも当たらなければ、問題を資料の記述に合わせて直してください。relation_used はその行の from・to・label にしてください。
-記述式の問題は distractor_reasons を空配列にして、そのまま返してください。
 問題の数・id・type は変えないでください。aspect は次の場合だけ直してよい。
 aspect=example の問題が、資料の具体例ではなく定義の言い換えを問うていれば、aspect を definition に直してください。
+学習者は解答中に資料を見ていません。問題文が資料の中の例・図・式・例題を指すだけで（「スライドの例では」「この図で」など）、解くのに必要な前提が書かれていなければ、前提を資料から補って問題文の中に書いてください。問題文・選択肢の「第◯回」「p.◯」も、内容の説明に置き換えてください。資料だけに出てくる題材の名前は状況の説明に置き換え、定義されていない記号には意味を書き足し、「資料では」「in the provided material」のような言い回しは消してください。正答そのものは問題文に書かないでください。
 問題文が「〜を問う。」で終わっている、または正答に当たる関係ラベルの名前を含んでいれば、問題文を学習者向けの疑問文に直してください。
 answer と distractor_reasons の choice は 0 始まりの添字（0〜3）です。choices の順番は変えないでください。
 answer_text は choices[answer] と同じ文字列にしてください。
@@ -930,6 +936,74 @@ def verify_uniqueness(client, model, questions, graph, pages, index, wiki) -> tu
 # 出題の検証（verify_uniqueness）を通すか。generate_quiz の verify を省いたときの既定。QUIZMAP_RAG=off で通さない
 UNIQUENESS_DEFAULT = os.environ.get("QUIZMAP_RAG", "on").strip().lower() != "off"
 
+SINGLE_ANSWER_SYSTEM = """あなたは 4 択のクイズを解いて、答えが一つだけに決まるかを確かめる専門家です。資料に書かれていることを根拠に判断します。{language_rule}"""
+
+SINGLE_ANSWER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "questions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "choices": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {"choice": {"type": "integer"}, "correct": {"type": "boolean"}, "reason": {"type": "string"}},
+                            "required": ["choice", "correct", "reason"],
+                        },
+                    },
+                },
+                "required": ["id", "choices"],
+            },
+        },
+    },
+    "required": ["questions"],
+}
+
+
+def single_answer_user(questions: list[dict], materials: str) -> str:
+    import json
+    shown = [{"id": q["id"], "prompt": q["prompt"], "choices": q["choices"]} for q in questions]
+    return f"""次の 4 択の問題を、正答を知らない状態で確かめてください。
+各問題の 4 つの選択肢すべてについて、1 つずつ、問題文の問いに対する正解と言えるかを資料に照らして判定します。
+一つ見つけても止めず、残りの選択肢も同じ基準で判定してください。言い方が違うだけで同じ内容の選択肢は、どちらも同じ判定にします。
+- correct: 問題文の問いの答えとして正しい、または資料の記述から正しいと言えるなら true。誤りなら false
+- choice は 0 始まりの添字（0〜3）。reason は判定の理由を 1 行で書く
+問題の数と id は変えないでください。
+
+## 問題
+{json.dumps({"questions": shown}, ensure_ascii=False, indent=1)}
+
+{materials}
+"""
+
+
+def check_single_answer(client, model: str, questions: list[dict], materials: str, lang: str) -> tuple[list[dict], list[dict]]:
+    """正答を隠して各選択肢を判定し、正解が登録された正答ただ一つの問題だけを残す。
+
+    戻り値: (残した問題, 外した問題の記録 [{"id", "answer", "correct_choices", "reasons"}])。
+    判定が返ってこない問題・4 つそろわない問題も、一つに決まると確かめられないので外す。
+    """
+    if not questions:
+        return [], []
+    res = call_json(client, model=model, system=SINGLE_ANSWER_SYSTEM.replace("{language_rule}", language_rule(lang)),
+                    schema=SINGLE_ANSWER_SCHEMA, user=single_answer_user(questions, materials))
+    by_id = {r["id"]: {c["choice"]: c for c in r["choices"]} for r in res["questions"]}
+    kept, dropped = [], []
+    for q in questions:
+        judged = by_id.get(q["id"], {})
+        correct = sorted(i for i, c in judged.items() if c["correct"])
+        if set(judged) == set(range(len(q["choices"]))) and correct == [q["answer"]]:
+            kept.append(q)
+        else:
+            dropped.append({"id": q["id"], "answer": q["answer"], "correct_choices": correct,
+                            "reasons": [judged[i]["reason"] for i in correct]})
+    return kept, dropped
+
+
 def generate_quiz(client, model: str, graph: dict, vocab: dict, pages: list[dict],
                   confirmed_ids: list[str], n: int, index=None, wiki=None, verify: bool | None = None) -> dict:
     """戻り値: {"questions": [...], "warnings": [...], "meta": {...}}
@@ -946,13 +1020,12 @@ def generate_quiz(client, model: str, graph: dict, vocab: dict, pages: list[dict
     if not selected:
         raise ValueError("確定した概念が graph.json に見つからない")
     counts = split_counts(n, bool(inner))
-    n_short = n // 5
     materials = materials_text(concepts, selected, inner, neighbors, needed, page_text, styles)
 
     # (1) 生成
     lang = language_of(vocab, (p["text"] for p in pages))
     gen = call_json(client, model=model, system=GEN_SYSTEM.replace("{language_rule}", language_rule(lang)), schema=GEN_SCHEMA,
-                    user=gen_user(materials, n, counts, n_short))
+                    user=gen_user(materials, n, counts))
     calls += 1
     questions = gen["questions"][:n]
 
@@ -1032,8 +1105,13 @@ def generate_quiz(client, model: str, graph: dict, vocab: dict, pages: list[dict
     warnings = (["aspect を自己確認で直した: " + c for c in aspect_changes] + answer_warnings + resolve_warnings + tidy_notes
                 + direction_warnings + style_warnings
                 + validate(final, confirmed_ids, pages))
-    # 補正の後でも正答の添字が answer_text と合わない 4 択は出さない（正しく答えても不正解になるため）
-    final = [q for q in final if q.get("type") != "mcq" or _answer_matches(q)]
+    # 出すのは 4 択だけ。補正の後でも正答の添字が answer_text と合わない問題は出さない（正しく答えても不正解になるため）
+    final = [q for q in final if q.get("type") == "mcq" and _answer_matches(q)]
+    # 答えが一つだけか、すべての補正が終わった問題で確かめる（差し替えた選択肢も含めて確かめるため、最後に行う）
+    final, single_answer_dropped = check_single_answer(client, model, final, materials, lang)
+    if single_answer_dropped or final:
+        calls += 1
+    warnings += [f"{d['id']}: 正解が一つに決まらないので外した（正解と判定された選択肢: {d['correct_choices']}）" for d in single_answer_dropped]
     meta = {
         "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
         "model": model,
@@ -1051,6 +1129,7 @@ def generate_quiz(client, model: str, graph: dict, vocab: dict, pages: list[dict
         "distractors_replaced": n_replaced,
         "dropped_relation_direction": len(dropped_direction),
         "dropped_relation_direction_records": dropped_direction,       # 外した問題の id と理由（#160）
+        "dropped_not_single_answer": single_answer_dropped,            # 正解が一つに決まらず外した問題
         "tidied": tidy_notes,                                          # 後片付けで直したこと（#161）
         "api_calls": calls,
         "seconds": round(time.monotonic() - t0, 1),

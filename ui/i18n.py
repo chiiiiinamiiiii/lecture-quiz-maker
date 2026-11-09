@@ -19,10 +19,14 @@ TEXTS = {
     "open_ingest": {"ja": "資料の取り込み", "en": "Import materials"},
     "back_to_map": {"ja": "地図とクイズに戻る", "en": "Back to map & quiz"},
     "page_ingest": {"ja": "資料の取り込み", "en": "Import materials"},
+    "delete_course": {"ja": "このコースを削除", "en": "Delete this course"},
+    "delete_course_confirm": {"ja": "「{name}」を削除します。取り込んだ資料と解答の記録も消え、元に戻せません。",
+                              "en": "Delete “{name}”? Its imported materials and quiz history will be removed. This cannot be undone."},
+    "delete_course_yes": {"ja": "削除する", "en": "Delete"},
+    "delete_course_no": {"ja": "やめる", "en": "Cancel"},
     "rename_course": {"ja": "コース名", "en": "Course name"},
     "rename_help": {"ja": "ここで直した名前は、このコースのデータに保存されます", "en": "Saved to this course's data"},
     "ingesting": {"ja": "取り込み中", "en": "Importing"},
-    "stats": {"ja": "概念 {c} / 関係 {r} / 出題済み {a}", "en": "{c} concepts / {r} relations / {a} asked"},
 
     # 地図（JavaScript 側にも渡す）
     "tool_hand": {"ja": "手のひら（H）: ドラッグで移動", "en": "Hand (H): drag to pan"},
@@ -46,11 +50,6 @@ TEXTS = {
     "by_lecture": {"ja": "講義回で選ぶ", "en": "By lecture"},
     "all": {"ja": "全部", "en": "All"},
     "lecture_fmt": {"ja": "第{n}回", "en": "L{n}"},
-    "external_rel": {"ja": "外部資料（Wikipedia）で補った関係", "en": "Relation added from an external source (Wikipedia)"},
-    "external_legend": {"ja": "外部資料で補った関係", "en": "From external source"},
-    "external_src": {"ja": "出典", "en": "Source"},
-    "cooccur_rel": {"ja": "同じスライドに出る（{lec} p.{page}）", "en": "Appear on the same slide ({lec} p.{page})"},
-    "cooccur_legend": {"ja": "同じスライドに出る（関連）", "en": "On the same slide (related)"},
     "lecture_short": {"ja": "{n}", "en": "L{n}"},   # 「講義回」の配置の列の見出し（短い形。#44）
     "count_fmt": {"ja": "{n} 個を選択中", "en": "{n} selected"},
     "def_hidden": {"ja": "解答中は定義を隠しています", "en": "Definitions are hidden while you answer"},
@@ -62,9 +61,8 @@ TEXTS = {
     "sel_title": {"ja": "選択した範囲", "en": "Selection"},
     "sel_empty": {"ja": "地図の上で概念を囲むか、下の講義回ボタンを押すと、ここに並びます。",
                   "en": "Lasso concepts on the map or press a lecture button below to list them here."},
-    "sel_caption": {"ja": "{n} 個（うち辺の中点から {m} 個）。出題に使わないものはチェックを外してください。",
-                    "en": "{n} concepts ({m} via relation midpoints). Uncheck any you don't want."},
-    "via_edge": {"ja": "辺の中点から", "en": "via relation"},
+    "sel_caption": {"ja": "{n} 個。出題に使わないものはチェックを外してください。",
+                    "en": "{n} concepts. Uncheck any you don't want."},
     "asked_mark": {"ja": "出題済み", "en": "asked"},
     "confirm": {"ja": "この範囲で確定", "en": "Use this selection"},
     "confirmed": {"ja": "確定した {n} 概念", "en": "{n} concepts confirmed"},
@@ -98,7 +96,6 @@ TEXTS = {
     "explanation": {"ja": "解説", "en": "Explanation"},
     "hint_used": {"ja": "ヒント使用", "en": "hint used"},
     "new_quiz": {"ja": "もう一度作る", "en": "New quiz"},
-    "json_expander": {"ja": "生成結果の JSON（答えを含む）", "en": "Raw JSON (includes answers)"},
 
     # 取り込み
     "new_course_title": {"ja": "新しいコースを作る", "en": "Create a course"},
@@ -166,6 +163,5 @@ def map_texts() -> dict:
     """地図部品（JavaScript）に渡す文言。"""
     keys = ["tool_hand", "tool_lasso", "tool_rect", "zoom_in", "zoom_out", "fit", "clear", "layout_force",
             "layout_timeline", "density", "unasked", "asked", "selected", "hint_hand", "hint_select", "by_lecture", "all",
-            "lecture_fmt", "lecture_short", "count_fmt", "def_hidden",
-            "external_rel", "external_legend", "external_src", "cooccur_rel", "cooccur_legend"]
+            "lecture_fmt", "lecture_short", "count_fmt", "def_hidden"]
     return {k: TEXTS[k].get(lang()) or TEXTS[k]["ja"] for k in keys}
