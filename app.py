@@ -13,11 +13,11 @@ from pathlib import Path
 import streamlit as st
 
 from quizmap.common import DATA_DIR
-from quizmap.courses import COURSES_DIR, course_info, current_job, import_legacy, list_courses, running_job
+from quizmap.courses import COURSES_DIR, course_info, current_job, delete_course, import_legacy, list_courses, running_job
 from ui.i18n import LANGS, t
 from ui.ingest_view import render_ingest_page, render_new_course
 from ui.map_view import render_map_page
-from ui.state import clear_course_state, load_graph, save_course_name
+from ui.state import clear_course_state, save_course_name
 
 NEW = "__new__"
 
@@ -66,6 +66,27 @@ def _on_course_change(widget_key: str) -> None:
     cid = st.session_state.get(widget_key)
     if cid is not None and cid != st.session_state.get("course_id"):
         _select_course(cid)
+
+
+def _delete_course_control(course: dict) -> None:
+    """コースの削除。元に戻せないので、押したあとに確認を挟む。"""
+    key = f"confirm_delete-{course['id']}"
+    if not st.session_state.get(key):
+        if st.button(t("delete_course"), icon=":material/delete:", use_container_width=True, key=f"delete-{course['id']}"):
+            st.session_state[key] = True
+            st.rerun()
+        return
+    st.warning(t("delete_course_confirm", name=course["name"]))
+    yes, no = st.columns(2)
+    if yes.button(t("delete_course_yes"), type="primary", use_container_width=True, key=f"delete-yes-{course['id']}"):
+        delete_course(course["dir"])
+        clear_course_state()
+        for k in (key, "course_id", "course_dir"):
+            st.session_state.pop(k, None)
+        st.rerun()
+    if no.button(t("delete_course_no"), use_container_width=True, key=f"delete-no-{course['id']}"):
+        st.session_state[key] = False
+        st.rerun()
 
 
 @st.fragment(run_every="2s")
@@ -128,8 +149,6 @@ def main() -> None:
     ingest_key = f"show_ingest-{sel}"
     with st.sidebar:
         if course["ready"]:
-            graph, _, asked = load_graph()
-            st.caption(t("stats", c=len(graph["concepts"]), r=len(graph["relations"]), a=len(asked)))
             name = st.text_input(t("rename_course"), value=course["name"], key=f"rename-{sel}", help=t("rename_help"))
             if name.strip() and name.strip() != course["name"]:
                 save_course_name(name.strip())
@@ -140,6 +159,8 @@ def main() -> None:
                 if st.button(t("open_ingest"), icon=":material/upload_file:", use_container_width=True):
                     st.session_state[ingest_key] = True
                     st.rerun()
+        if not ingesting:
+            _delete_course_control(course)
 
     if not course["ready"] or ingesting or st.session_state.get(ingest_key):
         if course["ready"] and not ingesting:

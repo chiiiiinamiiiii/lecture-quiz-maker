@@ -160,7 +160,7 @@ def n_selected(pg: Page) -> int:
 def panel_count(pg: Page) -> int | None:
     """右側パネルに並んだ選択の件数（チェックボックスの数）。"""
     t = main_text(pg)
-    if "個（うち" not in t:
+    if "出題に使わないものはチェックを外して" not in t:
         return None
     return pg.locator("[data-testid='stCheckbox']").count()
 

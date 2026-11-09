@@ -69,6 +69,15 @@ class FakeWiki:
         return self.articles.get(term)
 
 
+def _all_single(user: str, answer: int = 0) -> dict:
+    """答えが一つだけの確認の偽物。answer 番の選択肢だけを正解と返す。"""
+    import json as _json
+    start = user.index("## 問題\n") + len("## 問題\n")
+    shown, _ = _json.JSONDecoder().raw_decode(user[start:])
+    return {"questions": [{"id": q["id"], "choices": [{"choice": i, "correct": i == answer, "reason": ""} for i in range(len(q["choices"]))]}
+                          for q in shown["questions"]]}
+
+
 @pytest.fixture
 def llm(monkeypatch):
     state = {"checks": [], "users": [], "calls": 0}
@@ -196,6 +205,8 @@ def test_generate_quiz_calls_verify_and_keeps_before(monkeypatch):
     seen = {"verify": []}
 
     def fake(client, *, model, system, user, schema, max_tokens=32000):
+        if schema is quiz.SINGLE_ANSWER_SCHEMA:
+            return _all_single(user, q["answer"])
         if "checks" in schema["properties"]:
             seen["verify"].append(user)
             return {"checks": [check("q_01", supported=False)]}
@@ -211,7 +222,7 @@ def test_generate_quiz_calls_verify_and_keeps_before(monkeypatch):
     assert out["meta"]["uniqueness"]["dropped"] == 1 and out["meta"]["api_calls"] == 3
 
     out = quiz.generate_quiz(None, "m", GRAPH, vocab, PAGES, ["kouno", "otsu"], 1, verify=False)
-    assert len(out["questions"]) == 1 and "uniqueness" not in out["meta"] and out["meta"]["api_calls"] == 2
+    assert len(out["questions"]) == 1 and "uniqueness" not in out["meta"] and out["meta"]["api_calls"] == 3
 
 
 def test_wiki_terms_are_concept_labels_not_choice_sentences(llm):
@@ -260,6 +271,8 @@ def test_generate_quiz_drops_relation_question_with_reversed_answer(monkeypatch)
              "prompt": "乙説が唱えたものはどれか。"}                                   # 逆向きの関係を主張 → 外す
 
     def fake(client, *, model, system, user, schema, max_tokens=32000):
+        if schema is quiz.SINGLE_ANSWER_SCHEMA:
+            return _all_single(user)
         assert "「甲野は乙説を唱えた」" in user and "既定の問い方は「乙説」を示して「甲野」を答えさせる" in user
         return {"questions": [{**x, "distractor_reasons": []} for x in (right, wrong, other_end)]}
     monkeypatch.setattr(quiz, "call_json", fake)
@@ -269,3 +282,55 @@ def test_generate_quiz_drops_relation_question_with_reversed_answer(monkeypatch)
     assert out["meta"]["dropped_relation_direction"] == 1
     assert out["meta"]["dropped_relation_direction_records"][0]["id"] == "q_02"
     assert any("q_02" in w and "外した" in w for w in out["warnings"])
+
+
+def test_prompts_assume_learner_cannot_see_slides():
+    """学習者は資料を見ていない前提で、問題文に前提を書かせる（生成と自己確認の両方）。"""
+    gen = quiz.gen_user("材料", 5, {"relation": 2, "example": 2, "definition": 1})
+    ver = quiz.verify_user([], "材料")
+    for text in (gen, ver):
+        assert "資料を見ていない" in text or "資料を見ていません" in text
+        assert "前提" in text
+
+
+def test_only_multiple_choice_is_requested():
+    gen = quiz.gen_user("材料", 5, {"relation": 2, "example": 2, "definition": 1})
+    assert "すべて 4 択" in gen and "記述式の問題は作らない" in gen
+    assert quiz.QUESTION_PROPS["type"]["enum"] == ["mcq"]
+
+
+SINGLE_QS = [{"id": "q1", "prompt": "p", "choices": ["a", "b", "c", "d"], "answer": 1, "answer_text": "b"}]
+
+
+def _single(monkeypatch, judged):
+    seen = {}
+
+    def fake(client, *, model, system, user, schema, max_tokens=32000):
+        seen["user"] = user
+        return {"questions": judged}
+    monkeypatch.setattr(quiz, "call_json", fake)
+    return seen
+
+
+def _j(correct, n=4):
+    return [{"id": "q1", "choices": [{"choice": i, "correct": i in correct, "reason": "r"} for i in range(n)]}]
+
+
+def test_single_answer_keeps_only_the_keyed_answer(monkeypatch):
+    seen = _single(monkeypatch, _j({1}))
+    kept, dropped = quiz.check_single_answer(None, "m", SINGLE_QS, "材料", "ja")
+    assert kept == SINGLE_QS and dropped == []
+    assert '"answer"' not in seen["user"] and "answer_text" not in seen["user"], "正答は判定役に見せない"
+
+
+@pytest.mark.parametrize("correct", [{1, 2}, {0}, set()])
+def test_single_answer_drops_multiple_wrong_or_no_answer(monkeypatch, correct):
+    _single(monkeypatch, _j(correct))
+    kept, dropped = quiz.check_single_answer(None, "m", SINGLE_QS, "材料", "ja")
+    assert kept == [] and dropped[0]["correct_choices"] == sorted(correct)
+
+
+@pytest.mark.parametrize("judged", [[], _j({1}, n=3)])
+def test_single_answer_drops_when_not_fully_judged(monkeypatch, judged):
+    _single(monkeypatch, judged)
+    assert quiz.check_single_answer(None, "m", SINGLE_QS, "材料", "ja")[0] == []

@@ -27,7 +27,7 @@ def quiz_section(graph, vocab, ids: list[str]) -> None:
 
     m = result["meta"]
     st.caption(t("quiz_meta", n=m["n_generated"]))
-    # 自動検証の警告（誤答の差し替えなど）は学習者向けではないので画面に出さない。生成結果の JSON には残る
+    # 自動検証の警告（誤答の差し替えなど）は学習者向けではないので画面に出さない
     questions = result["questions"]
     if "graded" in st.session_state:
         review_section(questions, st.session_state["graded"])
@@ -146,5 +146,3 @@ def review_section(questions, graded) -> None:
             st.caption(f"{t('hint_source')}: {_source_text(q)}")
             for img in _slide_images(q)[:2]:
                 st.image(str(img), use_container_width=True)
-    with st.expander(t("json_expander")):
-        st.json(questions, expanded=False)

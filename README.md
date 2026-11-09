@@ -13,14 +13,15 @@ Existing quiz generators ask about one term at a time. What I actually get wrong
 
 Everything happens inside the app.
 
-1. **Upload** the lecture PDFs. Lecture numbers are read from file names (`第3回`, `week3`, `Lecture 03` …) and can be corrected in a table.
+1. **Upload** the lecture PDFs. All uploaded PDFs are used. Lecture numbers are read from file names (`第3回`, `week3`, `Lecture 03` …); files without one get the next free number.
 2. **Vocabulary derivation** (LLM). The model reads the slides and proposes the *kinds of concepts* and the *kinds of relations* that this particular course uses, each relation with a definition and a *question style*.
 3. **Extraction** (LLM). Using that fixed vocabulary, the model extracts concepts, then relations between them, each with the lecture and page it came from.
 4. **Map.** Concepts are dots, relations are lines. Two layouts: by links (force-directed) and by lecture.
 5. **Select a region** with the lasso or marquee (Shift adds, ⌘ subtracts, as in Adobe tools), by clicking dots, or with the lecture buttons.
-6. **Quiz** (LLM). Questions about relations, examples and definitions in the selected region. Distractors come from neighbouring concepts on the map, then the model checks each distractor against the slides and replaces any it cannot justify as wrong.
-7. **Answer and grade.** Multiple choice is graded automatically; short answers are graded by the LLM (1 / 0.5 / 0) with a one-line note on what is missing. Each question shows its explanation and the source slide.
+6. **Quiz** (LLM). Questions about relations, examples and definitions in the selected region. Distractors come from neighbouring concepts on the map, then the model checks each distractor against the slides and replaces any it cannot justify as wrong. Questions are written so that they can be answered without seeing the slides, with the needed background stated in the question.
+7. **Answer and grade.** All questions are multiple choice and are graded automatically. Before a question is shown, each choice is judged again with the answer hidden, and only questions with exactly one correct choice are kept. Each question shows its explanation and the source slide.
 8. **Asked concepts change colour** on the map, so the next quiz can target what you have not practised.
+9. **Manage courses.** Courses can be renamed and deleted in the app.
 
 The interface is available in Japanese and English.
 
@@ -38,7 +39,7 @@ Open http://localhost:8501, choose “+ New course”, upload PDFs, and press �
 
 Tests (no API calls): `.venv/bin/pip install -r requirements-dev.txt && .venv/bin/playwright install chromium`, then `.venv/bin/python -m pytest tests -q`.
 
-End-to-end test with the real API: `RUN_API_TESTS=1 .venv/bin/python -m pytest tests/e2e/test_full_flow_api.py -q`. A browser uploads a PDF, imports it with RAG on, selects a lecture range on the map, generates 3 questions, answers, grades, and checks that the explanations, `results.json` and the asked-concept colors appear. On the final code (2026-10-26) it passed in 71 s with 17 API calls. Short-answer grading was not exercised in that run because no short-answer question came up; it was measured separately in the evaluation.
+End-to-end test with the real API: `RUN_API_TESTS=1 .venv/bin/python -m pytest tests/e2e/test_full_flow_api.py -q`. A browser uploads a PDF, imports it with RAG on, selects a lecture range on the map, generates 3 questions, answers, grades, and checks that the explanations, `results.json` and the asked-concept colors appear. On the final code (2026-11-09) it passed in 115 s.
 
 ## Where the LLM is used
 
@@ -48,9 +49,9 @@ End-to-end test with the real API: `RUN_API_TESTS=1 .venv/bin/python -m pytest t
 | Extraction | Concepts, typed relations, and their source pages | Semantic structure, not keywords |
 | Question writing | Question text and four choices, following each relation's `question_style` | — |
 | Distractor self-check | Whether each wrong choice is really wrong according to the slides | Prevents “distractor that is actually correct” |
-| Short-answer grading | 1 / 0.5 / 0 with feedback (LLM-as-judge) | Free-text answers |
 | Relation completion (RAG) | Whether two concepts that the slides leave unconnected are related, backed by a slide passage or a Wikipedia passage | Slides often skip steps between ideas |
 | Answer verification (RAG) | Whether the answer follows from the slides, and whether another choice is also correct in general knowledge | A question can have one answer within the slides but two in reality |
+| Single-answer check | With the answer hidden, whether each of the four choices is correct | Keeps out questions with several correct choices or a wrong answer key |
 
 Only the map drawing and the selection are plain code.
 
@@ -62,7 +63,7 @@ Only the map drawing and the selection are plain code.
 
 **Map words are copied from the slides.** The user's rule is that every word on the map appears in the uploaded material. The model is told to copy each concept name exactly as written on the page. Code then checks the name against the page text. If it is not there, code looks for the nearest spelling on the page (spacing, middle dots, brackets, okurigana, a shorter part of the name), and if that fails, the model is asked once more to copy it from the page. A concept is never silently deleted: one whose name cannot be found is kept in the data, left off the map, and reported. A first version dropped such concepts; the user rejected that, and the design was changed.
 
-**Every concept gets at least one relation.** The user's rule is that no concept may stand alone on the map. After extraction and relation completion, a connect step takes every concept that still has no relation. First the model looks at it together with up to eight candidates (concepts on the same page, the neighbouring pages, the same lecture, and pages the search index finds similar), the slide text and Wikipedia, and returns the most certain relation with a quote, which is checked like any other relation. Whatever is still alone is then linked by code to a concept on the same page (or the nearest page) with a fixed label *Related*, drawn as a faint dotted line. One concept receives at most three such links, so no hub forms. *Related* links and Wikipedia-only links are never used as material for questions.
+**Every concept gets at least one relation.** The user's rule is that no concept may stand alone on the map. After extraction and relation completion, a connect step takes every concept that still has no relation. First the model looks at it together with up to eight candidates (concepts on the same page, the neighbouring pages, the same lecture, and pages the search index finds similar), the slide text and Wikipedia, and returns the most certain relation with a quote, which is checked like any other relation. Whatever is still alone is then linked by code to a concept on the same page (or the nearest page) with a fixed label *Related*. One concept receives at most three such links, so no hub forms. *Related* links and Wikipedia-only links are never used as material for questions.
 
 **Each relation label carries a sentence template.** The vocabulary is derived per course, so the direction of a label (which end is the part, which end is the reason) used to be left to the model's reading, and direction errors reached the questions. Each label now has a template such as "{from} is a type of {to}". Extraction checks a relation by filling in the template, questions are generated from the filled-in sentences, and a question whose answer contradicts the sentence is removed. The vocabulary is re-derived once if it lacks structural labels (type, part, contrast, example, basis, application), if a label can only connect cited works, or if it has fewer than three content kinds.
 
@@ -85,7 +86,15 @@ Only the map drawing and the selection are plain code.
 
 **Output follows the language of the material.** The app detects whether the slides are Japanese or English and asks the model to write the vocabulary, concepts, questions and explanations in that language. The interface language is a separate setting.
 
-**Retrieval (RAG) checks relations and answers, but never adds words to the map.** The rules were set by the user: every concept on the map must appear in the uploaded material; outside sources may only be used to check relations between those concepts and to check that a question has one correct answer; and every answer must follow from the uploaded material. During import, all slide pages are embedded (`gemini-embedding-001`) into a per-course index. A completion step then looks at concepts left without relations and at concepts that share a slide but have no relation. For each pair it retrieves related slide pages and the Wikipedia introductions of both concepts, and asks the model whether a relation from the course vocabulary holds. A relation backed by a slide quote is added as a normal relation; one backed only by Wikipedia is added as an *external* relation, drawn dashed on the map with its source. External relations are never used as material for questions. After questions are generated, a verification step retrieves slide pages and Wikipedia introductions for the answer and every choice, removes questions whose answer cannot be traced to a slide, and replaces or removes choices that would also be correct. Every retrieval and decision is logged, so retrieval errors and generation errors can be told apart. The design is in `docs/rag-design.md`.
+**Retrieval (RAG) checks relations and answers, but never adds words to the map.** The rules were set by the user: every concept on the map must appear in the uploaded material; outside sources may only be used to check relations between those concepts and to check that a question has one correct answer; and every answer must follow from the uploaded material. During import, all slide pages are embedded (`gemini-embedding-001`) into a per-course index. A completion step then looks at concepts left without relations and at concepts that share a slide but have no relation. For each pair it retrieves related slide pages and the Wikipedia introductions of both concepts, and asks the model whether a relation from the course vocabulary holds. A relation backed by a slide quote is added as a normal relation; one backed only by Wikipedia is added as an *external* relation. External relations are never used as material for questions. After questions are generated, a verification step retrieves slide pages and Wikipedia introductions for the answer and every choice, removes questions whose answer cannot be traced to a slide, and replaces or removes choices that would also be correct. Every retrieval and decision is logged, so retrieval errors and generation errors can be told apart. The design is in `docs/rag-design.md`.
+
+**Lines do not show where a relation came from.** External and "related" relations used to be dashed and listed in the legend, which told learners nothing useful and made the map harder to read. All lines are now the same solid line. The origin stays in the data and is used only to keep those relations out of quiz material.
+
+**The map fills the screen.** The raw force layout stretched diagonally and left the corners empty. The browser now rotates the widest direction of the points onto the long side of the screen, blends each axis with its rank order to loosen clusters, and matches the aspect ratio of the screen. Links are unchanged, but distances between dots no longer show exact closeness.
+
+**All questions are multiple choice, with exactly one correct answer.** Short-answer questions were removed by the user's decision, so every question is graded automatically with no API call. The largest remaining risk is a question with several correct choices. After all other fixes, a final call judges each of the four choices with the answer hidden, and a question is kept only if the sole choice judged correct is the keyed answer. Questions that are not fully judged are also removed. Removed questions are not replaced, so a quiz can have fewer questions than requested.
+
+**Questions assume the learner cannot see the slides.** Some questions pointed into the material ("in the slide's example", "the cabinetmaker's problem") or used undefined symbols. Both the writing prompt and the self-check prompt now require the situation, conditions and symbol meanings to be stated in the question.
 
 **Display density is not extraction depth.** The map can show fewer dots, but it never deletes extracted data. How many concepts are extracted at all is decided at extraction time and depends on the model and the number of calls (see Known limitations).
 
@@ -103,13 +112,13 @@ Only the map drawing and the selection are plain code.
 |---|---|---|
 | Import 17 lectures / 185 pages (ethics) | 35 | about 4 min |
 | Import 4 lectures / 136 pages (NLP, English) | 9 | 88 s |
-| Generate 5 questions | 2 | about 11 s |
-| Grade (multiple choice only / with short answers) | 0 / 1 | — |
+| Generate 5 questions (with checks) | 4 | about 20–30 s |
+| Grade (multiple choice) | 0 | — |
 
 ## Evaluation
 
 <!-- EVAL:BEGIN（data/team/output-reviewer/summary-for-readme.md から差し込み） -->
-All numbers are counts with denominators. "Before" = prompts at commit `fb02246` (vocab/graph generated 2026-10-19, `gemini-3.1-flash-lite`). The evaluation protocol is in `eval-protocol.md` (fixed random seed 20261024, so the samples are reproducible). Vocabulary and extraction "after" = the final code, run three times on the Ethics course (§1). Question quality, grading and map value were measured on the Before graph with the fixed question and grading code, so those changes come from the question and grading fixes only.
+Sections 1–6 were measured up to 2026-10-26. The re-measurement after the 2026-11-09 changes (all multiple choice, single-answer check, self-contained questions) is section 7. All numbers are counts with denominators. "Before" = prompts at commit `fb02246` (vocab/graph generated 2026-10-19, `gemini-3.1-flash-lite`). The evaluation protocol is in `eval-protocol.md` (fixed random seed 20261024, so the samples are reproducible). Vocabulary and extraction "after" = the final code, run three times on the Ethics course (§1). Question quality, grading and map value were measured on the Before graph with the fixed question and grading code, so those changes come from the question and grading fixes only.
 
 #### 1. Vocabulary quality (§12-1, §12-2)
 
@@ -167,7 +176,7 @@ Each sample is 30 relations drawn from that run's graph with seed 20261024. The 
 | Answer index points to the wrong choice | 4 / 24 | 0 / 24 |
 | Relation asked in the reverse direction | 4 / 30 | 1 / 30 |
 | Not usable, by aspect: relation / example / definition | 6/12 · 4/12 · 0/6 | 1/12 · 1/7 · 0/11 |
-| Short-answer grading matches the expected score (6 questions × 5 answers, graded twice) | 25 / 30 (too lenient 0, too strict 3, unstable 2) | 29 / 30 (too lenient 0, too strict 1, unstable 0) |
+| Short-answer grading matches the expected score (measured before short answers were removed; 6 questions × 5 answers, graded twice) | 25 / 30 (too lenient 0, too strict 3, unstable 2) | 29 / 30 (too lenient 0, too strict 1, unstable 0) |
 
 #### 4. Selection and map value (§12-4, §12-5)
 
@@ -227,6 +236,25 @@ Each relation label now has a sentence template and an "answer end", and relatio
 - No question asked a relation against the slides. But all 3 questions the direction check removed were correct: two asked "which concept did Aristotle propose" (the answer end of *proposes* is the person), and one asked for the opposite of a concept (opposition holds both ways).
 - Ethics "grounds" relations: reversed 7 / 22 → 0 / 14 after the label definitions were aligned with the natural reading.
 - Mathematics uses "Part" for 65 / 179 relations; 38 of them are clearly correct.
+
+#### 7. Re-measurement on 2026-11-09 (latest code, `gemini-3.1-flash-lite`)
+
+Six ranges × 5 questions were generated for each of the mathematics and ethics courses, with the same checks as the app. Of 60 requested questions, 56 were delivered (the single-answer check removed 1 and answer verification removed 3). No short-answer questions appeared. A separate Claude agent with no knowledge of how the questions were made judged them, using only the full course text and assuming the learner cannot see the slides. A question counts as having several correct answers if another choice can be defended, which is a strict standard. Because the judge and criteria differ from sections 1–6, the figures are not directly comparable with them.
+
+| | Mathematics | Ethics | Total |
+|---|---|---|---|
+| Exactly one correct choice | 19 / 28 | 25 / 28 | 44 / 56 |
+| More than one correct choice | 8 / 28 | 2 / 28 | 10 / 56 |
+| No correct choice (keyed answer wrong) | 1 / 28 | 1 / 28 | 2 / 56 |
+| Keyed answer correct / partly / wrong | 22 / 5 / 1 | 24 / 3 / 1 | 46 / 8 / 2 |
+| Cannot be answered without the slides | 5 / 28 | 0 / 28 | 5 / 56 |
+| Wording refers to the material | 1 / 28 | 0 / 28 | 1 / 56 |
+| Usable / usable after a fix / not usable | 15 / 4 / 9 | 21 / 4 / 3 | 36 / 8 / 12 |
+
+- **Short-answer questions are gone,** and only one question still refers to the material.
+- **"Always exactly one answer" has not been achieved.** Even with the new check, 12 of 56 questions did not have a single correct answer. The check runs on the same inexpensive model that writes the questions, so it probably shares the same blind spots.
+- Most remaining multi-answer questions are broad ones built from a relation label ("what is the theoretical basis of …"), where another choice also holds.
+- All 5 questions that need the slides are in mathematics, where exercise names or undefined symbols remain.
 <!-- EVAL:END -->
 
 ## Known limitations
@@ -236,7 +264,11 @@ Each relation label now has a sentence template and an "answer end", and relatio
 - **Removing cited books can remove ideas with the same name.** *Social Contract* or *Escape from Freedom* were extracted only as book titles and were removed with them (issue #69). The removed titles are logged so this can be checked.
 - **Some relations are labelled "Other".** The share fell from 49–69% to 14–24% after the vocabulary fixes and the chunked extraction, and it still varies with the vocabulary each run derives.
 - **Some books escape the book filter.** A book whose kind is "Other" is not removed before relation extraction (issue #99).
-- **The answer check rarely catches a bad question.** After the fixes it no longer removes good questions, but it kept one question whose wrong options were also correct, and it judged the same question differently in two ranges.
+- **Questions with several correct choices remain.** Despite the hidden-answer check, the 2026-11-09 re-measurement found 10 of 56 questions with more than one correct choice and 2 with a wrong keyed answer (Evaluation 7).
+- **Some mathematics questions still need the slides.** This applied to 5 of 56 questions, all in mathematics.
+- **A quiz can have fewer questions than requested.** Questions removed by the checks are not replaced.
+- **Accuracy drops on slides with little context.** Slides that only list keywords give the model little to work with. No change has targeted this directly.
+- **Some wording may still refer to the material.** The prompt reduces this, but 1 of 56 questions still did in the re-measurement.
 - **The free tier limits how often you can import.** One course of about 200 pages uses about 40 generation calls and up to 200 embedded texts. The embedding limit of 1,000 texts per day is reached after a few imports of new material.
 - **Repeated slides.** Later lectures sometimes repeat earlier slides, which inflates occurrence counts.
 

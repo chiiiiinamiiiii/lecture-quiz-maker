@@ -14,6 +14,8 @@
 //   H / L / M … 手のひら（最初のツール）/ 投げ縄 / 矩形、0 … 全体表示、Esc … 選択を解除
 
 const CLICK_DELAY = 250;
+const FIT_PAD_X = 48;       // 全体表示の左右の余白（px）
+const SPREAD_RANK = 0.6;    // 関係ベースの地図を画面に広げる強さ（0: 元の配置のまま、1: 縦横それぞれ等間隔）
 const FIT_NODE_R = 10;     // 全体表示の余白に足す点の半径の目安（px）
 const FIT_LABEL_H = 18;    // 点の下に描く名前 1 行の高さ（px）
 const AXIS_ROW = 25;       // 「講義回」の配置の列の見出しの行の高さ（札 17px＋間 8px）   // 点のクリックを反映するまで待つ時間（ms）。この間のダブルクリックは拡大だけにする
@@ -37,8 +39,6 @@ const COLORS = {
 };
 // LLM が資料から作った文字列（概念名・定義・関係の名前）を HTML に差し込む前に無害化する（#42）
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
-const EXTERNAL_DASH = [4, 4];   // 外部資料で補った関係の辺の点線（画面の px）
-const COOCCUR_DASH = [1.5, 3];  // 同じスライドに出るだけの関係（#127）: 外部資料より細かい点線
 const rgba = (c, a) => `rgba(${c[0]},${c[1]},${c[2]},${a})`;
 
 function pointInPolygon(x, y, poly) {
@@ -127,6 +127,7 @@ class MapApp {
     }
     this._renderChrome();
     this._resize();
+    if (first || courseChanged) this.pos = this._positions(this.layout);   // 画面の大きさが分かってから形を決める
     if (first || courseChanged || !this.view) this.fit(false);
     this.draw();
   }
@@ -135,7 +136,36 @@ class MapApp {
     const p = new Map();
     const src = this.data.positions[layout];
     for (const n of this.nodes) p.set(n.id, src[n.id] ? [...src[n.id]] : [0, 0]);
+    if (layout === "force" && this.w) this._spreadToArea(p);
     return p;
+  }
+
+  // 関係ベースの地図を、点を置ける範囲いっぱいに広げる。つながりの近さは保ったまま、次の順に形を変える。
+  // 1. 点の広がりが最も大きい向きを、範囲の長い辺に合わせて回す（斜めに伸びた地図で四隅が空くのを防ぐ）
+  // 2. 縦横それぞれ、順位（等間隔）の位置と混ぜる（固まりをほぐし、外れた点だけで範囲が決まらないようにする）
+  // 3. 縦横比を範囲に合わせる
+  _spreadToArea(p) {
+    const pts = [...p.values()];
+    const n = pts.length;
+    const { top, bottom } = this._fitMargins();
+    const aw = Math.max(this.w - FIT_PAD_X * 2, 1), ah = Math.max(this.h - top - bottom, 1);
+    this._shapedAspect = aw / ah;
+    if (n < 3) return;
+    const mx = pts.reduce((v, q) => v + q[0], 0) / n, my = pts.reduce((v, q) => v + q[1], 0) / n;
+    let xx = 0, yy = 0, xy = 0;
+    for (const [x, y] of pts) { xx += (x - mx) ** 2; yy += (y - my) ** 2; xy += (x - mx) * (y - my); }
+    const angle = 0.5 * Math.atan2(2 * xy, xx - yy) + (aw >= ah ? 0 : Math.PI / 2);   // 長い辺が縦なら 90 度足す
+    const c = Math.cos(-angle), s = Math.sin(-angle);
+    const rot = pts.map(([x, y]) => [(x - mx) * c - (y - my) * s, (x - mx) * s + (y - my) * c]);
+    const spread = (axis) => {
+      const v = rot.map((q) => q[axis]), lo = Math.min(...v), hi = Math.max(...v);
+      const order = v.map((_, i) => i).sort((i, j) => v[i] - v[j]);
+      const rank = new Array(n);
+      order.forEach((i, r) => { rank[i] = r / (n - 1); });
+      return v.map((x, i) => (1 - SPREAD_RANK) * (x - lo) / Math.max(hi - lo, 1e-9) + SPREAD_RANK * rank[i]);
+    };
+    const xs = spread(0), ys = spread(1);
+    pts.forEach((q, i) => { q[0] = xs[i] * aw / ah; q[1] = ys[i]; });
   }
 
   visibleIds() {
@@ -168,10 +198,7 @@ class MapApp {
     this.root.querySelector(".qm-legend").innerHTML =
       `<span><i style="background:${rgba(COLORS.unasked, 1)}"></i>${T.unasked}</span>` +
       `<span><i style="background:${rgba(COLORS.asked, 1)}"></i>${T.asked}</span>` +
-      `<span><i class="ring"></i>${T.selected}</span>` +
-      // 外部資料で補った関係（点線の辺）は、その地図にあるときだけ凡例に出す
-      (this.edges.some((e) => e.external) ? `<span class="ext"><i class="dash"></i>${esc(T.external_legend)}</span>` : "") +
-      (this.edges.some((e) => e.cooccur) ? `<span class="cooccur"><i class="dots"></i>${esc(T.cooccur_legend)}</span>` : "");
+      `<span><i class="ring"></i>${T.selected}</span>`;
     const hint = this.root.querySelector(".qm-hint");
     const hintText = this.tool === "hand" ? T.hint_hand : T.hint_select;   // ツールごとに説明を替える（#67）
     hint.textContent = hintText;
@@ -223,6 +250,12 @@ class MapApp {
     this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     this._fitToolbar();
     this._lecEdges();
+    // 窓の形が変わったら、関係ベースの地図を新しい形に広げ直す
+    if (this.pos && this.layout === "force" && this._shapedAspect) {
+      const { top, bottom } = this._fitMargins();
+      const aspect = Math.max(this.w - FIT_PAD_X * 2, 1) / Math.max(this.h - top - bottom, 1);
+      if (Math.abs(aspect / this._shapedAspect - 1) > 0.03) { this.pos = this._positions("force"); this.fit(false); }
+    }
     this.draw();
   }
 
@@ -236,7 +269,7 @@ class MapApp {
     if (!pts.length) return;
     const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
     const [x0, x1, y0, y1] = [Math.min(...xs), Math.max(...xs), Math.min(...ys), Math.max(...ys)];
-    const pad = 70;
+    const pad = FIT_PAD_X;
     const { top, bottom } = this._fitMargins();
     const scale = Math.min((this.w - pad * 2) / Math.max(x1 - x0, 1e-6), (this.h - top - bottom) / Math.max(y1 - y0, 1e-6));
     const target = { scale, tx: pad + (this.w - pad * 2 - (x1 - x0) * scale) / 2 - x0 * scale,
@@ -405,12 +438,8 @@ class MapApp {
       if (hasSel) alpha = this.selected.has(e.s) && this.selected.has(e.t) ? 0.42 : 0.05;
       if (focus) { const on = e.s === hov || e.t === hov; alpha = on ? 0.85 : 0.04; color = on ? COLORS.accent : COLORS.edge; width = on ? 1.4 : 1; }
       if (hovEdge && hovEdge.id === e.id) { alpha = 0.95; color = COLORS.accent; width = 2; }
-      else if (e.cooccur) { alpha *= 0.6; width *= 0.8; }    // 同じスライドに出るだけの関係は、薄く細く
       ctx.strokeStyle = rgba(color, alpha); ctx.lineWidth = width;
-      // 外部資料（Wikipedia）で補った関係は点線、同じスライドに出るだけの関係はさらに細かい点線
-      ctx.setLineDash(e.cooccur ? COOCCUR_DASH : e.external ? EXTERNAL_DASH : []);
       ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke();
-      ctx.setLineDash([]);
       if (this.layout === "force" && this.view.scale > 900 && !focus) {                        // 拡大したら辺の中点を見せる
         ctx.fillStyle = rgba(color, Math.min(0.6, alpha + 0.15));
         ctx.beginPath(); ctx.arc((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, 1.8, 0, Math.PI * 2); ctx.fill();
@@ -544,11 +573,7 @@ class MapApp {
     } else {
       const e = this.edges.find((x) => x.id === this.hover.id);
       html = `<b>${esc(this.byId.get(e.s).label)}</b> <span class="rel">${esc(e.label)}</span> <b>${esc(this.byId.get(e.t).label)}</b>` +
-        (e.external ? `<div class="ext">${esc(T.external_rel)}</div>` +
-          (e.article ? `<small class="ext-src">${esc(T.external_src)}: ${esc(e.article)}</small>` : "") : "") +
-        (e.cooccur
-          ? `<div class="cooccur">${esc(T.cooccur_rel.replace("{lec}", T.lecture_fmt.replace("{n}", e.lecture)).replace("{page}", e.page))}</div>`
-          : `<small>${esc(T.lecture_fmt.replace("{n}", e.lecture))} p.${esc(e.page)}</small>`);
+        `<small>${esc(T.lecture_fmt.replace("{n}", e.lecture))} p.${esc(e.page)}</small>`;
     }
     this.tooltip.innerHTML = html;
     this.tooltip.style.display = "block";
